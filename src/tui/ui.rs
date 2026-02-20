@@ -250,8 +250,15 @@ fn header_fits_single_line(conv: &crate::history::Conversation, terminal_width: 
         3 + formatted.len() // " · " + duration
     });
 
-    // Format: "  project · model · msg_count · duration · tokens · timestamp · summary"
+    // Provider badge length: "[Claude] " = 10, "[Cursor] " = 10
+    let badge_len = match conv.provider {
+        ProviderKind::Claude => "[Claude] ".len(),
+        ProviderKind::Cursor => "[Cursor] ".len(),
+    };
+
+    // Format: "  [Provider] project · model · msg_count · duration · tokens · timestamp · summary"
     let total_len = 2
+        + badge_len
         + project.len()
         + 3
         + model_len
@@ -347,8 +354,12 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             // Calculate header length to determine if long token format fits
             let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
             let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
+            let badge_len = match conv.provider {
+                ProviderKind::Claude => "[Claude] ".len(),
+                ProviderKind::Cursor => "[Cursor] ".len(),
+            };
             let base_len =
-                2 + project.len() + 3 + model_len + msg_count.len() + duration_len + 3 + 16; // 16 = timestamp
+                2 + badge_len + project.len() + 3 + model_len + msg_count.len() + duration_len + 3 + 16; // 16 = timestamp
 
             let tokens = if conv.total_tokens > 0 {
                 let long_form = format_tokens_long(conv.total_tokens);
@@ -1079,12 +1090,16 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let right_len =
                 msg_count.chars().count() + duration_len + 3 + timestamp.chars().count(); // 3 for " · "
             let indicator_len = indicator.chars().count();
+            let badge_len = match conv.provider {
+                ProviderKind::Claude => "[Claude] ".chars().count(),
+                ProviderKind::Cursor => "[Cursor] ".chars().count(),
+            };
             let project_len = project_part.chars().count();
             let min_padding = 2; // Minimum padding between content and timestamp
 
             // Calculate available width for summary (filter empty summaries)
             let available_for_summary =
-                width.saturating_sub(indicator_len + project_len + right_len + min_padding + 4); // 4 for " · " prefix and ellipsis
+                width.saturating_sub(indicator_len + badge_len + project_len + right_len + min_padding + 4); // 4 for " · " prefix and ellipsis
 
             // Build summary part (dimmer, dynamically truncated based on available space)
             let summary_part = conv
@@ -1107,6 +1122,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 
             // Calculate padding for right-aligned timestamp + message count
             let left_len = indicator_len
+                + badge_len
                 + project_len
                 + summary_part
                     .as_ref()
