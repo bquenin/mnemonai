@@ -12,22 +12,26 @@ pub struct SearchableConversation {
     pub index: usize,
 }
 
-/// Normalize text for search: lowercase and replace underscores with spaces
+/// Normalize text for search: lowercase and replace non-alphanumeric characters with spaces.
+/// This ensures punctuation like `#`, `@`, `/`, etc. act as word boundaries,
+/// so searching for `555` matches text containing `#555`.
 pub fn normalize_for_search(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch == '_' {
-            out.push(' ');
-        } else {
+        if ch.is_alphanumeric() {
             out.extend(ch.to_lowercase());
+        } else {
+            // Whitespace, punctuation, underscores, etc. all become spaces
+            out.push(' ');
         }
     }
     out
 }
 
-/// Check if a character is a word separator for search purposes
+/// Check if a character is a word separator for search purposes.
+/// Consistent with `normalize_for_search`: anything non-alphanumeric is a separator.
 pub fn is_word_separator(c: char) -> bool {
-    c.is_whitespace() || c == '_'
+    !c.is_alphanumeric()
 }
 
 /// Precompute lowercased search text for all conversations.
@@ -277,6 +281,29 @@ mod tests {
         let now = Local::now();
         let timestamp = now - Duration::days(60);
         assert_eq!(recency_multiplier(timestamp, now), 1.0);
+    }
+
+    #[test]
+    fn search_matches_through_punctuation() {
+        let now = Local::now();
+        // Text contains "#555" (e.g., a GitHub issue reference)
+        let mut convs = vec![make_conv("fix issue #555 in the parser", now)];
+        let searchable = precompute_search_text(&mut convs);
+        // Searching for "555" (without #) should still match
+        let results = search(&convs, &searchable, "555", now, None);
+        assert_eq!(results.len(), 1, "555 should match #555");
+        // Searching for "#555" should also match
+        let results = search(&convs, &searchable, "#555", now, None);
+        assert_eq!(results.len(), 1, "#555 should also match");
+    }
+
+    #[test]
+    fn search_matches_path_components() {
+        let now = Local::now();
+        let mut convs = vec![make_conv("edit src/main.rs file", now)];
+        let searchable = precompute_search_text(&mut convs);
+        let results = search(&convs, &searchable, "main", now, None);
+        assert_eq!(results.len(), 1, "main should match src/main.rs");
     }
 
     #[test]

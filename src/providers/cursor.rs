@@ -42,6 +42,18 @@ struct WorkspaceInfo {
     timestamp_millis: Option<i64>,
 }
 
+/// Per-conversation metadata collected from GROUP BY queries.
+struct ConvInfo {
+    conv_id: String,
+    bubble_count: usize,
+    first_key: String,
+    preview_key: String,
+    /// Key of a user-type bubble (from a second query filtered on type=1).
+    /// This is the key fix: MIN/MAX(key) over all bubbles often picks an assistant
+    /// bubble because keys contain random UUIDs. This field targets user bubbles specifically.
+    user_preview_key: Option<String>,
+}
+
 impl CursorProvider {
     pub fn new() -> Self {
         let home = std::env::var("HOME")
@@ -164,9 +176,6 @@ impl CursorProvider {
     }
 
     /// Load all conversations from the global Cursor database.
-    /// Uses a two-step batch approach for performance:
-    /// 1. GROUP BY query to enumerate conversations with counts and first/last keys
-    /// 2. Batch IN query to fetch only the bubbles needed for previews
     fn load_from_global_db(&self, show_last: bool) -> Result<Vec<Conversation>> {
         let conn = Connection::open_with_flags(
             &self.global_db_path,
@@ -174,97 +183,6 @@ impl CursorProvider {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
 
-        // Step 1: Single GROUP BY to enumerate all conversations with counts and boundary keys
-        let order_func = if show_last { "MAX" } else { "MIN" };
-        let query = format!(
-            "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) as conv_id, \
-                    COUNT(*) as cnt, \
-                    MIN(key) as first_key, \
-                    {}(key) as preview_key \
-             FROM cursorDiskKV \
-             WHERE key >= 'bubbleId:' AND key < 'bubbleId;' \
-             GROUP BY conv_id",
-            order_func
-        );
-        let mut stmt = conn.prepare(&query)?;
-
-        struct ConvInfo {
-            conv_id: String,
-            bubble_count: usize,
-            first_key: String,
-            preview_key: String,
-        }
-
-        let conv_infos: Vec<ConvInfo> = stmt
-            .query_map([], |row| {
-                Ok(ConvInfo {
-                    conv_id: row.get(0)?,
-                    bubble_count: row.get::<_, usize>(1)?,
-                    first_key: row.get(2)?,
-                    preview_key: row.get(3)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let _ = crate::debug_log::log_debug(&format!(
-            "Cursor: found {} conversations from GROUP BY",
-            conv_infos.len()
-        ));
-
-        // Step 2: Batch-fetch the bubbles we need for previews and timestamps.
-        // Collect all unique keys we need to fetch (first_key for timestamp, preview_key for text).
-        let mut keys_to_fetch: Vec<String> = Vec::with_capacity(conv_infos.len() * 2);
-        for info in &conv_infos {
-            keys_to_fetch.push(info.first_key.clone());
-            if info.first_key != info.preview_key {
-                keys_to_fetch.push(info.preview_key.clone());
-            }
-        }
-        keys_to_fetch.sort();
-        keys_to_fetch.dedup();
-
-        // Fetch all needed bubbles in batches using IN clauses
-        let mut bubble_map: HashMap<String, Value> = HashMap::with_capacity(keys_to_fetch.len());
-        for chunk in keys_to_fetch.chunks(200) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key IN ({})",
-                placeholders.join(",")
-            );
-            let mut batch_stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::types::ToSql> =
-                chunk.iter().map(|k| k as &dyn rusqlite::types::ToSql).collect();
-            let rows = batch_stmt.query_map(params.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            for row in rows.flatten() {
-                if let Ok(v) = serde_json::from_str::<Value>(&row.1) {
-                    bubble_map.insert(row.0, v);
-                }
-            }
-        }
-
-        let _ = crate::debug_log::log_debug(&format!(
-            "Cursor: fetched {} bubbles for previews",
-            bubble_map.len()
-        ));
-
-        // Build timestamp map from conversation index
-        let mut index_timestamps: HashMap<String, i64> = HashMap::new();
-        if let Ok(index_json) = conn.query_row::<String, _, _>(
-            "SELECT value FROM ItemTable WHERE key = 'conversationClassificationScoredConversations'",
-            [],
-            |row| row.get(0),
-        ) {
-            if let Ok(index) = serde_json::from_str::<Vec<ConversationIndexEntry>>(&index_json) {
-                for entry in index {
-                    index_timestamps.insert(entry.conversation_id, entry.timestamp);
-                }
-            }
-        }
-
-        // Build workspace map in parallel
         let workspace_map = self.build_workspace_map();
 
         let _ = crate::debug_log::log_debug(&format!(
@@ -272,127 +190,7 @@ impl CursorProvider {
             workspace_map.len()
         ));
 
-        // Step 3: Build Conversation structs from the collected data
-        let mut conversations = Vec::new();
-
-        for info in &conv_infos {
-            // Extract preview text from the preview bubble
-            let preview_bubble = bubble_map.get(&info.preview_key);
-            let preview_text = preview_bubble.and_then(|v| {
-                let btype = v.get("type").and_then(|t| t.as_i64()).unwrap_or(0);
-                if btype == BUBBLE_TYPE_USER {
-                    // Try text field first, fall back to richText
-                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    if !text.is_empty() {
-                        return Some(text.to_string());
-                    }
-                    if let Some(rt) = v.get("richText").and_then(|r| r.as_str()) {
-                        return extract_text_from_richtext(rt);
-                    }
-                }
-                None
-            });
-
-            // If the preview_key bubble wasn't a user message (e.g. show_last=false
-            // and first bubble is assistant), try to find user text from first_key
-            let preview_text = preview_text.or_else(|| {
-                let first_bubble = bubble_map.get(&info.first_key)?;
-                let btype = first_bubble.get("type").and_then(|t| t.as_i64()).unwrap_or(0);
-                if btype == BUBBLE_TYPE_USER {
-                    let text = first_bubble.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    if !text.is_empty() {
-                        return Some(text.to_string());
-                    }
-                    if let Some(rt) = first_bubble.get("richText").and_then(|r| r.as_str()) {
-                        return extract_text_from_richtext(rt);
-                    }
-                }
-                None
-            });
-
-            let preview_text = match preview_text {
-                Some(t) if !t.is_empty() => t,
-                _ => continue, // Skip conversations with no user text
-            };
-
-            // Extract model from whichever bubble has it
-            let model = bubble_map
-                .get(&info.first_key)
-                .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
-                .or_else(|| {
-                    bubble_map
-                        .get(&info.preview_key)
-                        .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
-                });
-
-            let ws_info = workspace_map.get(&info.conv_id);
-            let workspace_path = ws_info.map(|i| i.path.clone());
-            let workspace_open_path = ws_info.map(|i| i.open_path.clone());
-            let title = ws_info.and_then(|i| i.title.clone());
-
-            let project_name = workspace_path
-                .as_ref()
-                .map(|p| crate::history::format_short_name_from_path(p));
-
-            // Resolve timestamp: index > first bubble createdAt > workspace composerData
-            let local_ts = if let Some(&ts_millis) = index_timestamps.get(&info.conv_id) {
-                let ts = Utc
-                    .timestamp_millis_opt(ts_millis)
-                    .single()
-                    .unwrap_or_else(Utc::now);
-                ts.with_timezone(&Local)
-            } else if let Some(ts) = bubble_map.get(&info.first_key).and_then(|v| {
-                let created_at = v.get("createdAt")?.as_str()?;
-                let dt = DateTime::parse_from_rfc3339(created_at).ok()?;
-                Some(dt.with_timezone(&Local))
-            }) {
-                ts
-            } else if let Some(ws_ts) = ws_info.and_then(|i| i.timestamp_millis) {
-                let ts = Utc
-                    .timestamp_millis_opt(ws_ts)
-                    .single()
-                    .unwrap_or_else(Utc::now);
-                ts.with_timezone(&Local)
-            } else {
-                continue; // No timestamp from any source
-            };
-
-            let fake_path = self
-                .global_db_path
-                .with_file_name(format!("cursor-{}.jsonl", &info.conv_id));
-
-            let preview = preview_text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let full_text = preview.clone();
-
-            conversations.push(Conversation {
-                path: fake_path,
-                index: 0,
-                provider: ProviderKind::Cursor,
-                id: info.conv_id.clone(),
-                timestamp: local_ts,
-                preview,
-                full_text,
-                project_name,
-                project_path: workspace_path,
-                cwd: workspace_open_path,
-                message_count: info.bubble_count,
-                parse_errors: Vec::new(),
-                summary: title.clone(),
-                model,
-                total_tokens: 0,
-                duration_minutes: None,
-            });
-        }
-
-        let _ = crate::debug_log::log_debug(&format!(
-            "Cursor: returning {} conversations",
-            conversations.len()
-        ));
-
-        Ok(conversations)
+        load_conversations_from_conn(&conn, show_last, &workspace_map, &self.global_db_path)
     }
 
     /// Load all bubbles for a conversation from the global database.
@@ -420,6 +218,237 @@ impl CursorProvider {
 
         Ok(bubbles)
     }
+}
+
+/// Core logic for loading conversations from an open SQLite connection.
+/// Separated from `load_from_global_db` for testability (tests use in-memory DBs).
+fn load_conversations_from_conn(
+    conn: &Connection,
+    show_last: bool,
+    workspace_map: &HashMap<String, WorkspaceInfo>,
+    db_path: &Path,
+) -> Result<Vec<Conversation>> {
+    // Step 1: Single GROUP BY to enumerate all conversations with counts and boundary keys
+    let order_func = if show_last { "MAX" } else { "MIN" };
+    let query = format!(
+        "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) as conv_id, \
+                COUNT(*) as cnt, \
+                MIN(key) as first_key, \
+                {}(key) as preview_key \
+         FROM cursorDiskKV \
+         WHERE key >= 'bubbleId:' AND key < 'bubbleId;' \
+         GROUP BY conv_id",
+        order_func
+    );
+    let mut stmt = conn.prepare(&query)?;
+
+    let mut conv_infos: Vec<ConvInfo> = stmt
+        .query_map([], |row| {
+            Ok(ConvInfo {
+                conv_id: row.get(0)?,
+                bubble_count: row.get::<_, usize>(1)?,
+                first_key: row.get(2)?,
+                preview_key: row.get(3)?,
+                user_preview_key: None,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let _ = crate::debug_log::log_debug(&format!(
+        "Cursor: found {} conversations from GROUP BY",
+        conv_infos.len()
+    ));
+
+    // Step 1b: Second GROUP BY filtered on user-type bubbles (type=1).
+    // This is the core fix: MIN/MAX(key) over all bubbles often selects an assistant
+    // bubble because keys contain random UUIDs. This query specifically targets user bubbles.
+    let user_query = format!(
+        "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) as conv_id, \
+                {}(key) as user_key \
+         FROM cursorDiskKV \
+         WHERE key >= 'bubbleId:' AND key < 'bubbleId;' \
+           AND json_extract(CAST(value AS TEXT), '$.type') = 1 \
+         GROUP BY conv_id",
+        order_func
+    );
+    let mut user_keys: HashMap<String, String> = HashMap::new();
+    if let Ok(mut user_stmt) = conn.prepare(&user_query) {
+        if let Ok(rows) = user_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                user_keys.insert(row.0, row.1);
+            }
+        }
+    }
+
+    let _ = crate::debug_log::log_debug(&format!(
+        "Cursor: found {} conversations with user bubbles",
+        user_keys.len()
+    ));
+
+    // Populate user_preview_key from the second query results
+    for info in &mut conv_infos {
+        info.user_preview_key = user_keys.remove(&info.conv_id);
+    }
+
+    // Step 2: Batch-fetch the bubbles we need for previews and timestamps.
+    // Collect all unique keys we need to fetch.
+    let mut keys_to_fetch: Vec<String> = Vec::with_capacity(conv_infos.len() * 3);
+    for info in &conv_infos {
+        keys_to_fetch.push(info.first_key.clone());
+        keys_to_fetch.push(info.preview_key.clone());
+        if let Some(ref uk) = info.user_preview_key {
+            keys_to_fetch.push(uk.clone());
+        }
+    }
+    keys_to_fetch.sort();
+    keys_to_fetch.dedup();
+
+    // Fetch all needed bubbles in batches using IN clauses
+    let mut bubble_map: HashMap<String, Value> = HashMap::with_capacity(keys_to_fetch.len());
+    for chunk in keys_to_fetch.chunks(200) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key IN ({})",
+            placeholders.join(",")
+        );
+        let mut batch_stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|k| k as &dyn rusqlite::types::ToSql).collect();
+        let rows = batch_stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            if let Ok(v) = serde_json::from_str::<Value>(&row.1) {
+                bubble_map.insert(row.0, v);
+            }
+        }
+    }
+
+    let _ = crate::debug_log::log_debug(&format!(
+        "Cursor: fetched {} bubbles for previews",
+        bubble_map.len()
+    ));
+
+    // Build timestamp map from conversation index
+    let mut index_timestamps: HashMap<String, i64> = HashMap::new();
+    if let Ok(index_json) = conn.query_row::<String, _, _>(
+        "SELECT value FROM ItemTable WHERE key = 'conversationClassificationScoredConversations'",
+        [],
+        |row| row.get(0),
+    ) {
+        if let Ok(index) = serde_json::from_str::<Vec<ConversationIndexEntry>>(&index_json) {
+            for entry in index {
+                index_timestamps.insert(entry.conversation_id, entry.timestamp);
+            }
+        }
+    }
+
+    // Step 3: Build Conversation structs from the collected data
+    let mut conversations = Vec::new();
+
+    for info in &conv_infos {
+        // Extract preview text with priority chain:
+        // user_preview_key > preview_key (if user) > first_key (if user)
+        let preview_text = info
+            .user_preview_key
+            .as_ref()
+            .and_then(|k| bubble_map.get(k))
+            .and_then(extract_user_text_from_value)
+            .or_else(|| {
+                bubble_map
+                    .get(&info.preview_key)
+                    .and_then(extract_user_text_from_value)
+            })
+            .or_else(|| {
+                bubble_map
+                    .get(&info.first_key)
+                    .and_then(extract_user_text_from_value)
+            });
+
+        let preview_text = match preview_text {
+            Some(t) if !t.is_empty() => t,
+            _ => continue, // Skip conversations with no user text
+        };
+
+        // Extract model from whichever bubble has it
+        let model = bubble_map
+            .get(&info.first_key)
+            .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
+            .or_else(|| {
+                bubble_map
+                    .get(&info.preview_key)
+                    .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
+            });
+
+        let ws_info = workspace_map.get(&info.conv_id);
+        let workspace_path = ws_info.map(|i| i.path.clone());
+        let workspace_open_path = ws_info.map(|i| i.open_path.clone());
+        let title = ws_info.and_then(|i| i.title.clone());
+
+        let project_name = workspace_path
+            .as_ref()
+            .map(|p| crate::history::format_short_name_from_path(p));
+
+        // Resolve timestamp: index > first bubble createdAt > workspace composerData
+        let local_ts = if let Some(&ts_millis) = index_timestamps.get(&info.conv_id) {
+            let ts = Utc
+                .timestamp_millis_opt(ts_millis)
+                .single()
+                .unwrap_or_else(Utc::now);
+            ts.with_timezone(&Local)
+        } else if let Some(ts) = bubble_map.get(&info.first_key).and_then(|v| {
+            let created_at = v.get("createdAt")?.as_str()?;
+            let dt = DateTime::parse_from_rfc3339(created_at).ok()?;
+            Some(dt.with_timezone(&Local))
+        }) {
+            ts
+        } else if let Some(ws_ts) = ws_info.and_then(|i| i.timestamp_millis) {
+            let ts = Utc
+                .timestamp_millis_opt(ws_ts)
+                .single()
+                .unwrap_or_else(Utc::now);
+            ts.with_timezone(&Local)
+        } else {
+            continue; // No timestamp from any source
+        };
+
+        let fake_path = db_path.with_file_name(format!("cursor-{}.jsonl", &info.conv_id));
+
+        let preview = preview_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let full_text = preview.clone();
+
+        conversations.push(Conversation {
+            path: fake_path,
+            index: 0,
+            provider: ProviderKind::Cursor,
+            id: info.conv_id.clone(),
+            timestamp: local_ts,
+            preview,
+            full_text,
+            project_name,
+            project_path: workspace_path,
+            cwd: workspace_open_path,
+            message_count: info.bubble_count,
+            parse_errors: Vec::new(),
+            summary: title.clone(),
+            model,
+            total_tokens: 0,
+            duration_minutes: None,
+        });
+    }
+
+    let _ = crate::debug_log::log_debug(&format!(
+        "Cursor: returning {} conversations",
+        conversations.len()
+    ));
+
+    Ok(conversations)
 }
 
 impl super::Provider for CursorProvider {
@@ -792,6 +821,23 @@ fn collect_text_nodes(node: &Value, parts: &mut Vec<String>) {
     if let Some(root) = node.get("root") {
         collect_text_nodes(root, parts);
     }
+}
+
+/// Extract user text from a raw JSON bubble value.
+/// Returns Some(text) only if type == BUBBLE_TYPE_USER and has non-empty text/richText.
+fn extract_user_text_from_value(v: &Value) -> Option<String> {
+    let btype = v.get("type").and_then(|t| t.as_i64()).unwrap_or(0);
+    if btype != BUBBLE_TYPE_USER {
+        return None;
+    }
+    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    if !text.is_empty() {
+        return Some(text.to_string());
+    }
+    if let Some(rt) = v.get("richText").and_then(|r| r.as_str()) {
+        return extract_text_from_richtext(rt);
+    }
+    None
 }
 
 /// Get the effective text content from a bubble.
@@ -1191,5 +1237,353 @@ mod tests {
             .read_entries(&convs[0])
             .expect("Failed to read entries");
         eprintln!("First conversation has {} log entries", entries.len());
+    }
+
+    // --- In-memory SQLite tests for load_conversations_from_conn ---
+
+    /// Create an in-memory SQLite DB with the same schema as Cursor's state.vscdb.
+    fn create_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
+             CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Insert a bubble into the test DB.
+    fn insert_bubble(conn: &Connection, conv_id: &str, bubble_uuid: &str, json: &Value) {
+        let key = format!("bubbleId:{}:{}", conv_id, bubble_uuid);
+        let value = serde_json::to_string(json).unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            rusqlite::params![&key, &value],
+        )
+        .unwrap();
+    }
+
+    /// Insert a conversation index entry so the conversation gets a timestamp.
+    fn insert_index_entry(conn: &Connection, conv_id: &str, timestamp_millis: i64) {
+        // Read existing index or create new
+        let existing: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = 'conversationClassificationScoredConversations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "[]".to_string());
+        let mut index: Vec<Value> = serde_json::from_str(&existing).unwrap();
+        index.push(serde_json::json!({
+            "conversationId": conv_id,
+            "timestamp": timestamp_millis
+        }));
+        let new_json = serde_json::to_string(&index).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('conversationClassificationScoredConversations', ?)",
+            rusqlite::params![&new_json],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_discovers_conversation_with_assistant_first_key() {
+        // Core bug fix test: MIN(key) picks an assistant bubble due to random UUID ordering,
+        // but the second query finds the user bubble via type=1 filter.
+        let conn = create_test_db();
+        let conv = "conv-aaa";
+
+        // Insert assistant bubble with a key that sorts first (UUID starting with '0')
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-0000-0000-0000-000000000001",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "I can help with that!",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        // Insert user bubble with a key that sorts later
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "How do I fix this bug?",
+                "createdAt": "2025-06-01T09:59:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+
+        assert_eq!(convs.len(), 1, "Should discover the conversation");
+        assert_eq!(convs[0].preview, "How do I fix this bug?");
+    }
+
+    #[test]
+    fn test_discovers_conversation_with_user_first_key() {
+        // No regression: when MIN(key) is already a user bubble, it still works.
+        let conn = create_test_db();
+        let conv = "conv-bbb";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "Hello world",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Hi there!",
+                "createdAt": "2025-06-01T10:00:01Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].preview, "Hello world");
+    }
+
+    #[test]
+    fn test_skips_conversation_with_no_user_bubbles() {
+        // When a conversation has only assistant bubbles, it should be skipped gracefully.
+        let conn = create_test_db();
+        let conv = "conv-ccc";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "aaaa-asst1",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Starting up...",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "bbbb-asst2",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Ready to help",
+                "createdAt": "2025-06-01T10:00:01Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+
+        assert_eq!(convs.len(), 0, "Should skip conversation with no user bubbles");
+    }
+
+    #[test]
+    fn test_show_last_picks_last_user_bubble() {
+        // show_last=true should use MAX(key) for user bubbles, false should use MIN(key).
+        let conn = create_test_db();
+        let conv = "conv-ddd";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-user1",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "First question",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "55555555-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Answer",
+                "createdAt": "2025-06-01T10:00:01Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-user2",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "Follow-up question",
+                "createdAt": "2025-06-01T10:01:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+
+        let convs_first =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        assert_eq!(convs_first[0].preview, "First question");
+
+        let convs_last =
+            load_conversations_from_conn(&conn, true, &ws_map, &db_path).unwrap();
+        assert_eq!(convs_last[0].preview, "Follow-up question");
+    }
+
+    #[test]
+    fn test_discovers_conversation_with_richtext_only() {
+        // richText fallback works when text field is empty.
+        let conn = create_test_db();
+        let conv = "conv-eee";
+
+        let richtext = r#"{"root":{"children":[{"children":[{"text":"Rich text content","type":"text"}],"type":"paragraph"}],"type":"root"}}"#;
+        insert_bubble(
+            &conn,
+            conv,
+            "aaaa-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "",
+                "richText": richtext,
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].preview, "Rich text content");
+    }
+
+    #[test]
+    fn test_multiple_conversations_mixed() {
+        // Mix of discoverable and non-discoverable conversations in one DB.
+        let conn = create_test_db();
+
+        // Conversation 1: has user bubble (discoverable)
+        insert_bubble(
+            &conn,
+            "conv-1",
+            "aaaa-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "Question one",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_index_entry(&conn, "conv-1", 1717236000000);
+
+        // Conversation 2: only assistant bubbles (not discoverable)
+        insert_bubble(
+            &conn,
+            "conv-2",
+            "bbbb-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Automated response",
+                "createdAt": "2025-06-01T11:00:00Z"
+            }),
+        );
+        insert_index_entry(&conn, "conv-2", 1717239600000);
+
+        // Conversation 3: assistant sorts first, but has user bubble (discoverable)
+        insert_bubble(
+            &conn,
+            "conv-3",
+            "00000000-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Welcome!",
+                "createdAt": "2025-06-01T12:00:00Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            "conv-3",
+            "zzzzzzzz-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "Question three",
+                "createdAt": "2025-06-01T11:59:00Z"
+            }),
+        );
+        insert_index_entry(&conn, "conv-3", 1717243200000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+
+        assert_eq!(convs.len(), 2, "Should discover 2 of 3 conversations");
+        let ids: Vec<&str> = convs.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"conv-1"));
+        assert!(ids.contains(&"conv-3"));
+        assert!(!ids.contains(&"conv-2"));
+    }
+
+    #[test]
+    fn test_timestamp_from_first_key_not_user_key() {
+        // Timestamp should come from the first bubble's createdAt, not the user bubble's.
+        let conn = create_test_db();
+        let conv = "conv-fff";
+
+        // Assistant bubble sorts first and has the earlier timestamp
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Auto-greeting",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        // User bubble sorts later and has a later timestamp
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "My question",
+                "createdAt": "2025-06-01T10:05:00Z"
+            }),
+        );
+        // Don't insert an index entry — force timestamp from first bubble's createdAt
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        // The timestamp should come from the first_key (assistant at 10:00:00Z),
+        // not the user_preview_key (user at 10:05:00Z).
+        // Compare in UTC to avoid local timezone differences.
+        let ts_utc = convs[0].timestamp.with_timezone(&Utc);
+        assert_eq!(ts_utc.format("%H:%M:%S").to_string(), "10:00:00");
     }
 }
