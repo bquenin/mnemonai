@@ -4,11 +4,11 @@
 # Usage: curl -fsSL https://raw.githubusercontent.com/bquenin/mnemonai/main/scripts/install.sh | bash
 #
 # Environment variables:
-#   MNEMONAI_VERSION      - Pin a specific version (e.g., v0.1.26)
+#   MNEMONAI_VERSION      - Pin a specific version (e.g., v0.2.0)
 #   MNEMONAI_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
 #
 # Examples:
-#   MNEMONAI_VERSION=v0.1.26 bash install.sh
+#   MNEMONAI_VERSION=v0.2.0 bash install.sh
 #   MNEMONAI_INSTALL_DIR=/opt/bin bash install.sh
 #
 
@@ -53,7 +53,7 @@ detect_platform() {
 		echo ""
 		echo "mnemonai supports macOS and Linux."
 		echo "For other platforms, try building from source with Cargo:"
-		echo "  cargo install mnemonai"
+		echo "  cargo install --git https://github.com/bquenin/mnemonai.git"
 		echo ""
 		exit 1
 		;;
@@ -71,7 +71,7 @@ detect_platform() {
 		echo ""
 		echo "mnemonai prebuilt binaries are available for amd64 and arm64."
 		echo "For other architectures, try building from source with Cargo:"
-		echo "  cargo install mnemonai"
+		echo "  cargo install --git https://github.com/bquenin/mnemonai.git"
 		echo ""
 		exit 1
 		;;
@@ -113,7 +113,7 @@ install_from_release() {
 			echo ""
 			echo "This might be due to network issues or GitHub API rate limits."
 			echo "You can specify a version manually:"
-			echo "  MNEMONAI_VERSION=v0.1.26 bash install.sh"
+			echo "  MNEMONAI_VERSION=v0.2.0 bash install.sh"
 			echo ""
 			exit 1
 		fi
@@ -134,7 +134,7 @@ install_from_release() {
 			echo ""
 			echo "The release may not have a prebuilt binary for your platform."
 			echo "Try installing with Cargo instead:"
-			echo "  cargo install mnemonai"
+			echo "  cargo install --git https://github.com/bquenin/mnemonai.git"
 			echo ""
 			cd - >/dev/null || cd "$HOME"
 			exit 1
@@ -145,7 +145,7 @@ install_from_release() {
 			echo ""
 			echo "The release may not have a prebuilt binary for your platform."
 			echo "Try installing with Cargo instead:"
-			echo "  cargo install mnemonai"
+			echo "  cargo install --git https://github.com/bquenin/mnemonai.git"
 			echo ""
 			cd - >/dev/null || cd "$HOME"
 			exit 1

@@ -9,6 +9,11 @@ Universal AI coding conversation history browser. Search, browse, and resume con
 | **Claude Code** | JSONL files in `~/.claude/projects/` | `claude --resume <session-id>` |
 | **Cursor** | SQLite in workspace storage | Bridge extension + `cursor://` URI |
 
+## Supported Platforms
+
+- macOS (Apple Silicon and Intel)
+- Linux (x86_64)
+
 ## Install
 
 ### Homebrew
@@ -21,18 +26,6 @@ brew install bquenin/mnemonai/mnemonai
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bquenin/mnemonai/main/scripts/install.sh | bash
-```
-
-### From source
-
-```bash
-cargo install --path .
-```
-
-### From crates.io (coming soon)
-
-```bash
-cargo install mnemonai
 ```
 
 ## Usage
@@ -84,51 +77,6 @@ enabled = true
 [providers.cursor]
 enabled = true
 ```
-
-## Architecture
-
-```
-src/
-├── main.rs              # Entry point, event loop
-├── cli.rs               # clap argument parsing
-├── config.rs            # TOML configuration
-├── error.rs             # Error types
-├── model.rs             # Unified conversation/message types
-├── providers/
-│   ├── mod.rs           # Provider trait
-│   ├── claude.rs        # Claude Code JSONL loader
-│   └── cursor.rs        # Cursor SQLite loader
-├── resume/
-│   ├── claude.rs        # claude --resume
-│   └── cursor.rs        # cursor:// URI + bridge extension
-├── tui/
-│   ├── app.rs           # State machine
-│   ├── ui.rs            # List + detail rendering
-│   ├── search.rs        # Fuzzy search
-│   └── viewer.rs        # Conversation renderer
-└── render/
-    ├── markdown.rs      # Markdown → styled text
-    └── syntax.rs        # Syntax highlighting
-```
-
-### Provider Trait
-
-Adding a new AI tool is straightforward — implement the `Provider` trait:
-
-```rust
-pub trait Provider: Send + Sync {
-    fn name(&self) -> &str;
-    fn detect(&self) -> bool;
-    fn load_conversations(&self) -> Result<Vec<Conversation>>;
-    fn resume(&self, conversation: &Conversation) -> Result<()>;
-}
-```
-
-## Cursor Bridge Extension
-
-The `extension/` directory contains a minimal VS Code extension that enables resuming Cursor conversations. It registers a URI handler that calls `composer.openComposer(composerId)` when mnemonai opens a `cursor://` URI.
-
-The extension is auto-installed on first resume attempt.
 
 ## License
 
