@@ -13,15 +13,15 @@ pub struct SearchableConversation {
 }
 
 /// Normalize text for search: lowercase and replace non-alphanumeric characters with spaces.
-/// This ensures punctuation like `#`, `@`, `/`, etc. act as word boundaries,
+/// Hyphens are preserved so that `claude-history` stays as a single word.
+/// Other punctuation like `#`, `@`, `/`, etc. act as word boundaries,
 /// so searching for `555` matches text containing `#555`.
 pub fn normalize_for_search(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch.is_alphanumeric() {
+        if ch.is_alphanumeric() || ch == '-' {
             out.extend(ch.to_lowercase());
         } else {
-            // Whitespace, punctuation, underscores, etc. all become spaces
             out.push(' ');
         }
     }
@@ -29,9 +29,10 @@ pub fn normalize_for_search(text: &str) -> String {
 }
 
 /// Check if a character is a word separator for search purposes.
-/// Consistent with `normalize_for_search`: anything non-alphanumeric is a separator.
+/// Hyphens are preserved as part of words (for Ctrl+W and highlighting),
+/// while other punctuation like `#` acts as a separator.
 pub fn is_word_separator(c: char) -> bool {
-    !c.is_alphanumeric()
+    !(c.is_alphanumeric() || c == '-')
 }
 
 /// Precompute lowercased search text for all conversations.
