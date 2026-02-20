@@ -122,6 +122,13 @@ pub struct Args {
     )]
     pub local: bool,
 
+    /// Include conversations from deleted project directories
+    #[arg(
+        long,
+        help = "Include conversations from deleted project directories"
+    )]
+    pub show_deleted_projects: bool,
+
     /// Display output through a pager (less)
     #[arg(long, group = "pager_display")]
     pub pager: bool,

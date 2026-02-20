@@ -27,6 +27,13 @@ pub fn convert_path_to_project_dir_name(path: &Path) -> String {
 ///
 /// For regular paths, returns just the folder name.
 pub fn format_short_name_from_path(path: &Path) -> String {
+    // If the path is the user's home directory, display as ~
+    if let Some(home) = home::home_dir() {
+        if path == home {
+            return "~".to_string();
+        }
+    }
+
     let path_str = path.to_string_lossy();
 
     // Check for worktree pattern in the path

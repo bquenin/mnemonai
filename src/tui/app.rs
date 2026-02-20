@@ -168,6 +168,8 @@ pub struct App {
     single_file_mode: bool,
     /// Previous search query for incremental filtering
     previous_query: String,
+    /// Whether to show conversations whose project directory no longer exists
+    show_deleted_projects: bool,
 }
 
 impl App {
@@ -177,7 +179,13 @@ impl App {
         use_relative_time: bool,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
+        show_deleted_projects: bool,
     ) -> Self {
+        if !show_deleted_projects {
+            conversations.retain(|c| {
+                c.project_path.as_ref().map_or(true, |p| p.exists())
+            });
+        }
         let searchable = search::precompute_search_text(&mut conversations);
         let filtered: Vec<usize> = (0..conversations.len()).collect();
         let selected = if filtered.is_empty() { None } else { Some(0) };
@@ -200,6 +208,7 @@ impl App {
             show_timing: false,
             single_file_mode: false,
             previous_query: String::new(),
+            show_deleted_projects,
         }
     }
 
@@ -208,6 +217,7 @@ impl App {
         use_relative_time: bool,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
+        show_deleted_projects: bool,
     ) -> Self {
         Self {
             conversations: Vec::new(),
@@ -227,6 +237,7 @@ impl App {
             show_timing: false,
             single_file_mode: false,
             previous_query: String::new(),
+            show_deleted_projects,
         }
     }
 
@@ -286,12 +297,18 @@ impl App {
             show_timing: false,
             single_file_mode: true,
             previous_query: String::new(),
+            show_deleted_projects: true,
         }
     }
 
     /// Append a batch of conversations during loading
     /// Note: Does NOT precompute search text - that's deferred to finish_loading
-    pub fn append_conversations(&mut self, new_convs: Vec<Conversation>) {
+    pub fn append_conversations(&mut self, mut new_convs: Vec<Conversation>) {
+        if !self.show_deleted_projects {
+            new_convs.retain(|c| {
+                c.project_path.as_ref().map_or(true, |p| p.exists())
+            });
+        }
         let start_idx = self.conversations.len();
         self.conversations.extend(new_convs);
         let end_idx = self.conversations.len();
@@ -1645,6 +1662,7 @@ pub fn run(
     use_relative_time: bool,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
+    show_deleted_projects: bool,
     providers: &[Box<dyn Provider>],
 ) -> Result<Action> {
     // Set up panic hook to restore terminal
@@ -1661,6 +1679,7 @@ pub fn run(
         use_relative_time,
         tool_display,
         show_thinking,
+        show_deleted_projects,
     );
 
     loop {
@@ -1739,6 +1758,7 @@ pub fn run_with_loader(
     use_relative_time: bool,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
+    show_deleted_projects: bool,
     providers: &[Box<dyn Provider>],
 ) -> Result<(Action, Vec<Conversation>)> {
     // Set up panic hook to restore terminal
@@ -1750,7 +1770,7 @@ pub fn run_with_loader(
     }));
 
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_loading(use_relative_time, tool_display, show_thinking);
+    let mut app = App::new_loading(use_relative_time, tool_display, show_thinking, show_deleted_projects);
 
     loop {
         // Process all pending loader messages (non-blocking)

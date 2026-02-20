@@ -23,6 +23,7 @@ pub struct DisplayConfig {
     pub show_thinking: Option<bool>,
     pub plain: Option<bool>,
     pub pager: Option<bool>,
+    pub show_deleted_projects: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Default)]

@@ -108,6 +108,7 @@ fn run() -> Result<()> {
         std::io::stdout().is_terminal(),
     );
     let use_global = !args.local && !config.local.unwrap_or(false);
+    let show_deleted_projects = args.show_deleted_projects || display_config.show_deleted_projects.unwrap_or(false);
 
     // Build provider registry
     let providers: Vec<Box<dyn Provider>> = vec![
@@ -170,7 +171,7 @@ fn run() -> Result<()> {
             .collect();
         let rx = merge_streaming_loaders(receivers);
 
-        match tui::run_with_loader(rx, use_relative_time, tool_display, show_thinking, &providers)?
+        match tui::run_with_loader(rx, use_relative_time, tool_display, show_thinking, show_deleted_projects, &providers)?
         {
             (tui::Action::Select(path), convs) => (convs, path),
             (tui::Action::Resume(path), convs) => {
@@ -223,6 +224,7 @@ fn run() -> Result<()> {
             use_relative_time,
             tool_display,
             show_thinking,
+            show_deleted_projects,
             &providers,
         )? {
             tui::Action::Select(path) => (conversations, path),

@@ -94,11 +94,11 @@ fn format_tokens_long(tokens: u64) -> String {
 fn provider_badge(provider: ProviderKind) -> Span<'static> {
     match provider {
         ProviderKind::Claude => Span::styled(
-            "[CC] ",
+            "[Claude] ",
             Style::default().fg(Color::Rgb(218, 119, 86)), // Claude terracotta
         ),
         ProviderKind::Cursor => Span::styled(
-            "[Cu] ",
+            "[Cursor] ",
             Style::default().fg(Color::Rgb(180, 130, 230)), // Cursor purple
         ),
     }
