@@ -301,21 +301,23 @@ impl App {
         }
     }
 
-    /// Append a batch of conversations during loading
-    /// Note: Does NOT precompute search text - that's deferred to finish_loading
+    /// Append a batch of conversations during loading.
+    /// Maintains sorted order (newest first) so the list looks correct while loading.
+    /// Note: Does NOT precompute search text - that's deferred to finish_loading.
     pub fn append_conversations(&mut self, mut new_convs: Vec<Conversation>) {
         if !self.show_deleted_projects {
             new_convs.retain(|c| {
                 c.project_path.as_ref().map_or(true, |p| p.exists())
             });
         }
-        let start_idx = self.conversations.len();
         self.conversations.extend(new_convs);
-        let end_idx = self.conversations.len();
 
-        // Update filtered so items appear in the list during loading
-        // (Items shown in arrival order initially, will be re-sorted in finish_loading)
-        self.filtered.extend(start_idx..end_idx);
+        // Re-sort all conversations by timestamp (newest first)
+        self.conversations
+            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        // Rebuild filtered as sequential indices (no search during loading)
+        self.filtered = (0..self.conversations.len()).collect();
 
         // Select first item if nothing selected yet
         if self.selected.is_none() && !self.filtered.is_empty() {
