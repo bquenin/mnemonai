@@ -78,6 +78,10 @@ enabled = true
 enabled = true
 ```
 
+## Acknowledgments
+
+mnemonai is a fork of [claude-history](https://github.com/raine/claude-history) by [Raine Virta](https://github.com/raine).
+
 ## License
 
 MIT
