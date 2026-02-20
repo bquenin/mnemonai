@@ -11,6 +11,12 @@ Universal AI coding conversation history browser. Search, browse, and resume con
 
 ## Install
 
+### Homebrew
+
+```bash
+brew install bquenin/mnemonai/mnemonai
+```
+
 ### Quick install
 
 ```bash
@@ -32,18 +38,11 @@ cargo install mnemonai
 ## Usage
 
 ```bash
-# Launch the TUI
+# Launch the TUI (shows all conversations across all providers)
 mnemonai
 
-# Filter by provider
-mnemonai --provider claude
-mnemonai --provider cursor
-
-# Start with a search query
-mnemonai --query "authentication"
-
-# Filter by project
-mnemonai --project /path/to/project
+# Only show conversations from the current project directory
+mnemonai --local
 ```
 
 ## Keyboard Shortcuts

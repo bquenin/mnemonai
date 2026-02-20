@@ -114,13 +114,13 @@ pub struct Args {
     )]
     pub debug: Option<DebugLevel>,
 
-    /// Search conversations from all projects globally
+    /// Only show conversations from the current project directory
     #[arg(
         long,
-        short = 'g',
-        help = "Search all conversations from all projects at once"
+        short = 'L',
+        help = "Only show conversations from the current project directory"
     )]
-    pub global: bool,
+    pub local: bool,
 
     /// Display output through a pager (less)
     #[arg(long, group = "pager_display")]
@@ -146,7 +146,7 @@ pub struct Args {
     #[arg(
         value_name = "FILE",
         help = "JSONL conversation file to view directly",
-        conflicts_with_all = ["global", "show_dir", "resume", "show_path", "show_id", "plain", "render"]
+        conflicts_with_all = ["local", "show_dir", "resume", "show_path", "show_id", "plain", "render"]
     )]
     pub input_file: Option<PathBuf>,
 }

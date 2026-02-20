@@ -107,7 +107,7 @@ fn run() -> Result<()> {
         display_config.pager,
         std::io::stdout().is_terminal(),
     );
-    let use_global = args.global || config.global.unwrap_or(false);
+    let use_global = !args.local && !config.local.unwrap_or(false);
 
     // Build provider registry
     let providers: Vec<Box<dyn Provider>> = vec![
