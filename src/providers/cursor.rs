@@ -182,14 +182,7 @@ impl CursorProvider {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-
         let workspace_map = self.build_workspace_map();
-
-        let _ = crate::debug_log::log_debug(&format!(
-            "Cursor: built workspace map with {} entries",
-            workspace_map.len()
-        ));
-
         load_conversations_from_conn(&conn, show_last, &workspace_map, &self.global_db_path)
     }
 
@@ -220,15 +213,9 @@ impl CursorProvider {
     }
 }
 
-/// Core logic for loading conversations from an open SQLite connection.
-/// Separated from `load_from_global_db` for testability (tests use in-memory DBs).
-fn load_conversations_from_conn(
-    conn: &Connection,
-    show_last: bool,
-    workspace_map: &HashMap<String, WorkspaceInfo>,
-    db_path: &Path,
-) -> Result<Vec<Conversation>> {
-    // Step 1: Single GROUP BY to enumerate all conversations with counts and boundary keys
+/// GROUP BY query to enumerate all conversations with counts and boundary keys.
+/// Only accesses keys (no value I/O), so this is a fast index scan.
+fn query_conv_infos(conn: &Connection, show_last: bool) -> Result<Vec<ConvInfo>> {
     let order_func = if show_last { "MAX" } else { "MIN" };
     let query = format!(
         "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) as conv_id, \
@@ -241,8 +228,7 @@ fn load_conversations_from_conn(
         order_func
     );
     let mut stmt = conn.prepare(&query)?;
-
-    let mut conv_infos: Vec<ConvInfo> = stmt
+    let infos = stmt
         .query_map([], |row| {
             Ok(ConvInfo {
                 conv_id: row.get(0)?,
@@ -254,15 +240,13 @@ fn load_conversations_from_conn(
         })?
         .filter_map(|r| r.ok())
         .collect();
+    Ok(infos)
+}
 
-    let _ = crate::debug_log::log_debug(&format!(
-        "Cursor: found {} conversations from GROUP BY",
-        conv_infos.len()
-    ));
-
-    // Step 1b: Second GROUP BY filtered on user-type bubbles (type=1).
-    // This is the core fix: MIN/MAX(key) over all bubbles often selects an assistant
-    // bubble because keys contain random UUIDs. This query specifically targets user bubbles.
+/// Query for the first/last user-type bubble per conversation using json_extract.
+/// This is the slowest step (~500ms) because it reads and parses JSON for every bubble row.
+fn query_user_bubble_keys(conn: &Connection, show_last: bool) -> HashMap<String, String> {
+    let order_func = if show_last { "MAX" } else { "MIN" };
     let user_query = format!(
         "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) as conv_id, \
                 {}(key) as user_key \
@@ -272,9 +256,9 @@ fn load_conversations_from_conn(
          GROUP BY conv_id",
         order_func
     );
-    let mut user_keys: HashMap<String, String> = HashMap::new();
-    if let Ok(mut user_stmt) = conn.prepare(&user_query) {
-        if let Ok(rows) = user_stmt.query_map([], |row| {
+    let mut user_keys = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(&user_query) {
+        if let Ok(rows) = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }) {
             for row in rows.flatten() {
@@ -282,42 +266,124 @@ fn load_conversations_from_conn(
             }
         }
     }
+    user_keys
+}
 
-    let _ = crate::debug_log::log_debug(&format!(
-        "Cursor: found {} conversations with user bubbles",
-        user_keys.len()
-    ));
+/// Open (or create) the sidecar cache database for user bubble keys.
+/// Returns None on any error — callers fall back to the full query.
+fn open_cache_db() -> Option<Connection> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("mnemonai");
+    std::fs::create_dir_all(&dir).ok()?;
+    let db_path = dir.join("cursor_cache.db");
+    let conn = Connection::open(&db_path).ok()?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS user_bubble_keys (
+             conv_id      TEXT PRIMARY KEY,
+             min_user_key TEXT,
+             max_user_key TEXT
+         );",
+    )
+    .ok()?;
+    Some(conn)
+}
 
-    // Populate user_preview_key from the second query results
-    for info in &mut conv_infos {
-        info.user_preview_key = user_keys.remove(&info.conv_id);
+/// Bulk-load all cached user bubble key entries.
+fn load_cached_user_keys(
+    cache_conn: &Connection,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    let mut map = HashMap::new();
+    let mut stmt = match cache_conn
+        .prepare("SELECT conv_id, min_user_key, max_user_key FROM user_bubble_keys")
+    {
+        Ok(s) => s,
+        Err(_) => return map,
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return map,
+    };
+    for row in rows.flatten() {
+        map.insert(row.0, (row.1, row.2));
     }
+    map
+}
 
-    // Step 2: Batch-fetch the bubbles we need for previews and timestamps.
-    // Collect all unique keys we need to fetch.
-    let mut keys_to_fetch: Vec<String> = Vec::with_capacity(conv_infos.len() * 3);
-    for info in &conv_infos {
-        keys_to_fetch.push(info.first_key.clone());
-        keys_to_fetch.push(info.preview_key.clone());
-        if let Some(ref uk) = info.user_preview_key {
-            keys_to_fetch.push(uk.clone());
+/// Query MIN and MAX user-type bubble keys for a single conversation.
+/// Uses the primary key index with a prefix range — sub-millisecond.
+fn query_user_key_for_conv(
+    cursor_conn: &Connection,
+    conv_id: &str,
+) -> (Option<String>, Option<String>) {
+    let prefix = format!("bubbleId:{}:", conv_id);
+    let prefix_end = format!("bubbleId:{};", conv_id);
+    let result = cursor_conn.query_row(
+        "SELECT MIN(key), MAX(key) FROM cursorDiskKV \
+         WHERE key >= ?1 AND key < ?2 \
+           AND json_extract(CAST(value AS TEXT), '$.type') = 1",
+        rusqlite::params![&prefix, &prefix_end],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    );
+    result.unwrap_or((None, None))
+}
+
+/// Batch-insert user bubble key entries into the cache in a single transaction.
+fn save_user_keys_to_cache(
+    cache_conn: &Connection,
+    entries: &[(String, Option<String>, Option<String>)],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let _ = cache_conn.execute_batch("BEGIN");
+    {
+        let mut stmt = match cache_conn.prepare(
+            "INSERT OR REPLACE INTO user_bubble_keys (conv_id, min_user_key, max_user_key) VALUES (?1, ?2, ?3)",
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = cache_conn.execute_batch("ROLLBACK");
+                return;
+            }
+        };
+        for (conv_id, min_key, max_key) in entries {
+            let _ = stmt.execute(rusqlite::params![conv_id, min_key, max_key]);
         }
     }
-    keys_to_fetch.sort();
-    keys_to_fetch.dedup();
+    let _ = cache_conn.execute_batch("COMMIT");
+}
 
-    // Fetch all needed bubbles in batches using IN clauses
-    let mut bubble_map: HashMap<String, Value> = HashMap::with_capacity(keys_to_fetch.len());
-    for chunk in keys_to_fetch.chunks(200) {
+/// Batch-fetch bubble values by key using IN clauses.
+fn batch_fetch_bubbles(
+    conn: &Connection,
+    keys: &[String],
+) -> Result<HashMap<String, Value>> {
+    let mut bubble_map: HashMap<String, Value> = HashMap::with_capacity(keys.len());
+    for chunk in keys.chunks(200) {
         let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
         let sql = format!(
             "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key IN ({})",
             placeholders.join(",")
         );
-        let mut batch_stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             chunk.iter().map(|k| k as &dyn rusqlite::types::ToSql).collect();
-        let rows = batch_stmt.query_map(params.as_slice(), |row| {
+        let rows = stmt.query_map(params.as_slice(), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows.flatten() {
@@ -326,127 +392,210 @@ fn load_conversations_from_conn(
             }
         }
     }
+    Ok(bubble_map)
+}
 
-    let _ = crate::debug_log::log_debug(&format!(
-        "Cursor: fetched {} bubbles for previews",
-        bubble_map.len()
-    ));
-
-    // Build timestamp map from conversation index
-    let mut index_timestamps: HashMap<String, i64> = HashMap::new();
-    if let Ok(index_json) = conn.query_row::<String, _, _>(
+/// Load the conversation index timestamps from ItemTable.
+fn load_index_timestamps(conn: &Connection) -> HashMap<String, i64> {
+    let mut timestamps = HashMap::new();
+    if let Ok(json) = conn.query_row::<String, _, _>(
         "SELECT value FROM ItemTable WHERE key = 'conversationClassificationScoredConversations'",
         [],
         |row| row.get(0),
     ) {
-        if let Ok(index) = serde_json::from_str::<Vec<ConversationIndexEntry>>(&index_json) {
+        if let Ok(index) = serde_json::from_str::<Vec<ConversationIndexEntry>>(&json) {
             for entry in index {
-                index_timestamps.insert(entry.conversation_id, entry.timestamp);
+                timestamps.insert(entry.conversation_id, entry.timestamp);
             }
         }
     }
+    timestamps
+}
 
-    // Step 3: Build Conversation structs from the collected data
-    let mut conversations = Vec::new();
-
-    for info in &conv_infos {
-        // Extract preview text with priority chain:
-        // user_preview_key > preview_key (if user) > first_key (if user)
-        let preview_text = info
-            .user_preview_key
-            .as_ref()
-            .and_then(|k| bubble_map.get(k))
-            .and_then(extract_user_text_from_value)
-            .or_else(|| {
-                bubble_map
-                    .get(&info.preview_key)
-                    .and_then(extract_user_text_from_value)
-            })
-            .or_else(|| {
-                bubble_map
-                    .get(&info.first_key)
-                    .and_then(extract_user_text_from_value)
-            });
-
-        let preview_text = match preview_text {
-            Some(t) if !t.is_empty() => t,
-            _ => continue, // Skip conversations with no user text
-        };
-
-        // Extract model from whichever bubble has it
-        let model = bubble_map
-            .get(&info.first_key)
-            .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
-            .or_else(|| {
-                bubble_map
-                    .get(&info.preview_key)
-                    .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
-            });
-
-        let ws_info = workspace_map.get(&info.conv_id);
-        let workspace_path = ws_info.map(|i| i.path.clone());
-        let workspace_open_path = ws_info.map(|i| i.open_path.clone());
-        let title = ws_info.and_then(|i| i.title.clone());
-
-        let project_name = workspace_path
-            .as_ref()
-            .map(|p| crate::history::format_short_name_from_path(p));
-
-        // Resolve timestamp: index > first bubble createdAt > workspace composerData
-        let local_ts = if let Some(&ts_millis) = index_timestamps.get(&info.conv_id) {
-            let ts = Utc
-                .timestamp_millis_opt(ts_millis)
-                .single()
-                .unwrap_or_else(Utc::now);
-            ts.with_timezone(&Local)
-        } else if let Some(ts) = bubble_map.get(&info.first_key).and_then(|v| {
-            let created_at = v.get("createdAt")?.as_str()?;
-            let dt = DateTime::parse_from_rfc3339(created_at).ok()?;
-            Some(dt.with_timezone(&Local))
-        }) {
-            ts
-        } else if let Some(ws_ts) = ws_info.and_then(|i| i.timestamp_millis) {
-            let ts = Utc
-                .timestamp_millis_opt(ws_ts)
-                .single()
-                .unwrap_or_else(Utc::now);
-            ts.with_timezone(&Local)
-        } else {
-            continue; // No timestamp from any source
-        };
-
-        let fake_path = db_path.with_file_name(format!("cursor-{}.jsonl", &info.conv_id));
-
-        let preview = preview_text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let full_text = preview.clone();
-
-        conversations.push(Conversation {
-            path: fake_path,
-            index: 0,
-            provider: ProviderKind::Cursor,
-            id: info.conv_id.clone(),
-            timestamp: local_ts,
-            preview,
-            full_text,
-            project_name,
-            project_path: workspace_path,
-            cwd: workspace_open_path,
-            message_count: info.bubble_count,
-            parse_errors: Vec::new(),
-            summary: title.clone(),
-            model,
-            total_tokens: 0,
-            duration_minutes: None,
+/// Build a Conversation from collected metadata, or None if insufficient data.
+fn build_conversation(
+    info: &ConvInfo,
+    bubble_map: &HashMap<String, Value>,
+    index_timestamps: &HashMap<String, i64>,
+    workspace_map: &HashMap<String, WorkspaceInfo>,
+    db_path: &Path,
+) -> Option<Conversation> {
+    // Extract preview text with priority chain:
+    // user_preview_key > preview_key (if user) > first_key (if user)
+    let preview_text = info
+        .user_preview_key
+        .as_ref()
+        .and_then(|k| bubble_map.get(k))
+        .and_then(extract_user_text_from_value)
+        .or_else(|| {
+            bubble_map
+                .get(&info.preview_key)
+                .and_then(extract_user_text_from_value)
+        })
+        .or_else(|| {
+            bubble_map
+                .get(&info.first_key)
+                .and_then(extract_user_text_from_value)
         });
+
+    let preview_text = match preview_text {
+        Some(t) if !t.is_empty() => t,
+        _ => return None,
+    };
+
+    let model = bubble_map
+        .get(&info.first_key)
+        .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
+        .or_else(|| {
+            bubble_map
+                .get(&info.preview_key)
+                .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
+        });
+
+    let ws_info = workspace_map.get(&info.conv_id);
+    let workspace_path = ws_info.map(|i| i.path.clone());
+    let workspace_open_path = ws_info.map(|i| i.open_path.clone());
+    let title = ws_info.and_then(|i| i.title.clone());
+
+    let project_name = workspace_path
+        .as_ref()
+        .map(|p| crate::history::format_short_name_from_path(p));
+
+    // Resolve timestamp: index > first bubble createdAt > workspace composerData
+    let local_ts = if let Some(&ts_millis) = index_timestamps.get(&info.conv_id) {
+        let ts = Utc
+            .timestamp_millis_opt(ts_millis)
+            .single()
+            .unwrap_or_else(Utc::now);
+        ts.with_timezone(&Local)
+    } else if let Some(ts) = bubble_map.get(&info.first_key).and_then(|v| {
+        let created_at = v.get("createdAt")?.as_str()?;
+        let dt = DateTime::parse_from_rfc3339(created_at).ok()?;
+        Some(dt.with_timezone(&Local))
+    }) {
+        ts
+    } else if let Some(ws_ts) = ws_info.and_then(|i| i.timestamp_millis) {
+        let ts = Utc
+            .timestamp_millis_opt(ws_ts)
+            .single()
+            .unwrap_or_else(Utc::now);
+        ts.with_timezone(&Local)
+    } else {
+        return None;
+    };
+
+    let fake_path = db_path.with_file_name(format!("cursor-{}.jsonl", &info.conv_id));
+
+    let preview = preview_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let full_text = preview.clone();
+
+    Some(Conversation {
+        path: fake_path,
+        index: 0,
+        provider: ProviderKind::Cursor,
+        id: info.conv_id.clone(),
+        timestamp: local_ts,
+        preview,
+        full_text,
+        project_name,
+        project_path: workspace_path,
+        cwd: workspace_open_path,
+        message_count: info.bubble_count,
+        parse_errors: Vec::new(),
+        summary: title.clone(),
+        model,
+        total_tokens: 0,
+        duration_minutes: None,
+    })
+}
+
+/// Collect unique keys to fetch from a set of ConvInfo entries.
+fn collect_keys_to_fetch(conv_infos: &[ConvInfo]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::with_capacity(conv_infos.len() * 3);
+    for info in conv_infos {
+        keys.push(info.first_key.clone());
+        keys.push(info.preview_key.clone());
+        if let Some(ref uk) = info.user_preview_key {
+            keys.push(uk.clone());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Core logic for loading conversations from an open SQLite connection.
+/// Separated from `load_from_global_db` for testability (tests use in-memory DBs).
+fn load_conversations_from_conn(
+    conn: &Connection,
+    show_last: bool,
+    workspace_map: &HashMap<String, WorkspaceInfo>,
+    db_path: &Path,
+) -> Result<Vec<Conversation>> {
+    load_conversations_from_conn_inner(conn, show_last, workspace_map, db_path, None)
+}
+
+/// Inner implementation that accepts an optional cache connection for testability.
+fn load_conversations_from_conn_inner(
+    conn: &Connection,
+    show_last: bool,
+    workspace_map: &HashMap<String, WorkspaceInfo>,
+    db_path: &Path,
+    cache_conn_override: Option<&Connection>,
+) -> Result<Vec<Conversation>> {
+    let mut conv_infos = query_conv_infos(conn, show_last)?;
+
+    // Try cache-accelerated path; fall back to full scan on failure
+    let owned_cache;
+    let cache_ref = match cache_conn_override {
+        Some(c) => Some(c),
+        None => {
+            owned_cache = open_cache_db();
+            owned_cache.as_ref()
+        }
+    };
+
+    if let Some(cache_conn) = cache_ref {
+        let cached = load_cached_user_keys(cache_conn);
+        let mut new_entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+
+        for info in &mut conv_infos {
+            if let Some((min_key, max_key)) = cached.get(&info.conv_id) {
+                info.user_preview_key = if show_last {
+                    max_key.clone()
+                } else {
+                    min_key.clone()
+                };
+            } else {
+                let (min_key, max_key) = query_user_key_for_conv(conn, &info.conv_id);
+                info.user_preview_key = if show_last {
+                    max_key.clone()
+                } else {
+                    min_key.clone()
+                };
+                new_entries.push((info.conv_id.clone(), min_key, max_key));
+            }
+        }
+
+        save_user_keys_to_cache(cache_conn, &new_entries);
+    } else {
+        let mut user_keys = query_user_bubble_keys(conn, show_last);
+        for info in &mut conv_infos {
+            info.user_preview_key = user_keys.remove(&info.conv_id);
+        }
     }
 
-    let _ = crate::debug_log::log_debug(&format!(
-        "Cursor: returning {} conversations",
-        conversations.len()
-    ));
+    let keys_to_fetch = collect_keys_to_fetch(&conv_infos);
+    let bubble_map = batch_fetch_bubbles(conn, &keys_to_fetch)?;
+    let index_timestamps = load_index_timestamps(conn);
+
+    let conversations: Vec<Conversation> = conv_infos
+        .iter()
+        .filter_map(|info| build_conversation(info, &bubble_map, &index_timestamps, workspace_map, db_path))
+        .collect();
 
     Ok(conversations)
 }
@@ -492,40 +641,124 @@ impl super::Provider for CursorProvider {
         let workspace_storage_path = self.workspace_storage_path.clone();
 
         std::thread::spawn(move || {
-            let _ = crate::debug_log::log_debug(&format!(
-                "Cursor streaming: checking {}",
-                global_db_path.display()
-            ));
-
             if !global_db_path.exists() {
-                let _ =
-                    crate::debug_log::log_debug("Cursor streaming: global DB does not exist");
                 let _ = tx.send(LoaderMessage::Done);
                 return;
             }
 
             let provider = CursorProvider {
-                global_db_path,
+                global_db_path: global_db_path.clone(),
                 workspace_storage_path,
             };
 
-            match provider.load_from_global_db(show_last) {
-                Ok(convs) if !convs.is_empty() => {
-                    let _ = crate::debug_log::log_debug(&format!(
-                        "Cursor streaming: sending {} conversations",
-                        convs.len()
-                    ));
-                    let _ = tx.send(LoaderMessage::Batch(convs));
+            let conn = match Connection::open_with_flags(
+                &global_db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = tx.send(LoaderMessage::Done);
+                    return;
                 }
-                Ok(_) => {
-                    let _ =
-                        crate::debug_log::log_debug("Cursor streaming: no conversations found");
+            };
+
+            let workspace_map = provider.build_workspace_map();
+            let index_timestamps = load_index_timestamps(&conn);
+
+            // Enumerate all conversations via GROUP BY (fast index scan, ~30ms).
+            let mut conv_infos = match query_conv_infos(&conn, show_last) {
+                Ok(infos) => infos,
+                Err(_) => {
+                    let _ = tx.send(LoaderMessage::Done);
+                    return;
                 }
-                Err(e) => {
-                    let _ = crate::debug_log::log_debug(&format!(
-                        "Cursor streaming: error loading: {}",
-                        e
-                    ));
+            };
+
+            // Resolve user_preview_keys from cache BEFORE splitting into phases.
+            // On warm cache this fills all keys, so every conversation builds in the
+            // first batch — no visible refresh when phase 2 arrives.
+            let cache_conn = open_cache_db();
+            if let Some(ref cache) = cache_conn {
+                let cached = load_cached_user_keys(cache);
+                for info in &mut conv_infos {
+                    if let Some((min_key, max_key)) = cached.get(&info.conv_id) {
+                        info.user_preview_key = if show_last {
+                            max_key.clone()
+                        } else {
+                            min_key.clone()
+                        };
+                    }
+                }
+            }
+
+            // Batch-fetch all keys we know about (first, preview, and cached user keys).
+            let phase1_keys = collect_keys_to_fetch(&conv_infos);
+            let bubble_map = match batch_fetch_bubbles(&conn, &phase1_keys) {
+                Ok(m) => m,
+                Err(_) => {
+                    let _ = tx.send(LoaderMessage::Done);
+                    return;
+                }
+            };
+
+            // Phase 1: build every conversation we can (includes cached user keys).
+            let mut phase1_convs = Vec::new();
+            let mut remaining_infos = Vec::new();
+            for info in conv_infos {
+                if let Some(conv) = build_conversation(&info, &bubble_map, &index_timestamps, &workspace_map, &global_db_path) {
+                    phase1_convs.push(conv);
+                } else {
+                    remaining_infos.push(info);
+                }
+            }
+
+            if !phase1_convs.is_empty() {
+                let _ = tx.send(LoaderMessage::Batch(phase1_convs));
+            }
+
+            // Phase 2: resolve uncached conversations (cold cache or new conversations).
+            if !remaining_infos.is_empty() {
+                if let Some(ref cache) = cache_conn {
+                    let mut new_entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+                    for info in &mut remaining_infos {
+                        let (min_key, max_key) = query_user_key_for_conv(&conn, &info.conv_id);
+                        info.user_preview_key = if show_last {
+                            max_key.clone()
+                        } else {
+                            min_key.clone()
+                        };
+                        new_entries.push((info.conv_id.clone(), min_key, max_key));
+                    }
+                    save_user_keys_to_cache(cache, &new_entries);
+                } else {
+                    let mut user_keys = query_user_bubble_keys(&conn, show_last);
+                    for info in &mut remaining_infos {
+                        info.user_preview_key = user_keys.remove(&info.conv_id);
+                    }
+                }
+
+                let extra_keys: Vec<String> = remaining_infos
+                    .iter()
+                    .filter_map(|info| info.user_preview_key.as_ref())
+                    .filter(|k| !bubble_map.contains_key(*k))
+                    .cloned()
+                    .collect();
+
+                let mut full_map = bubble_map;
+                if !extra_keys.is_empty() {
+                    if let Ok(extra) = batch_fetch_bubbles(&conn, &extra_keys) {
+                        full_map.extend(extra);
+                    }
+                }
+
+                let phase2_convs: Vec<Conversation> = remaining_infos
+                    .iter()
+                    .filter_map(|info| build_conversation(info, &full_map, &index_timestamps, &workspace_map, &global_db_path))
+                    .collect();
+
+                if !phase2_convs.is_empty() {
+                    let _ = tx.send(LoaderMessage::Batch(phase2_convs));
                 }
             }
 
@@ -1585,5 +1818,183 @@ mod tests {
         // Compare in UTC to avoid local timezone differences.
         let ts_utc = convs[0].timestamp.with_timezone(&Utc);
         assert_eq!(ts_utc.format("%H:%M:%S").to_string(), "10:00:00");
+    }
+
+    // --- Sidecar cache tests ---
+
+    /// Create an in-memory cache database with the same schema as open_cache_db().
+    fn create_test_cache_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE user_bubble_keys (
+                 conv_id      TEXT PRIMARY KEY,
+                 min_user_key TEXT,
+                 max_user_key TEXT
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_query_user_key_for_conv_finds_user() {
+        let conn = create_test_db();
+        let conv = "conv-cache1";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-asst",
+            &serde_json::json!({ "type": BUBBLE_TYPE_ASSISTANT, "text": "Hi" }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "11111111-user1",
+            &serde_json::json!({ "type": BUBBLE_TYPE_USER, "text": "First" }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "eeeeeeee-user2",
+            &serde_json::json!({ "type": BUBBLE_TYPE_USER, "text": "Second" }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-asst2",
+            &serde_json::json!({ "type": BUBBLE_TYPE_ASSISTANT, "text": "Bye" }),
+        );
+
+        let (min_key, max_key) = query_user_key_for_conv(&conn, conv);
+        assert_eq!(
+            min_key,
+            Some(format!("bubbleId:{}:11111111-user1", conv))
+        );
+        assert_eq!(
+            max_key,
+            Some(format!("bubbleId:{}:eeeeeeee-user2", conv))
+        );
+    }
+
+    #[test]
+    fn test_query_user_key_for_conv_no_user() {
+        let conn = create_test_db();
+        let conv = "conv-cache2";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "aaaa-asst",
+            &serde_json::json!({ "type": BUBBLE_TYPE_ASSISTANT, "text": "No users here" }),
+        );
+
+        let (min_key, max_key) = query_user_key_for_conv(&conn, conv);
+        assert!(min_key.is_none());
+        assert!(max_key.is_none());
+    }
+
+    #[test]
+    fn test_cache_round_trip() {
+        let cache = create_test_cache_db();
+
+        let entries = vec![
+            (
+                "conv-a".to_string(),
+                Some("bubbleId:conv-a:111".to_string()),
+                Some("bubbleId:conv-a:999".to_string()),
+            ),
+            (
+                "conv-b".to_string(),
+                Some("bubbleId:conv-b:222".to_string()),
+                Some("bubbleId:conv-b:888".to_string()),
+            ),
+        ];
+
+        save_user_keys_to_cache(&cache, &entries);
+        let loaded = load_cached_user_keys(&cache);
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.get("conv-a"),
+            Some(&(
+                Some("bubbleId:conv-a:111".to_string()),
+                Some("bubbleId:conv-a:999".to_string())
+            ))
+        );
+        assert_eq!(
+            loaded.get("conv-b"),
+            Some(&(
+                Some("bubbleId:conv-b:222".to_string()),
+                Some("bubbleId:conv-b:888".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn test_cache_null_keys_round_trip() {
+        let cache = create_test_cache_db();
+
+        let entries = vec![("conv-empty".to_string(), None, None)];
+
+        save_user_keys_to_cache(&cache, &entries);
+        let loaded = load_cached_user_keys(&cache);
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("conv-empty"), Some(&(None, None)));
+    }
+
+    #[test]
+    fn test_load_with_cache_integration() {
+        // End-to-end: load_conversations_from_conn_inner with a cache should
+        // produce the same results and populate the cache for next time.
+        let conn = create_test_db();
+        let cache = create_test_cache_db();
+        let conv = "conv-cache-e2e";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Hello!",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "My question",
+                "createdAt": "2025-06-01T10:01:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+
+        // First call: populates cache
+        let convs = load_conversations_from_conn_inner(
+            &conn, false, &ws_map, &db_path, Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].preview, "My question");
+
+        // Verify cache was populated
+        let cached = load_cached_user_keys(&cache);
+        assert!(cached.contains_key(conv));
+
+        // Second call: uses cache (same result)
+        let convs2 = load_conversations_from_conn_inner(
+            &conn, false, &ws_map, &db_path, Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(convs2.len(), 1);
+        assert_eq!(convs2[0].preview, "My question");
     }
 }
