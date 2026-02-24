@@ -12,27 +12,16 @@ pub struct SearchableConversation {
     pub index: usize,
 }
 
-/// Normalize text for search: lowercase and replace non-alphanumeric characters with spaces.
-/// Hyphens are preserved so that `claude-history` stays as a single word.
-/// Other punctuation like `#`, `@`, `/`, etc. act as word boundaries,
-/// so searching for `555` matches text containing `#555`.
+/// Normalize text for search: lowercase only.
+/// Query terms are split on whitespace and matched as substrings,
+/// so URLs, paths, and other structured strings stay intact as single terms.
 pub fn normalize_for_search(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_alphanumeric() || ch == '-' {
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(' ');
-        }
-    }
-    out
+    text.to_lowercase()
 }
 
-/// Check if a character is a word separator for search purposes.
-/// Hyphens are preserved as part of words (for Ctrl+W and highlighting),
-/// while other punctuation like `#` acts as a separator.
+/// Check if a character is a word separator for search purposes (Ctrl+W, highlighting).
 pub fn is_word_separator(c: char) -> bool {
-    !(c.is_alphanumeric() || c == '-')
+    c.is_whitespace()
 }
 
 /// Precompute lowercased search text for all conversations.
@@ -71,12 +60,13 @@ pub fn search(
     }
 
     let query_lower = normalize_for_search(query);
-    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
-    if query_words.is_empty() {
+
+    // Score conversations in parallel, optionally narrowing to a subset
+    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    if query_terms.is_empty() {
         return (0..conversations.len()).collect();
     }
 
-    // Score conversations in parallel, optionally narrowing to a subset
     let mut scored: Vec<(usize, f64, DateTime<Local>)> = if let Some(indices) = narrow_from {
         let allowed: std::collections::HashSet<usize> = indices.iter().copied().collect();
         searchable
@@ -85,7 +75,7 @@ pub fn search(
             .filter_map(|s| {
                 let score = score_text(
                     &s.text_lower,
-                    &query_words,
+                    &query_terms,
                     conversations[s.index].timestamp,
                     now,
                 );
@@ -102,7 +92,7 @@ pub fn search(
             .filter_map(|s| {
                 let score = score_text(
                     &s.text_lower,
-                    &query_words,
+                    &query_terms,
                     conversations[s.index].timestamp,
                     now,
                 );
@@ -125,42 +115,27 @@ pub fn search(
     scored.into_iter().map(|(idx, _, _)| idx).collect()
 }
 
-/// Score a conversation based on word prefix matching and recency.
-/// Each query word must be a prefix of at least one word in the text (AND logic).
+/// Score a conversation based on substring matching and recency.
+/// Each query term (split on whitespace) must appear as a substring in the text (AND logic).
+/// This preserves URLs, paths, and other structured strings as single terms.
 fn score_text(
     text_lower: &str,
-    query_words: &[&str],
+    query_terms: &[&str],
     timestamp: DateTime<Local>,
     now: DateTime<Local>,
 ) -> f64 {
-    if query_words.is_empty() {
+    if query_terms.is_empty() {
         return 0.0;
     }
 
-    // Fast rejection: if a query word isn't present as substring, skip expensive checking
-    for &qw in query_words {
-        if !text_lower.contains(qw) {
+    // All terms must appear as substrings (AND logic)
+    for &term in query_terms {
+        if !text_lower.contains(term) {
             return 0.0;
         }
     }
 
-    // Single-pass word matching with tracking
-    let mut matched = vec![false; query_words.len()];
-    let mut remaining = query_words.len();
-
-    for text_word in text_lower.split_whitespace() {
-        for (i, &qw) in query_words.iter().enumerate() {
-            if !matched[i] && text_word.starts_with(qw) {
-                matched[i] = true;
-                remaining -= 1;
-                if remaining == 0 {
-                    return (query_words.len() as f64) * recency_multiplier(timestamp, now);
-                }
-            }
-        }
-    }
-
-    0.0
+    (query_terms.len() as f64) * recency_multiplier(timestamp, now)
 }
 
 /// Calculate recency multiplier based on age
@@ -211,16 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_underscore_separated() {
-        let now = Local::now();
-        let mut convs = vec![make_conv("HARDENED_RUNTIME config", now)];
-        let searchable = precompute_search_text(&mut convs);
-        let results = search(&convs, &searchable, "harden runtime", now, None);
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn search_matches_different_case() {
+    fn search_matches_case_insensitive() {
         let now = Local::now();
         let mut convs = vec![make_conv("Hardened Runtime enabled", now)];
         let searchable = precompute_search_text(&mut convs);
@@ -229,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn search_prefix_matches_words() {
+    fn search_substring_matches() {
         let now = Local::now();
         let mut convs = vec![make_conv("hardened security", now)];
         let searchable = precompute_search_text(&mut convs);
@@ -238,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn search_requires_all_words() {
+    fn search_requires_all_terms() {
         let now = Local::now();
         let mut convs = vec![make_conv("hardened security", now)];
         let searchable = precompute_search_text(&mut convs);
@@ -247,13 +213,16 @@ mod tests {
     }
 
     #[test]
-    fn search_with_underscore_in_query() {
+    fn search_underscore_preserved_in_query() {
         let now = Local::now();
-        let mut convs = vec![make_conv("hardened runtime enabled", now)];
+        let mut convs = vec![
+            make_conv("HARDENED_RUNTIME config", now),
+            make_conv("hardened runtime enabled", now),
+        ];
         let searchable = precompute_search_text(&mut convs);
-        // Query with underscore should still match space-separated text
+        // Underscore in query matches underscore in text, not space-separated
         let results = search(&convs, &searchable, "hardened_runtime", now, None);
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 1, "should only match the underscore variant");
     }
 
     #[test]
@@ -312,5 +281,32 @@ mod tests {
         let now = Local::now();
         let timestamp = now + Duration::hours(1);
         assert_eq!(recency_multiplier(timestamp, now), 3.0);
+    }
+
+    #[test]
+    fn search_url_matches_exactly() {
+        let now = Local::now();
+        let mut convs = vec![
+            make_conv(
+                "review this PR https://github.com/org/repo/pull/1 please",
+                now - Duration::days(5),
+            ),
+            // Different PR number — should NOT match
+            make_conv(
+                "check https://github.com/org/repo/pull/3 and also item 1",
+                now,
+            ),
+        ];
+        let searchable = precompute_search_text(&mut convs);
+        let results = search(
+            &convs,
+            &searchable,
+            "https://github.com/org/repo/pull/1",
+            now,
+            None,
+        );
+        // Only the conversation with the exact URL should match
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 0);
     }
 }

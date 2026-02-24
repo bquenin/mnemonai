@@ -286,6 +286,11 @@ fn open_cache_db() -> Option<Connection> {
              conv_id      TEXT PRIMARY KEY,
              min_user_key TEXT,
              max_user_key TEXT
+         );
+         CREATE TABLE IF NOT EXISTS conversation_full_text (
+             conv_id      TEXT PRIMARY KEY,
+             full_text    TEXT NOT NULL,
+             bubble_count INTEGER NOT NULL
          );",
     )
     .ok()?;
@@ -368,6 +373,107 @@ fn save_user_keys_to_cache(
     let _ = cache_conn.execute_batch("COMMIT");
 }
 
+/// Bulk-load all cached full-text entries.
+fn load_cached_full_text(cache_conn: &Connection) -> HashMap<String, (String, usize)> {
+    let mut map = HashMap::new();
+    let mut stmt = match cache_conn
+        .prepare("SELECT conv_id, full_text, bubble_count FROM conversation_full_text")
+    {
+        Ok(s) => s,
+        Err(_) => return map,
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, usize>(2)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return map,
+    };
+    for row in rows.flatten() {
+        map.insert(row.0, (row.1, row.2));
+    }
+    map
+}
+
+/// Query all bubble text for a single conversation using a prefix range scan.
+/// Returns concatenated text from all bubbles (sub-millisecond per conversation).
+fn query_full_text_for_conv(cursor_conn: &Connection, conv_id: &str) -> String {
+    let prefix = format!("bubbleId:{}:", conv_id);
+    let prefix_end = format!("bubbleId:{};", conv_id);
+    let result = cursor_conn.query_row(
+        "SELECT GROUP_CONCAT(NULLIF(json_extract(CAST(value AS TEXT), '$.text'), ''), ' ') \
+         FROM cursorDiskKV WHERE key >= ?1 AND key < ?2",
+        rusqlite::params![&prefix, &prefix_end],
+        |row| row.get::<_, Option<String>>(0),
+    );
+    result.unwrap_or(None).unwrap_or_default()
+}
+
+/// Batch-insert full-text entries into the cache in a single transaction.
+fn save_full_text_to_cache(
+    cache_conn: &Connection,
+    entries: &[(String, String, usize)],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let _ = cache_conn.execute_batch("BEGIN");
+    {
+        let mut stmt = match cache_conn.prepare(
+            "INSERT OR REPLACE INTO conversation_full_text (conv_id, full_text, bubble_count) VALUES (?1, ?2, ?3)",
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = cache_conn.execute_batch("ROLLBACK");
+                return;
+            }
+        };
+        for (conv_id, full_text, bubble_count) in entries {
+            let _ = stmt.execute(rusqlite::params![conv_id, full_text, bubble_count]);
+        }
+    }
+    let _ = cache_conn.execute_batch("COMMIT");
+}
+
+/// Build full-text map for all conversations, using cache where possible.
+/// For cached conversations with matching bubble count, uses the cached text.
+/// For new/changed conversations, queries per-conversation (sub-ms each) and updates cache.
+fn build_full_text_map(
+    cursor_conn: &Connection,
+    conv_infos: &[ConvInfo],
+    cache_conn: Option<&Connection>,
+) -> HashMap<String, String> {
+    let mut full_text_map = HashMap::with_capacity(conv_infos.len());
+
+    let cached = cache_conn
+        .map(|c| load_cached_full_text(c))
+        .unwrap_or_default();
+
+    let mut new_entries: Vec<(String, String, usize)> = Vec::new();
+
+    for info in conv_infos {
+        if let Some((text, count)) = cached.get(&info.conv_id) {
+            if *count == info.bubble_count {
+                full_text_map.insert(info.conv_id.clone(), text.clone());
+                continue;
+            }
+        }
+        // Cache miss or stale — query fresh
+        let text = query_full_text_for_conv(cursor_conn, &info.conv_id);
+        full_text_map.insert(info.conv_id.clone(), text.clone());
+        new_entries.push((info.conv_id.clone(), text, info.bubble_count));
+    }
+
+    if let Some(cache) = cache_conn {
+        save_full_text_to_cache(cache, &new_entries);
+    }
+
+    full_text_map
+}
+
 /// Batch-fetch bubble values by key using IN clauses.
 fn batch_fetch_bubbles(
     conn: &Connection,
@@ -418,6 +524,7 @@ fn build_conversation(
     bubble_map: &HashMap<String, Value>,
     index_timestamps: &HashMap<String, i64>,
     workspace_map: &HashMap<String, WorkspaceInfo>,
+    full_text_map: &HashMap<String, String>,
     db_path: &Path,
 ) -> Option<Conversation> {
     // Extract preview text with priority chain:
@@ -490,7 +597,10 @@ fn build_conversation(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let full_text = preview.clone();
+    let full_text = full_text_map
+        .get(&info.conv_id)
+        .cloned()
+        .unwrap_or_else(|| preview.clone());
 
     Some(Conversation {
         path: fake_path,
@@ -591,10 +701,11 @@ fn load_conversations_from_conn_inner(
     let keys_to_fetch = collect_keys_to_fetch(&conv_infos);
     let bubble_map = batch_fetch_bubbles(conn, &keys_to_fetch)?;
     let index_timestamps = load_index_timestamps(conn);
+    let full_text_map = build_full_text_map(conn, &conv_infos, cache_ref);
 
     let conversations: Vec<Conversation> = conv_infos
         .iter()
-        .filter_map(|info| build_conversation(info, &bubble_map, &index_timestamps, workspace_map, db_path))
+        .filter_map(|info| build_conversation(info, &bubble_map, &index_timestamps, workspace_map, &full_text_map, db_path))
         .collect();
 
     Ok(conversations)
@@ -702,11 +813,14 @@ impl super::Provider for CursorProvider {
                 }
             };
 
+            // Build full-text search index for all conversations (cached, sub-ms per miss).
+            let full_text_map = build_full_text_map(&conn, &conv_infos, cache_conn.as_ref());
+
             // Phase 1: build every conversation we can (includes cached user keys).
             let mut phase1_convs = Vec::new();
             let mut remaining_infos = Vec::new();
             for info in conv_infos {
-                if let Some(conv) = build_conversation(&info, &bubble_map, &index_timestamps, &workspace_map, &global_db_path) {
+                if let Some(conv) = build_conversation(&info, &bubble_map, &index_timestamps, &workspace_map, &full_text_map, &global_db_path) {
                     phase1_convs.push(conv);
                 } else {
                     remaining_infos.push(info);
@@ -754,7 +868,7 @@ impl super::Provider for CursorProvider {
 
                 let phase2_convs: Vec<Conversation> = remaining_infos
                     .iter()
-                    .filter_map(|info| build_conversation(info, &full_map, &index_timestamps, &workspace_map, &global_db_path))
+                    .filter_map(|info| build_conversation(info, &full_map, &index_timestamps, &workspace_map, &full_text_map, &global_db_path))
                     .collect();
 
                 if !phase2_convs.is_empty() {
