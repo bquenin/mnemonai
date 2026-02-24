@@ -78,6 +78,13 @@ enabled = true
 enabled = true
 ```
 
+## Releasing
+
+```bash
+# Bump version, tag, and push — GitHub Actions builds and publishes the release
+just release
+```
+
 ## Acknowledgments
 
 mnemonai is a fork of [claude-history](https://github.com/raine/claude-history) by [Raine Virta](https://github.com/raine).
