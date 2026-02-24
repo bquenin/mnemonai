@@ -80,10 +80,16 @@ enabled = true
 
 ## Releasing
 
+1. Bump the version in `Cargo.toml`
+2. Commit and push
+3. Tag and push the tag:
+
 ```bash
-# Bump version, tag, and push — GitHub Actions builds and publishes the release
-just release
+git tag v0.x.x
+git push origin v0.x.x
 ```
+
+The GitHub Actions release workflow triggers on `v*` tags, builds platform binaries, creates the GitHub release, and updates the Homebrew tap.
 
 ## Acknowledgments
 
