@@ -34,6 +34,21 @@ pub fn is_word_separator(c: char) -> bool {
     c.is_whitespace()
 }
 
+/// Check if a character is a word boundary (non-alphanumeric).
+fn is_word_boundary(c: char) -> bool {
+    !c.is_alphanumeric() && c != '_'
+}
+
+/// A query term with metadata about whether it's "completed" (followed by whitespace).
+/// Completed terms require a word boundary after the match in the text.
+#[derive(Clone, Debug)]
+struct QueryTerm<'a> {
+    text: &'a str,
+    /// True if this term was followed by whitespace in the query,
+    /// meaning the user finished typing it and it should match as a whole word.
+    completed: bool,
+}
+
 /// Precompute lowercased search text for all conversations.
 /// Moves `full_text` ownership from each Conversation into SearchableConversation
 /// to avoid storing the same text twice in memory.
@@ -68,6 +83,24 @@ pub fn precompute_search_text(conversations: &mut [Conversation]) -> Vec<Searcha
 /// Filter and score conversations based on query.
 /// Returns indices into the original conversations vec, sorted by score descending.
 /// When `narrow_from` is provided, only scores those indices (used when query extends previous).
+/// Parse query into terms, tracking whether the last term is "completed" (has trailing whitespace).
+/// A trailing space means the user finished typing the last term and it should match as a whole word.
+/// Interior spaces are just term separators — those terms remain prefix-matchable.
+fn parse_query_terms(query_lower: &str) -> Vec<QueryTerm<'_>> {
+    let has_trailing_space = query_lower.ends_with(|c: char| c.is_whitespace());
+    let terms: Vec<&str> = query_lower.split_whitespace().collect();
+    terms
+        .iter()
+        .enumerate()
+        .map(|(i, &text)| QueryTerm {
+            text,
+            // Only the last term can be "completed" — trailing space signals the user
+            // finished typing it. Interior spaces are just term separators.
+            completed: i == terms.len() - 1 && has_trailing_space,
+        })
+        .collect()
+}
+
 pub fn search(
     conversations: &[Conversation],
     searchable: &[SearchableConversation],
@@ -75,8 +108,7 @@ pub fn search(
     now: DateTime<Local>,
     narrow_from: Option<&[usize]>,
 ) -> Vec<usize> {
-    let query = query.trim();
-    if query.is_empty() {
+    if query.trim().is_empty() {
         // Return all indices sorted by timestamp (already sorted in history.rs)
         return (0..conversations.len()).collect();
     }
@@ -84,7 +116,7 @@ pub fn search(
     let query_lower = normalize_for_search(query);
 
     // Score conversations in parallel, optionally narrowing to a subset
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    let query_terms = parse_query_terms(&query_lower);
     if query_terms.is_empty() {
         return (0..conversations.len()).collect();
     }
@@ -140,11 +172,31 @@ pub fn search(
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
+/// If `whole_word` is true, only counts matches where the character after the match
+/// is a word boundary (or end of string).
+fn count_occurrences(haystack: &str, needle: &str, whole_word: bool) -> usize {
     if needle.is_empty() {
         return 0;
     }
-    haystack.matches(needle).count()
+    if !whole_word {
+        return haystack.matches(needle).count();
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs_end = start + pos + needle.len();
+        // Check that the character after the match is a word boundary (or end of string)
+        let at_boundary = abs_end >= haystack.len()
+            || haystack[abs_end..]
+                .chars()
+                .next()
+                .is_some_and(is_word_boundary);
+        if at_boundary {
+            count += 1;
+        }
+        start = abs_end;
+    }
+    count
 }
 
 /// Score a conversation based on substring matching, term frequency density, and recency.
@@ -160,7 +212,7 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 fn score_text(
     text_lower: &str,
     topic_end: usize,
-    query_terms: &[&str],
+    query_terms: &[QueryTerm<'_>],
     timestamp: DateTime<Local>,
     now: DateTime<Local>,
 ) -> f64 {
@@ -172,9 +224,9 @@ fn score_text(
     let body = &text_lower[topic_end..];
 
     let mut relevance = 0.0;
-    for &term in query_terms {
-        let topic_hits = count_occurrences(topic_window, term);
-        let body_hits = count_occurrences(body, term);
+    for term in query_terms {
+        let topic_hits = count_occurrences(topic_window, term.text, term.completed);
+        let body_hits = count_occurrences(body, term.text, term.completed);
         let total_hits = topic_hits + body_hits;
         if total_hits == 0 {
             return 0.0; // AND logic: all terms must be present
@@ -440,10 +492,68 @@ mod tests {
 
     #[test]
     fn count_occurrences_works() {
-        assert_eq!(count_occurrences("aaa", "a"), 3);
-        assert_eq!(count_occurrences("abcabc", "abc"), 2);
-        assert_eq!(count_occurrences("hello", "xyz"), 0);
-        assert_eq!(count_occurrences("", "a"), 0);
-        assert_eq!(count_occurrences("a", ""), 0);
+        // Substring mode (whole_word = false)
+        assert_eq!(count_occurrences("aaa", "a", false), 3);
+        assert_eq!(count_occurrences("abcabc", "abc", false), 2);
+        assert_eq!(count_occurrences("hello", "xyz", false), 0);
+        assert_eq!(count_occurrences("", "a", false), 0);
+        assert_eq!(count_occurrences("a", "", false), 0);
+    }
+
+    #[test]
+    fn count_occurrences_whole_word() {
+        // "dia" as whole word should not match "diagnostics"
+        assert_eq!(count_occurrences("diagnostics are useful", "dia", true), 0);
+        // "dia" as whole word should match "dia" followed by space
+        assert_eq!(count_occurrences("dia is short for diagram", "dia", true), 1);
+        // "dia" at end of string
+        assert_eq!(count_occurrences("this is dia", "dia", true), 1);
+        // "dia" followed by punctuation
+        assert_eq!(count_occurrences("check dia, then move on", "dia", true), 1);
+        // Multiple whole-word matches
+        assert_eq!(count_occurrences("dia and dia again", "dia", true), 2);
+    }
+
+    #[test]
+    fn trailing_space_filters_prefix_matches() {
+        let now = Local::now();
+        let mut convs = vec![
+            // Contains "diagnostics" but not "dia" as a standalone word
+            make_conv("run diagnostics on the server", now),
+            // Contains "dia" as a standalone word
+            make_conv("the dia tool is useful for diagrams", now),
+        ];
+        let searchable = precompute_search_text(&mut convs);
+
+        // Without trailing space: both match (substring "dia" in "diagnostics")
+        let results = search(&convs, &searchable, "dia", now, None);
+        assert_eq!(results.len(), 2, "prefix search should match both");
+
+        // With trailing space: only the standalone "dia" matches
+        let results = search(&convs, &searchable, "dia ", now, None);
+        assert_eq!(results.len(), 1, "completed term should only match whole word");
+        assert_eq!(results[0], 1, "should match the conversation with standalone 'dia'");
+    }
+
+    #[test]
+    fn parse_query_terms_tracks_completion() {
+        // Only the last term is affected by trailing space; interior terms are always prefix-matchable
+        let terms = parse_query_terms("foo bar");
+        assert_eq!(terms.len(), 2);
+        assert!(!terms[0].completed, "interior term is never completed");
+        assert!(!terms[1].completed, "last term without trailing space should not be completed");
+
+        let terms = parse_query_terms("foo bar ");
+        assert_eq!(terms.len(), 2);
+        assert!(!terms[0].completed, "interior term is never completed");
+        assert!(terms[1].completed, "last term with trailing space should be completed");
+
+        let terms = parse_query_terms("single");
+        assert_eq!(terms.len(), 1);
+        assert!(!terms[0].completed);
+
+        let terms = parse_query_terms("single ");
+        assert_eq!(terms.len(), 1);
+        assert!(terms[0].completed);
     }
 }
