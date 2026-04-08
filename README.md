@@ -40,26 +40,45 @@ mnemonai --local
 
 ## Keyboard Shortcuts
 
+Press `?` at any time to open the help overlay.
+
 ### List View
 
 | Key | Action |
 |-----|--------|
 | Type | Fuzzy search conversations |
-| `Up/Down` or `j/k` | Navigate list |
+| `Up/Down` | Navigate list |
+| `Home/End` | Jump to first/last |
+| `Page Up/Down` | Page navigation |
+| `Ctrl+D/U` | Half page down/up |
+| `Ctrl+N/P` | Next/prev (emacs-style) |
 | `Enter` | View conversation |
-| `r` | Resume conversation in original tool |
-| `Tab` | Cycle provider filter (All → Claude → Cursor) |
-| `Esc` | Clear search / Quit |
-| `q` | Quit |
+| `Ctrl+R` | Resume conversation in original tool |
+| `Ctrl+X` | Delete conversation |
+| `Ctrl+O` | Select and exit |
+| `Ctrl+W` | Delete word |
+| `Esc` | Quit |
 
 ### Detail View
 
 | Key | Action |
 |-----|--------|
 | `Up/Down` or `j/k` | Scroll |
-| `Page Up/Down` | Scroll fast |
-| `g/G` | Jump to top/bottom |
-| `r` | Resume conversation |
+| `d/u` or `Ctrl+D/U` | Half page down/up |
+| `Page Up/Down` | Page navigation |
+| `g/G` or `Home/End` | Jump to top/bottom |
+| `/` | Search within conversation |
+| `n/N` | Next/prev search match |
+| `t` | Toggle tool display |
+| `T` | Toggle thinking blocks |
+| `i` | Toggle timestamps and durations |
+| `p` | Show file path |
+| `Y` | Copy path to clipboard |
+| `I` | Copy session ID to clipboard |
+| `e` | Export to file |
+| `y` | Copy to clipboard |
+| `Ctrl+R` | Resume conversation |
+| `Ctrl+X` | Delete conversation |
 | `Esc` or `q` | Back to list |
 
 ## Configuration
@@ -67,15 +86,23 @@ mnemonai --local
 Create `~/.config/mnemonai/config.toml`:
 
 ```toml
+# Only show conversations from the current project directory
+local = false
+
+# Hide projects whose name contains any of these strings
+exclude = ["some-project", "another-project"]
+
 [display]
-show_tools = false      # Show tool-use messages
-relative_time = true    # "2 hours ago" vs "2026-02-18 14:30"
+show_tools = false            # Show tool-use messages
+relative_time = true          # "2 hours ago" vs "2026-02-18 14:30"
+last = false                  # Show last messages in preview (vs first)
+show_thinking = false         # Show thinking blocks
+plain = false                 # Plain text output without formatting
+pager = false                 # Use pager (less) for output
+show_deleted_projects = false # Include conversations from deleted directories
 
-[providers.claude]
-enabled = true
-
-[providers.cursor]
-enabled = true
+[resume]
+default_args = []             # Default args passed to 'claude --resume'
 ```
 
 ## Releasing
