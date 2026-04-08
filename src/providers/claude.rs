@@ -7,12 +7,14 @@ use std::sync::mpsc::Receiver;
 
 pub struct ClaudeProvider {
     current_dir: Option<std::path::PathBuf>,
+    exclude_paths: Vec<String>,
 }
 
 impl ClaudeProvider {
-    pub fn new() -> Self {
+    pub fn new(exclude_paths: Vec<String>) -> Self {
         Self {
             current_dir: std::env::current_dir().ok(),
+            exclude_paths,
         }
     }
 }
@@ -56,7 +58,7 @@ impl super::Provider for ClaudeProvider {
         show_last: bool,
         debug: Option<crate::cli::DebugLevel>,
     ) -> Receiver<LoaderMessage> {
-        history::load_all_conversations_streaming(show_last, debug)
+        history::load_all_conversations_streaming(show_last, debug, self.exclude_paths.clone())
     }
 
     fn read_entries(&self, conversation: &Conversation) -> Result<Vec<LogEntry>> {

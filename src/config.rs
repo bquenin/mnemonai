@@ -12,6 +12,7 @@ pub struct ConfigFile {
     pub local: Option<bool>,
     pub display: Option<DisplayConfig>,
     pub resume: Option<ResumeConfig>,
+    pub exclude: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug, Default)]

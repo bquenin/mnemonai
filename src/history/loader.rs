@@ -23,9 +23,10 @@ use std::time::SystemTime;
 pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    exclude_paths: &[String],
 ) -> Result<Vec<Conversation>> {
     let root = super::get_claude_projects_root()?;
-    let projects = list_projects(&root)?;
+    let projects = list_projects(&root, exclude_paths)?;
 
     debug::info(
         debug_level,
@@ -87,11 +88,12 @@ pub fn load_all_conversations(
 pub fn load_all_conversations_streaming(
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    exclude_paths: Vec<String>,
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        load_all_streaming_inner(tx, show_last, debug_level);
+        load_all_streaming_inner(tx, show_last, debug_level, &exclude_paths);
     });
 
     rx
@@ -101,6 +103,7 @@ fn load_all_streaming_inner(
     tx: Sender<LoaderMessage>,
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    exclude_paths: &[String],
 ) {
     // First, validate that the projects root exists (fatal if not)
     let root = match super::get_claude_projects_root() {
@@ -119,7 +122,7 @@ fn load_all_streaming_inner(
     }
 
     // List projects (fatal if this fails)
-    let projects = match list_projects(&root) {
+    let projects = match list_projects(&root, exclude_paths) {
         Ok(p) => p,
         Err(e) => {
             let _ = tx.send(LoaderMessage::Fatal(e));
@@ -167,7 +170,7 @@ fn load_all_streaming_inner(
 }
 
 /// List all projects that contain conversation files
-pub fn list_projects(root: &Path) -> Result<Vec<Project>> {
+pub fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Project>> {
     let entries = read_dir(root)?;
 
     let mut projects: Vec<Project> = entries
@@ -202,6 +205,15 @@ pub fn list_projects(root: &Path) -> Result<Vec<Project>> {
             // So / becomes -, but _ also becomes -, and __ becomes --
             // We convert single dashes to / but preserve double dashes as _
             let display_name = decode_project_dir_name(&name);
+
+            // Skip projects whose display name contains any exclude string
+            if exclude_names
+                .iter()
+                .any(|ex| display_name.contains(ex.as_str()))
+            {
+                return None;
+            }
+
             let modified = entry
                 .metadata()
                 .ok()?
