@@ -111,8 +111,9 @@ fn run() -> Result<()> {
     let show_deleted_projects = args.show_deleted_projects || display_config.show_deleted_projects.unwrap_or(false);
 
     // Build provider registry
+    let exclude_paths = config.exclude.unwrap_or_default();
     let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(providers::claude::ClaudeProvider::new()),
+        Box::new(providers::claude::ClaudeProvider::new(exclude_paths)),
         Box::new(providers::cursor::CursorProvider::new()),
     ];
 
