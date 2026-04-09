@@ -93,7 +93,7 @@ local = false
 exclude = ["some-project", "another-project"]
 
 [display]
-show_tools = false            # Show tool-use messages
+no_tools = false              # Hide tool-use messages
 relative_time = true          # "2 hours ago" vs "2026-02-18 14:30"
 last = false                  # Show last messages in preview (vs first)
 show_thinking = false         # Show thinking blocks
