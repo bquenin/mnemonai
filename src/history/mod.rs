@@ -72,6 +72,10 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+    /// Cached lowercased full text for search, when loaded from the persistent index.
+    pub search_text_lower: Option<String>,
+    /// Cached byte offset where the topic window ends in `search_text_lower`.
+    pub search_topic_end: Option<usize>,
 }
 
 pub struct Project {

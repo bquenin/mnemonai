@@ -2,6 +2,10 @@ use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage, extract_text_from_blocks,
 };
 use crate::cli::DebugLevel;
+use crate::conversation_index::{
+    CachedFileConversation, SourceFingerprint, attach_search_cache, fingerprint_from_metadata,
+    load_provider_cache, save_conversations,
+};
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::{
@@ -11,6 +15,7 @@ use chrono::{DateTime, FixedOffset, Local};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -81,6 +86,19 @@ struct ParsedTranscriptLine {
     counts_as_message: bool,
 }
 
+enum ConversationLoad {
+    Cached(Conversation),
+    Fresh(Conversation, SourceFingerprint),
+}
+
+impl ConversationLoad {
+    fn into_conversation(self) -> Conversation {
+        match self {
+            Self::Cached(conversation) | Self::Fresh(conversation, _) => conversation,
+        }
+    }
+}
+
 impl CursorAgentProvider {
     pub fn new() -> Self {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
@@ -134,9 +152,10 @@ impl CursorAgentProvider {
         project: &AgentProject,
         show_last: bool,
         debug_level: Option<DebugLevel>,
+        cache: &HashMap<PathBuf, CachedFileConversation>,
     ) -> Vec<Conversation> {
         let workspace_path = project.workspace_path.clone();
-        let mut conversations: Vec<Conversation> = project
+        let loaded: Vec<ConversationLoad> = project
             .transcript_files
             .par_iter()
             .filter_map(|path| {
@@ -145,6 +164,19 @@ impl CursorAgentProvider {
                     .and_then(|name| name.to_str())
                     .unwrap_or("unknown")
                     .to_string();
+                let fingerprint = file_fingerprint(path);
+
+                if let Some(fingerprint) = fingerprint
+                    && let Some(conversation) = cache
+                        .get(path)
+                        .and_then(|cached| cached.conversation_if_fresh(fingerprint))
+                {
+                    debug::debug(
+                        debug_level,
+                        &format!("Loaded Cursor Agent transcript {} from index", filename),
+                    );
+                    return Some(ConversationLoad::Cached(conversation));
+                }
 
                 match process_transcript_file(
                     path.clone(),
@@ -152,7 +184,7 @@ impl CursorAgentProvider {
                     workspace_path.clone(),
                     debug_level,
                 ) {
-                    Ok(Some(conversation)) => {
+                    Ok(Some(mut conversation)) => {
                         debug::debug(
                             debug_level,
                             &format!(
@@ -160,7 +192,13 @@ impl CursorAgentProvider {
                                 filename, conversation.preview
                             ),
                         );
-                        Some(conversation)
+                        attach_search_cache(&mut conversation);
+                        match fingerprint {
+                            Some(fingerprint) => {
+                                Some(ConversationLoad::Fresh(conversation, fingerprint))
+                            }
+                            None => Some(ConversationLoad::Cached(conversation)),
+                        }
                     }
                     Ok(None) => None,
                     Err(err) => {
@@ -175,6 +213,22 @@ impl CursorAgentProvider {
                     }
                 }
             })
+            .collect();
+
+        save_conversations(
+            ProviderKind::CursorAgent,
+            show_last,
+            loaded.iter().filter_map(|loaded| match loaded {
+                ConversationLoad::Fresh(conversation, fingerprint) => {
+                    Some((conversation, *fingerprint))
+                }
+                ConversationLoad::Cached(_) => None,
+            }),
+        );
+
+        let mut conversations: Vec<Conversation> = loaded
+            .into_iter()
+            .map(ConversationLoad::into_conversation)
             .collect();
 
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -208,9 +262,12 @@ impl super::Provider for CursorAgentProvider {
             return Ok(Vec::new());
         }
 
+        let cache = load_provider_cache(ProviderKind::CursorAgent, show_last);
         let mut conversations: Vec<Conversation> = projects
             .iter()
-            .flat_map(|project| self.load_project_conversations(project, show_last, debug_level))
+            .flat_map(|project| {
+                self.load_project_conversations(project, show_last, debug_level, &cache)
+            })
             .collect();
 
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -239,9 +296,10 @@ impl super::Provider for CursorAgentProvider {
                 }
             };
 
+            let cache = load_provider_cache(ProviderKind::CursorAgent, show_last);
             for project in &projects {
                 let conversations =
-                    provider.load_project_conversations(project, show_last, debug_level);
+                    provider.load_project_conversations(project, show_last, debug_level, &cache);
                 if !conversations.is_empty() {
                     let _ = tx.send(LoaderMessage::Batch(conversations));
                 }
@@ -453,6 +511,8 @@ fn process_transcript_file(
         model: None,
         total_tokens: 0,
         duration_minutes,
+        search_text_lower: None,
+        search_topic_end: None,
     }))
 }
 
@@ -625,6 +685,12 @@ fn load_workspace_path(project_dir: &Path) -> Option<PathBuf> {
 
 fn file_modified_time(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
+}
+
+fn file_fingerprint(path: &Path) -> Option<SourceFingerprint> {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| fingerprint_from_metadata(&metadata))
 }
 
 fn transcript_parent_dir(path: &Path, conversation_id: &str) -> Option<PathBuf> {
@@ -820,6 +886,8 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            search_text_lower: None,
+            search_topic_end: None,
         };
 
         provider.delete(&conversation).unwrap();

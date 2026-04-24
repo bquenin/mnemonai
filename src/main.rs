@@ -1,6 +1,7 @@
 mod claude;
 mod cli;
 mod config;
+mod conversation_index;
 mod debug;
 mod debug_log;
 mod display;

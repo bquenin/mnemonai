@@ -49,6 +49,19 @@ struct QueryTerm<'a> {
     completed: bool,
 }
 
+/// Find a char-boundary at or after TOPIC_WINDOW_SIZE bytes.
+pub fn topic_end_for_text(text: &str) -> usize {
+    if text.len() <= TOPIC_WINDOW_SIZE {
+        text.len()
+    } else {
+        let mut end = TOPIC_WINDOW_SIZE;
+        while !text.is_char_boundary(end) && end < text.len() {
+            end += 1;
+        }
+        end
+    }
+}
+
 /// Precompute lowercased search text for all conversations.
 /// Moves `full_text` ownership from each Conversation into SearchableConversation
 /// to avoid storing the same text twice in memory.
@@ -58,18 +71,14 @@ pub fn precompute_search_text(conversations: &mut [Conversation]) -> Vec<Searcha
         .enumerate()
         .map(|(idx, conv)| {
             let full_text = std::mem::take(&mut conv.full_text);
-            let text_lower = normalize_for_search(&full_text);
-            // Find a char-boundary at or after TOPIC_WINDOW_SIZE bytes
-            let topic_end = if text_lower.len() <= TOPIC_WINDOW_SIZE {
-                text_lower.len()
-            } else {
-                // Advance past TOPIC_WINDOW_SIZE to the next char boundary
-                let mut end = TOPIC_WINDOW_SIZE;
-                while !text_lower.is_char_boundary(end) && end < text_lower.len() {
-                    end += 1;
-                }
-                end
-            };
+            let text_lower = conv
+                .search_text_lower
+                .take()
+                .unwrap_or_else(|| normalize_for_search(&full_text));
+            let topic_end = conv
+                .search_topic_end
+                .take()
+                .unwrap_or_else(|| topic_end_for_text(&text_lower));
             SearchableConversation {
                 text_lower,
                 full_text,
@@ -291,6 +300,8 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            search_text_lower: None,
+            search_topic_end: None,
         }
     }
 
@@ -430,10 +441,7 @@ mod tests {
                 now,
             ),
             // Dense: "deploy" appears many times in a short text
-            make_conv(
-                "deploy deploy deploy the deploy fix for deploy",
-                now,
-            ),
+            make_conv("deploy deploy deploy the deploy fix for deploy", now),
         ];
         let searchable = precompute_search_text(&mut convs);
         let results = search(&convs, &searchable, "deploy", now, None);
@@ -453,16 +461,16 @@ mod tests {
                 now - Duration::days(60),
             ),
             // Recent but barely relevant: "webpack" mentioned once, buried past the topic window
-            make_conv(
-                &format!("{padding} someone mentioned webpack once"),
-                now,
-            ),
+            make_conv(&format!("{padding} someone mentioned webpack once"), now),
         ];
         let searchable = precompute_search_text(&mut convs);
         let results = search(&convs, &searchable, "webpack", now, None);
         assert_eq!(results.len(), 2);
         // The highly relevant old conversation should beat the barely-relevant recent one
-        assert_eq!(results[0], 0, "highly relevant old convo should rank above barely relevant recent one");
+        assert_eq!(
+            results[0], 0,
+            "highly relevant old convo should rank above barely relevant recent one"
+        );
     }
 
     #[test]
@@ -473,21 +481,18 @@ mod tests {
         let padding = "x ".repeat(1500); // ~3000 chars of padding
         let mut convs = vec![
             // "migrate" only in the body (after the topic window)
-            make_conv(
-                &format!("{padding}migrate migrate migrate"),
-                now,
-            ),
+            make_conv(&format!("{padding}migrate migrate migrate"), now),
             // "migrate" in the topic window (beginning of conversation)
-            make_conv(
-                &format!("migrate migrate migrate {padding}"),
-                now,
-            ),
+            make_conv(&format!("migrate migrate migrate {padding}"), now),
         ];
         let searchable = precompute_search_text(&mut convs);
         let results = search(&convs, &searchable, "migrate", now, None);
         assert_eq!(results.len(), 2);
         // The conversation with topic-window hits should rank first
-        assert_eq!(results[0], 1, "topic-window match should rank higher than body-only match");
+        assert_eq!(
+            results[0], 1,
+            "topic-window match should rank higher than body-only match"
+        );
     }
 
     #[test]
@@ -505,7 +510,10 @@ mod tests {
         // "dia" as whole word should not match "diagnostics"
         assert_eq!(count_occurrences("diagnostics are useful", "dia", true), 0);
         // "dia" as whole word should match "dia" followed by space
-        assert_eq!(count_occurrences("dia is short for diagram", "dia", true), 1);
+        assert_eq!(
+            count_occurrences("dia is short for diagram", "dia", true),
+            1
+        );
         // "dia" at end of string
         assert_eq!(count_occurrences("this is dia", "dia", true), 1);
         // "dia" followed by punctuation
@@ -531,8 +539,15 @@ mod tests {
 
         // With trailing space: only the standalone "dia" matches
         let results = search(&convs, &searchable, "dia ", now, None);
-        assert_eq!(results.len(), 1, "completed term should only match whole word");
-        assert_eq!(results[0], 1, "should match the conversation with standalone 'dia'");
+        assert_eq!(
+            results.len(),
+            1,
+            "completed term should only match whole word"
+        );
+        assert_eq!(
+            results[0], 1,
+            "should match the conversation with standalone 'dia'"
+        );
     }
 
     #[test]
@@ -541,12 +556,18 @@ mod tests {
         let terms = parse_query_terms("foo bar");
         assert_eq!(terms.len(), 2);
         assert!(!terms[0].completed, "interior term is never completed");
-        assert!(!terms[1].completed, "last term without trailing space should not be completed");
+        assert!(
+            !terms[1].completed,
+            "last term without trailing space should not be completed"
+        );
 
         let terms = parse_query_terms("foo bar ");
         assert_eq!(terms.len(), 2);
         assert!(!terms[0].completed, "interior term is never completed");
-        assert!(terms[1].completed, "last term with trailing space should be completed");
+        assert!(
+            terms[1].completed,
+            "last term with trailing space should be completed"
+        );
 
         let terms = parse_query_terms("single");
         assert_eq!(terms.len(), 1);

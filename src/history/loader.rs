@@ -9,14 +9,33 @@ use super::path::{
 };
 use super::{Conversation, LoaderMessage, Project};
 use crate::cli::DebugLevel;
+use crate::conversation_index::{
+    CachedFileConversation, SourceFingerprint, attach_search_cache, fingerprint_from_metadata,
+    load_provider_cache, save_conversations,
+};
 use crate::debug;
 use crate::error::{AppError, Result};
+use crate::history::ProviderKind;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::read_dir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::SystemTime;
+
+enum ConversationLoad {
+    Cached(Conversation),
+    Fresh(Conversation, SourceFingerprint),
+}
+
+impl ConversationLoad {
+    fn into_conversation(self) -> Conversation {
+        match self {
+            Self::Cached(conversation) | Self::Fresh(conversation, _) => conversation,
+        }
+    }
+}
 
 /// Load conversations from ALL projects globally
 #[allow(dead_code)]
@@ -33,12 +52,14 @@ pub fn load_all_conversations(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
+    let cache = load_provider_cache(ProviderKind::Claude, show_last);
+
     // Load conversations from all projects in parallel
     let mut all_conversations: Vec<Conversation> = projects
         .par_iter()
         .flat_map(|project| {
             let project_dir = root.join(&project.name);
-            match load_conversations(&project_dir, show_last, debug_level) {
+            match load_conversations_with_cache(&project_dir, show_last, debug_level, &cache) {
                 Ok(mut convs) => {
                     // Fallback path for old JSONL files without cwd field
                     let fallback_path = decode_project_dir_name_to_path(&project.name);
@@ -135,11 +156,13 @@ fn load_all_streaming_inner(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
+    let cache = load_provider_cache(ProviderKind::Claude, show_last);
+
     // Process projects in parallel and send batches as they complete
     projects.par_iter().for_each(|project| {
         let project_dir = root.join(&project.name);
 
-        match load_conversations(&project_dir, show_last, debug_level) {
+        match load_conversations_with_cache(&project_dir, show_last, debug_level, &cache) {
             Ok(mut convs) => {
                 if convs.is_empty() {
                     return;
@@ -241,6 +264,16 @@ pub fn load_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
+    let cache = load_provider_cache(ProviderKind::Claude, show_last);
+    load_conversations_with_cache(projects_dir, show_last, debug_level, &cache)
+}
+
+fn load_conversations_with_cache(
+    projects_dir: &Path,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+    cache: &HashMap<PathBuf, CachedFileConversation>,
+) -> Result<Vec<Conversation>> {
     // Find all JSONL files and capture metadata in one pass
     let mut files_with_meta = Vec::new();
     let mut skipped_agent_files = 0;
@@ -258,12 +291,13 @@ pub fn load_conversations(
                 continue;
             }
 
-            let modified = entry
-                .metadata()
-                .ok()
+            let metadata = entry.metadata().ok();
+            let modified = metadata
+                .as_ref()
                 .and_then(|metadata| metadata.modified().ok());
+            let fingerprint = metadata.as_ref().map(fingerprint_from_metadata);
 
-            files_with_meta.push((path, modified));
+            files_with_meta.push((path, modified, fingerprint));
         }
     }
 
@@ -277,26 +311,44 @@ pub fn load_conversations(
     );
 
     // Sort by modification time (newest first)
-    files_with_meta.sort_by_key(|(_, modified)| modified.unwrap_or(SystemTime::UNIX_EPOCH));
+    files_with_meta.sort_by_key(|(_, modified, _)| modified.unwrap_or(SystemTime::UNIX_EPOCH));
     files_with_meta.reverse();
 
     // Process each file (potentially in parallel)
-    let mut conversations: Vec<Conversation> = files_with_meta
+    let loaded: Vec<ConversationLoad> = files_with_meta
         .into_par_iter()
-        .filter_map(|(path, modified)| {
+        .filter_map(|(path, modified, fingerprint)| {
             let filename = path
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or("unknown")
                 .to_owned();
 
+            if let Some(fingerprint) = fingerprint
+                && let Some(conversation) = cache
+                    .get(&path)
+                    .and_then(|cached| cached.conversation_if_fresh(fingerprint))
+            {
+                debug::debug(
+                    debug_level,
+                    &format!("Loaded {} from conversation index", filename),
+                );
+                return Some(ConversationLoad::Cached(conversation));
+            }
+
             match process_conversation_file(path, show_last, modified, debug_level) {
-                Ok(Some(conversation)) => {
+                Ok(Some(mut conversation)) => {
                     debug::debug(
                         debug_level,
                         &format!("Loaded {}: {}", filename, conversation.preview),
                     );
-                    Some(conversation)
+                    attach_search_cache(&mut conversation);
+                    match fingerprint {
+                        Some(fingerprint) => {
+                            Some(ConversationLoad::Fresh(conversation, fingerprint))
+                        }
+                        None => Some(ConversationLoad::Cached(conversation)),
+                    }
                 }
                 Ok(None) => None,
                 Err(e) => {
@@ -308,6 +360,22 @@ pub fn load_conversations(
                 }
             }
         })
+        .collect();
+
+    save_conversations(
+        ProviderKind::Claude,
+        show_last,
+        loaded.iter().filter_map(|loaded| match loaded {
+            ConversationLoad::Fresh(conversation, fingerprint) => {
+                Some((conversation, *fingerprint))
+            }
+            ConversationLoad::Cached(_) => None,
+        }),
+    );
+
+    let mut conversations: Vec<Conversation> = loaded
+        .into_iter()
+        .map(ConversationLoad::into_conversation)
         .collect();
 
     // Ensure deterministic ordering after parallel processing
