@@ -56,9 +56,7 @@ struct ConvInfo {
 
 impl CursorProvider {
     pub fn new() -> Self {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
         let cursor_user = home
             .join("Library")
             .join("Application Support")
@@ -179,8 +177,7 @@ impl CursorProvider {
     fn load_from_global_db(&self, show_last: bool) -> Result<Vec<Conversation>> {
         let conn = Connection::open_with_flags(
             &self.global_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let workspace_map = self.build_workspace_map();
         load_conversations_from_conn(&conn, show_last, &workspace_map, &self.global_db_path)
@@ -190,8 +187,7 @@ impl CursorProvider {
     fn load_bubbles(conv_id: &str, global_db_path: &Path) -> Result<Vec<Bubble>> {
         let conn = Connection::open_with_flags(
             global_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
 
         let prefix = format!("bubbleId:{}:", conv_id);
@@ -413,10 +409,7 @@ fn query_full_text_for_conv(cursor_conn: &Connection, conv_id: &str) -> String {
 }
 
 /// Batch-insert full-text entries into the cache in a single transaction.
-fn save_full_text_to_cache(
-    cache_conn: &Connection,
-    entries: &[(String, String, usize)],
-) {
+fn save_full_text_to_cache(cache_conn: &Connection, entries: &[(String, String, usize)]) {
     if entries.is_empty() {
         return;
     }
@@ -475,10 +468,7 @@ fn build_full_text_map(
 }
 
 /// Batch-fetch bubble values by key using IN clauses.
-fn batch_fetch_bubbles(
-    conn: &Connection,
-    keys: &[String],
-) -> Result<HashMap<String, Value>> {
+fn batch_fetch_bubbles(conn: &Connection, keys: &[String]) -> Result<HashMap<String, Value>> {
     let mut bubble_map: HashMap<String, Value> = HashMap::with_capacity(keys.len());
     for chunk in keys.chunks(200) {
         let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
@@ -487,8 +477,10 @@ fn batch_fetch_bubbles(
             placeholders.join(",")
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|k| k as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|k| k as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -552,11 +544,17 @@ fn build_conversation(
 
     let model = bubble_map
         .get(&info.first_key)
-        .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
+        .and_then(|v| {
+            v.get("modelType")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        })
         .or_else(|| {
-            bubble_map
-                .get(&info.preview_key)
-                .and_then(|v| v.get("modelType").and_then(|m| m.as_str()).map(String::from))
+            bubble_map.get(&info.preview_key).and_then(|v| {
+                v.get("modelType")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
         });
 
     let ws_info = workspace_map.get(&info.conv_id);
@@ -705,7 +703,16 @@ fn load_conversations_from_conn_inner(
 
     let conversations: Vec<Conversation> = conv_infos
         .iter()
-        .filter_map(|info| build_conversation(info, &bubble_map, &index_timestamps, workspace_map, &full_text_map, db_path))
+        .filter_map(|info| {
+            build_conversation(
+                info,
+                &bubble_map,
+                &index_timestamps,
+                workspace_map,
+                &full_text_map,
+                db_path,
+            )
+        })
         .collect();
 
     Ok(conversations)
@@ -717,7 +724,7 @@ impl super::Provider for CursorProvider {
     }
 
     fn name(&self) -> &str {
-        "Cursor"
+        "Cursor (IDE)"
     }
 
     fn detect(&self) -> bool {
@@ -820,7 +827,14 @@ impl super::Provider for CursorProvider {
             let mut phase1_convs = Vec::new();
             let mut remaining_infos = Vec::new();
             for info in conv_infos {
-                if let Some(conv) = build_conversation(&info, &bubble_map, &index_timestamps, &workspace_map, &full_text_map, &global_db_path) {
+                if let Some(conv) = build_conversation(
+                    &info,
+                    &bubble_map,
+                    &index_timestamps,
+                    &workspace_map,
+                    &full_text_map,
+                    &global_db_path,
+                ) {
                     phase1_convs.push(conv);
                 } else {
                     remaining_infos.push(info);
@@ -868,7 +882,16 @@ impl super::Provider for CursorProvider {
 
                 let phase2_convs: Vec<Conversation> = remaining_infos
                     .iter()
-                    .filter_map(|info| build_conversation(info, &full_map, &index_timestamps, &workspace_map, &full_text_map, &global_db_path))
+                    .filter_map(|info| {
+                        build_conversation(
+                            info,
+                            &full_map,
+                            &index_timestamps,
+                            &workspace_map,
+                            &full_text_map,
+                            &global_db_path,
+                        )
+                    })
                     .collect();
 
                 if !phase2_convs.is_empty() {
@@ -914,17 +937,11 @@ impl super::Provider for CursorProvider {
         }
 
         // Open the conversation via URI (routes to the focused window)
-        let uri = format!(
-            "cursor://{}/open?id={}",
-            EXTENSION_ID, conversation.id
-        );
+        let uri = format!("cursor://{}/open?id={}", EXTENSION_ID, conversation.id);
 
-        Command::new("open")
-            .arg(&uri)
-            .status()
-            .map_err(|e| {
-                AppError::ClaudeExecutionError(format!("Failed to open Cursor URI: {}", e))
-            })?;
+        Command::new("open").arg(&uri).status().map_err(|e| {
+            AppError::ClaudeExecutionError(format!("Failed to open Cursor URI: {}", e))
+        })?;
 
         Ok(())
     }
@@ -932,9 +949,9 @@ impl super::Provider for CursorProvider {
     fn delete(&self, conversation: &Conversation) -> Result<()> {
         let conn = Connection::open_with_flags(
             &self.global_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ).map_err(|e| {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
             AppError::ClaudeExecutionError(format!(
                 "Failed to open Cursor database for writing: {}",
                 e
@@ -1028,17 +1045,15 @@ fn parse_bubble(json_str: &str) -> Option<Bubble> {
         .unwrap_or("")
         .to_string();
 
-    let rich_text = v
-        .get("richText")
-        .and_then(|r| {
-            if r.is_string() {
-                r.as_str().map(String::from)
-            } else if r.is_object() {
-                Some(r.to_string())
-            } else {
-                None
-            }
-        });
+    let rich_text = v.get("richText").and_then(|r| {
+        if r.is_string() {
+            r.as_str().map(String::from)
+        } else if r.is_object() {
+            Some(r.to_string())
+        } else {
+            None
+        }
+    });
 
     let created_at = v
         .get("createdAt")
@@ -1069,30 +1084,37 @@ fn parse_bubble(json_str: &str) -> Option<Bubble> {
         .and_then(|t| t.get("name"))
         .and_then(|n| n.as_str())
         .map(String::from);
-    let tool_args = tool_former
-        .and_then(|t| {
-            // Try rawArgs first, fall back to params (newer Cursor format)
-            let raw = t.get("rawArgs").and_then(|a| {
-                if let Some(s) = a.as_str() {
-                    if s.is_empty() { None } else { Some(s.to_string()) }
-                } else if a.is_object() || a.is_array() {
-                    Some(a.to_string())
+    let tool_args = tool_former.and_then(|t| {
+        // Try rawArgs first, fall back to params (newer Cursor format)
+        let raw = t.get("rawArgs").and_then(|a| {
+            if let Some(s) = a.as_str() {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            } else if a.is_object() || a.is_array() {
+                Some(a.to_string())
+            } else {
+                None
+            }
+        });
+        raw.or_else(|| {
+            t.get("params").and_then(|p| {
+                if let Some(s) = p.as_str() {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
+                } else if p.is_object() || p.is_array() {
+                    Some(p.to_string())
                 } else {
                     None
                 }
-            });
-            raw.or_else(|| {
-                t.get("params").and_then(|p| {
-                    if let Some(s) = p.as_str() {
-                        if s.is_empty() { None } else { Some(s.to_string()) }
-                    } else if p.is_object() || p.is_array() {
-                        Some(p.to_string())
-                    } else {
-                        None
-                    }
-                })
             })
-        });
+        })
+    });
     let tool_call_id = tool_former
         .and_then(|t| t.get("toolCallId"))
         .and_then(|i| i.as_str())
@@ -1321,9 +1343,7 @@ fn truncate_str(s: &str, max_bytes: usize) -> String {
 }
 
 fn is_extension_installed() -> bool {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
     let extensions_dir = home.join(".cursor").join("extensions");
     let ext_dir = extensions_dir.join("mnemonai.mnemonai-bridge-0.1.0");
 
@@ -1356,9 +1376,7 @@ fn is_extension_installed() -> bool {
 }
 
 fn install_extension() -> Result<()> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
     let extensions_dir = home.join(".cursor").join("extensions");
     let ext_dir = extensions_dir.join("mnemonai.mnemonai-bridge-0.1.0");
 
@@ -1492,10 +1510,7 @@ mod tests {
         let entry = bubble_to_log_entry(&bubble).unwrap();
         match entry {
             crate::claude::LogEntry::User { message, .. } => {
-                assert_eq!(
-                    crate::claude::extract_text_from_user(&message),
-                    "Hello"
-                );
+                assert_eq!(crate::claude::extract_text_from_user(&message), "Hello");
             }
             _ => panic!("Expected User entry"),
         }
@@ -1567,7 +1582,10 @@ mod tests {
 
         let with_project = convs.iter().filter(|c| c.project_name.is_some()).count();
         let with_summary = convs.iter().filter(|c| c.summary.is_some()).count();
-        eprintln!("{} have project names, {} have titles", with_project, with_summary);
+        eprintln!(
+            "{} have project names, {} have titles",
+            with_project, with_summary
+        );
 
         for conv in convs.iter().take(3) {
             eprintln!(
@@ -1666,8 +1684,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1, "Should discover the conversation");
         assert_eq!(convs[0].preview, "How do I fix this bug?");
@@ -1703,8 +1720,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "Hello world");
@@ -1740,10 +1756,13 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
 
-        assert_eq!(convs.len(), 0, "Should skip conversation with no user bubbles");
+        assert_eq!(
+            convs.len(),
+            0,
+            "Should skip conversation with no user bubbles"
+        );
     }
 
     #[test]
@@ -1787,12 +1806,10 @@ mod tests {
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
 
-        let convs_first =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs_first = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
         assert_eq!(convs_first[0].preview, "First question");
 
-        let convs_last =
-            load_conversations_from_conn(&conn, true, &ws_map, &db_path).unwrap();
+        let convs_last = load_conversations_from_conn(&conn, true, &ws_map, &db_path).unwrap();
         assert_eq!(convs_last[0].preview, "Follow-up question");
     }
 
@@ -1818,8 +1835,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "Rich text content");
@@ -1881,8 +1897,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 2, "Should discover 2 of 3 conversations");
         let ids: Vec<&str> = convs.iter().map(|c| c.id.as_str()).collect();
@@ -1923,8 +1938,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs =
-            load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1);
         // The timestamp should come from the first_key (assistant at 10:00:00Z),
@@ -1981,14 +1995,8 @@ mod tests {
         );
 
         let (min_key, max_key) = query_user_key_for_conv(&conn, conv);
-        assert_eq!(
-            min_key,
-            Some(format!("bubbleId:{}:11111111-user1", conv))
-        );
-        assert_eq!(
-            max_key,
-            Some(format!("bubbleId:{}:eeeeeeee-user2", conv))
-        );
+        assert_eq!(min_key, Some(format!("bubbleId:{}:11111111-user1", conv)));
+        assert_eq!(max_key, Some(format!("bubbleId:{}:eeeeeeee-user2", conv)));
     }
 
     #[test]
@@ -2092,10 +2100,9 @@ mod tests {
         let db_path = PathBuf::from("/tmp/test.vscdb");
 
         // First call: populates cache
-        let convs = load_conversations_from_conn_inner(
-            &conn, false, &ws_map, &db_path, Some(&cache),
-        )
-        .unwrap();
+        let convs =
+            load_conversations_from_conn_inner(&conn, false, &ws_map, &db_path, Some(&cache))
+                .unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "My question");
 
@@ -2104,10 +2111,9 @@ mod tests {
         assert!(cached.contains_key(conv));
 
         // Second call: uses cache (same result)
-        let convs2 = load_conversations_from_conn_inner(
-            &conn, false, &ws_map, &db_path, Some(&cache),
-        )
-        .unwrap();
+        let convs2 =
+            load_conversations_from_conn_inner(&conn, false, &ws_map, &db_path, Some(&cache))
+                .unwrap();
         assert_eq!(convs2.len(), 1);
         assert_eq!(convs2[0].preview, "My question");
     }

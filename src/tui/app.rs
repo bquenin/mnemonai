@@ -22,7 +22,8 @@ use std::time::Duration;
 fn provider_theme(kind: &ProviderKind) -> (String, (u8, u8, u8), (u8, u8, u8)) {
     match kind {
         ProviderKind::Claude => ("Claude".to_string(), (218, 119, 86), (170, 93, 67)),
-        ProviderKind::Cursor => ("Cursor".to_string(), (180, 130, 230), (140, 100, 180)),
+        ProviderKind::Cursor => ("Cursor IDE".to_string(), (180, 130, 230), (140, 100, 180)),
+        ProviderKind::CursorAgent => ("Cursor Agent".to_string(), (94, 184, 255), (72, 140, 194)),
     }
 }
 
@@ -182,9 +183,7 @@ impl App {
         show_deleted_projects: bool,
     ) -> Self {
         if !show_deleted_projects {
-            conversations.retain(|c| {
-                c.project_path.as_ref().map_or(true, |p| p.exists())
-            });
+            conversations.retain(|c| c.project_path.as_ref().map_or(true, |p| p.exists()));
         }
         let searchable = search::precompute_search_text(&mut conversations);
         let filtered: Vec<usize> = (0..conversations.len()).collect();
@@ -306,9 +305,7 @@ impl App {
     /// Note: Does NOT precompute search text - that's deferred to finish_loading.
     pub fn append_conversations(&mut self, mut new_convs: Vec<Conversation>) {
         if !self.show_deleted_projects {
-            new_convs.retain(|c| {
-                c.project_path.as_ref().map_or(true, |p| p.exists())
-            });
+            new_convs.retain(|c| c.project_path.as_ref().map_or(true, |p| p.exists()));
         }
         self.conversations.extend(new_convs);
 
@@ -387,14 +384,13 @@ impl App {
     fn update_filter(&mut self) {
         let now = Local::now();
         // When the new query extends the previous one, only rescore the already-filtered subset
-        let narrow_hint = if !self.previous_query.is_empty()
-            && self.query.starts_with(&self.previous_query)
-        {
-            // Move filtered out to avoid clone; search() will produce the new value
-            Some(std::mem::take(&mut self.filtered))
-        } else {
-            None
-        };
+        let narrow_hint =
+            if !self.previous_query.is_empty() && self.query.starts_with(&self.previous_query) {
+                // Move filtered out to avoid clone; search() will produce the new value
+                Some(std::mem::take(&mut self.filtered))
+            } else {
+                None
+            };
         self.filtered = search::search(
             &self.conversations,
             &self.searchable,
@@ -654,7 +650,11 @@ impl App {
     }
 
     /// Handle a key event during export/yank menu mode
-    fn handle_menu_key(&mut self, code: KeyCode, providers: &[Box<dyn Provider>]) -> Option<Action> {
+    fn handle_menu_key(
+        &mut self,
+        code: KeyCode,
+        providers: &[Box<dyn Provider>],
+    ) -> Option<Action> {
         let (selected, is_yank) = match &mut self.dialog_mode {
             DialogMode::ExportMenu { selected } => (selected, false),
             DialogMode::YankMenu { selected } => (selected, true),
@@ -742,8 +742,10 @@ impl App {
 
         let assistant_label = match conv.map(|c| &c.provider) {
             Some(ProviderKind::Cursor) => "Cursor",
+            Some(ProviderKind::CursorAgent) => "Cursor Agent",
             _ => "Claude",
-        }.to_string();
+        }
+        .to_string();
 
         let export_options = match &self.app_mode {
             AppMode::View(state) => crate::tui::export::ExportOptions {
@@ -759,8 +761,11 @@ impl App {
             // Use provider to read entries for export
             match provider.read_entries(conv) {
                 Ok(entries) => {
-                    let content =
-                        crate::tui::export::generate_content_from_entries(&entries, format, export_options);
+                    let content = crate::tui::export::generate_content_from_entries(
+                        &entries,
+                        format,
+                        export_options,
+                    );
                     if to_clipboard {
                         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&content)) {
                             Ok(()) => crate::tui::export::ExportResult {
@@ -1348,11 +1353,7 @@ impl App {
     }
 
     /// Enter view mode for the currently selected conversation
-    pub fn enter_view_mode(
-        &mut self,
-        content_width: usize,
-        providers: &[Box<dyn Provider>],
-    ) {
+    pub fn enter_view_mode(&mut self, content_width: usize, providers: &[Box<dyn Provider>]) {
         use crate::tui::viewer::{RenderOptions, render_entries};
 
         let Some(selected) = self.selected else {
@@ -1519,11 +1520,7 @@ impl App {
     }
 
     /// Re-render the view with current toggle settings
-    fn re_render_view(
-        &mut self,
-        viewport_height: usize,
-        providers: &[Box<dyn Provider>],
-    ) {
+    fn re_render_view(&mut self, viewport_height: usize, providers: &[Box<dyn Provider>]) {
         use crate::tui::viewer::{RenderOptions, render_conversation, render_entries};
 
         if let AppMode::View(ref mut state) = self.app_mode {
@@ -1714,8 +1711,11 @@ pub fn run(
                     match action {
                         Action::Delete(ref path) => {
                             // Delete through provider dispatch
-                            let conv =
-                                app.conversations().iter().find(|c| &c.path == path).cloned();
+                            let conv = app
+                                .conversations()
+                                .iter()
+                                .find(|c| &c.path == path)
+                                .cloned();
                             let deleted = if let Some(ref conv) = conv {
                                 if let Some(provider) =
                                     providers.iter().find(|p| p.kind() == conv.provider)
@@ -1772,7 +1772,12 @@ pub fn run_with_loader(
     }));
 
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_loading(use_relative_time, tool_display, show_thinking, show_deleted_projects);
+    let mut app = App::new_loading(
+        use_relative_time,
+        tool_display,
+        show_thinking,
+        show_deleted_projects,
+    );
 
     loop {
         // Process all pending loader messages (non-blocking)
@@ -1844,8 +1849,11 @@ pub fn run_with_loader(
                 match action {
                     Action::Delete(ref path) => {
                         // Delete through provider dispatch
-                        let conv =
-                            app.conversations().iter().find(|c| &c.path == path).cloned();
+                        let conv = app
+                            .conversations()
+                            .iter()
+                            .find(|c| &c.path == path)
+                            .cloned();
                         let deleted = if let Some(ref conv) = conv {
                             if let Some(provider) =
                                 providers.iter().find(|p| p.kind() == conv.provider)

@@ -30,6 +30,7 @@ pub use path::{convert_path_to_project_dir_name, format_short_name_from_path};
 pub enum ProviderKind {
     Claude,
     Cursor,
+    CursorAgent,
 }
 
 /// Represents a JSONL parsing error with context for debugging
@@ -50,7 +51,7 @@ pub struct Conversation {
     pub index: usize,
     /// Which provider this conversation belongs to
     pub provider: ProviderKind,
-    /// Unique identifier (session UUID for Claude, composer ID for Cursor)
+    /// Unique identifier (session UUID for Claude, composer/chat ID for Cursor)
     pub id: String,
     pub timestamp: DateTime<Local>,
     pub preview: String,

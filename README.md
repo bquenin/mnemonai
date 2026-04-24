@@ -7,7 +7,8 @@ Universal AI coding conversation history browser. Search, browse, and resume con
 | Tool | History Format | Resume Support |
 |------|---------------|----------------|
 | **Claude Code** | JSONL files in `~/.claude/projects/` | `claude --resume <session-id>` |
-| **Cursor** | SQLite in workspace storage | Bridge extension + `cursor://` URI |
+| **Cursor Agent CLI** | JSONL transcripts in `~/.cursor/projects/*/agent-transcripts/` | `agent --resume <chat-id>` |
+| **Cursor (IDE)** | SQLite in workspace storage | Bridge extension + `cursor://` URI |
 
 ## Supported Platforms
 
@@ -102,7 +103,7 @@ pager = false                 # Use pager (less) for output
 show_deleted_projects = false # Include conversations from deleted directories
 
 [resume]
-default_args = []             # Default args passed to 'claude --resume'
+default_args = []             # Default args passed to 'claude --resume' for Claude Code sessions
 ```
 
 ## Releasing
