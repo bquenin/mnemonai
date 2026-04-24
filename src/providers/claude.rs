@@ -1,4 +1,5 @@
 use crate::claude::LogEntry;
+use crate::conversation_index::delete_conversation;
 use crate::error::{AppError, Result};
 use crate::history::{self, Conversation, LoaderMessage, ProviderKind};
 use crate::tui::viewer;
@@ -90,7 +91,9 @@ impl super::Provider for ClaudeProvider {
     }
 
     fn delete(&self, conversation: &Conversation) -> Result<()> {
-        std::fs::remove_file(&conversation.path).map_err(AppError::Io)
+        std::fs::remove_file(&conversation.path).map_err(AppError::Io)?;
+        delete_conversation(ProviderKind::Claude, &conversation.path);
+        Ok(())
     }
 }
 

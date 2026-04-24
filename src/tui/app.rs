@@ -301,17 +301,13 @@ impl App {
     }
 
     /// Append a batch of conversations during loading.
-    /// Maintains sorted order (newest first) so the list looks correct while loading.
-    /// Note: Does NOT precompute search text - that's deferred to finish_loading.
+    /// Defers global sort and search precompute until finish_loading to avoid
+    /// repeated O(n log n) work while provider batches are still arriving.
     pub fn append_conversations(&mut self, mut new_convs: Vec<Conversation>) {
         if !self.show_deleted_projects {
             new_convs.retain(|c| c.project_path.as_ref().map_or(true, |p| p.exists()));
         }
         self.conversations.extend(new_convs);
-
-        // Re-sort all conversations by timestamp (newest first)
-        self.conversations
-            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
         // Rebuild filtered as sequential indices (no search during loading)
         self.filtered = (0..self.conversations.len()).collect();

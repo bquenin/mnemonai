@@ -17,6 +17,7 @@ mod path;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -34,7 +35,7 @@ pub enum ProviderKind {
 }
 
 /// Represents a JSONL parsing error with context for debugging
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ParseError {
     pub line_number: usize,
     pub line_content: String,
@@ -72,6 +73,10 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+    /// Cached lowercased full text for search, when loaded from the persistent index.
+    pub search_text_lower: Option<String>,
+    /// Cached byte offset where the topic window ends in `search_text_lower`.
+    pub search_topic_end: Option<usize>,
 }
 
 pub struct Project {

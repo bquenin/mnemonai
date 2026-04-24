@@ -1,6 +1,6 @@
 mod app;
 mod export;
-mod search;
+pub(crate) mod search;
 mod ui;
 pub mod viewer;
 
