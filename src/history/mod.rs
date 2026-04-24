@@ -17,6 +17,7 @@ mod path;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -34,7 +35,7 @@ pub enum ProviderKind {
 }
 
 /// Represents a JSONL parsing error with context for debugging
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ParseError {
     pub line_number: usize,
     pub line_content: String,

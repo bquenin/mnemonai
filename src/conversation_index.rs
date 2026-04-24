@@ -12,7 +12,7 @@ use std::fs::Metadata;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceFingerprint {
@@ -81,10 +81,10 @@ where
                 schema_version, provider, show_last, source_path, source_mtime_millis,
                 source_size, id, timestamp, preview, full_text, search_text_lower,
                 search_topic_end, project_name, project_path, cwd, message_count,
-                summary, model, total_tokens, duration_minutes
+                parse_errors_json, summary, model, total_tokens, duration_minutes
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21
             )",
         ) {
             Ok(stmt) => stmt,
@@ -101,6 +101,8 @@ where
             let topic_end = conversation
                 .search_topic_end
                 .unwrap_or_else(|| topic_end_for_text(text_lower));
+            let parse_errors_json = serde_json::to_string(&conversation.parse_errors)
+                .unwrap_or_else(|_| "[]".to_string());
 
             if stmt
                 .execute(params![
@@ -120,6 +122,7 @@ where
                     path_to_string(conversation.project_path.as_ref()),
                     path_to_string(conversation.cwd.as_ref()),
                     conversation.message_count as i64,
+                    parse_errors_json,
                     conversation.summary.as_deref(),
                     conversation.model.as_deref(),
                     conversation.total_tokens.min(i64::MAX as u64) as i64,
@@ -137,6 +140,17 @@ where
     let _ = tx.commit();
 }
 
+pub fn delete_conversation(provider: ProviderKind, path: &std::path::Path) {
+    let Some(conn) = open_index_db() else {
+        return;
+    };
+
+    let _ = conn.execute(
+        "DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2",
+        params![provider_key(&provider), path.to_string_lossy()],
+    );
+}
+
 fn load_provider_cache_from_conn(
     conn: &Connection,
     provider: ProviderKind,
@@ -146,7 +160,8 @@ fn load_provider_cache_from_conn(
         "SELECT
             source_path, source_mtime_millis, source_size, id, timestamp, preview,
             full_text, search_text_lower, search_topic_end, project_name, project_path,
-            cwd, message_count, summary, model, total_tokens, duration_minutes
+            cwd, message_count, parse_errors_json, summary, model, total_tokens,
+            duration_minutes
          FROM file_conversations
          WHERE schema_version = ?1 AND provider = ?2 AND show_last = ?3",
     )?;
@@ -165,8 +180,10 @@ fn load_provider_cache_from_conn(
                 .unwrap_or_else(|_| Local::now());
             let search_topic_end: i64 = row.get(8)?;
             let message_count: i64 = row.get(12)?;
-            let total_tokens: i64 = row.get(15)?;
-            let duration_minutes: Option<i64> = row.get(16)?;
+            let parse_errors_json: String = row.get(13)?;
+            let parse_errors = serde_json::from_str(&parse_errors_json).unwrap_or_default();
+            let total_tokens: i64 = row.get(16)?;
+            let duration_minutes: Option<i64> = row.get(17)?;
 
             Ok((
                 PathBuf::from(&source_path),
@@ -189,9 +206,9 @@ fn load_provider_cache_from_conn(
                         project_path: optional_path(row.get(10)?),
                         cwd: optional_path(row.get(11)?),
                         message_count: message_count.max(0) as usize,
-                        parse_errors: Vec::new(),
-                        summary: row.get(13)?,
-                        model: row.get(14)?,
+                        parse_errors,
+                        summary: row.get(14)?,
+                        model: row.get(15)?,
                         total_tokens: total_tokens.max(0) as u64,
                         duration_minutes: duration_minutes.map(|v| v.max(0) as u64),
                     },
@@ -235,6 +252,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              project_path          TEXT,
              cwd                   TEXT,
              message_count         INTEGER NOT NULL,
+             parse_errors_json     TEXT NOT NULL,
              summary               TEXT,
              model                 TEXT,
              total_tokens          INTEGER NOT NULL,
@@ -315,6 +333,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let mut conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
+        conversation.parse_errors.push(crate::history::ParseError {
+            line_number: 7,
+            line_content: "{bad json".to_string(),
+            error_message: "expected value".to_string(),
+            context_before: vec!["before".to_string()],
+            context_after: vec!["after".to_string()],
+        });
         attach_search_cache(&mut conversation);
         let fingerprint = SourceFingerprint {
             modified_millis: 123,
@@ -334,6 +359,8 @@ mod tests {
         let loaded = cached.conversation_if_fresh(fingerprint).unwrap();
 
         assert_eq!(loaded.id, "session-1");
+        assert_eq!(loaded.parse_errors.len(), 1);
+        assert_eq!(loaded.parse_errors[0].line_number, 7);
         assert_eq!(
             loaded.search_text_lower.as_deref(),
             Some("hello cache body")
@@ -345,6 +372,46 @@ mod tests {
                     size: 456
                 })
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn delete_conversation_removes_cached_rows_for_all_preview_modes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
+        attach_search_cache(&mut conversation);
+        let fingerprint = SourceFingerprint {
+            modified_millis: 123,
+            size: 456,
+        };
+
+        save_conversations_to_conn(
+            &conn,
+            ProviderKind::Claude,
+            false,
+            [(&conversation, fingerprint)],
+        )
+        .unwrap();
+        save_conversations_to_conn(
+            &conn,
+            ProviderKind::Claude,
+            true,
+            [(&conversation, fingerprint)],
+        )
+        .unwrap();
+
+        delete_conversation_from_conn(&mut conn, ProviderKind::Claude, &conversation.path).unwrap();
+
+        assert!(
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, true)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -362,14 +429,15 @@ mod tests {
                 schema_version, provider, show_last, source_path, source_mtime_millis,
                 source_size, id, timestamp, preview, full_text, search_text_lower,
                 search_topic_end, project_name, project_path, cwd, message_count,
-                summary, model, total_tokens, duration_minutes
+                parse_errors_json, summary, model, total_tokens, duration_minutes
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21
             )",
         )?;
 
         for (conversation, fingerprint) in entries {
+            let parse_errors_json = serde_json::to_string(&conversation.parse_errors).unwrap();
             stmt.execute(params![
                 SCHEMA_VERSION,
                 provider_key(&provider),
@@ -387,6 +455,7 @@ mod tests {
                 path_to_string(conversation.project_path.as_ref()),
                 path_to_string(conversation.cwd.as_ref()),
                 conversation.message_count as i64,
+                parse_errors_json,
                 conversation.summary.as_deref(),
                 conversation.model.as_deref(),
                 conversation.total_tokens as i64,
@@ -394,6 +463,18 @@ mod tests {
             ])?;
         }
 
+        Ok(())
+    }
+
+    fn delete_conversation_from_conn(
+        conn: &mut Connection,
+        provider: ProviderKind,
+        path: &std::path::Path,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2",
+            params![provider_key(&provider), path.to_string_lossy()],
+        )?;
         Ok(())
     }
 }

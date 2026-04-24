@@ -3,8 +3,8 @@ use crate::claude::{
 };
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, attach_search_cache, fingerprint_from_metadata,
-    load_provider_cache, save_conversations,
+    CachedFileConversation, SourceFingerprint, attach_search_cache, delete_conversation,
+    fingerprint_from_metadata, load_provider_cache, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -367,11 +367,13 @@ impl super::Provider for CursorAgentProvider {
         if let Some(transcript_dir) = transcript_parent_dir(&conversation.path, &conversation.id) {
             if transcript_dir.exists() {
                 fs::remove_dir_all(transcript_dir)?;
+                delete_conversation(ProviderKind::CursorAgent, &conversation.path);
                 return Ok(());
             }
         }
 
         fs::remove_file(&conversation.path)?;
+        delete_conversation(ProviderKind::CursorAgent, &conversation.path);
         Ok(())
     }
 }
