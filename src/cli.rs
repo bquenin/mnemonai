@@ -84,11 +84,11 @@ pub struct Args {
     #[arg(long, group = "thinking_display")]
     pub hide_thinking: bool,
 
-    /// Resume the selected conversation in the Claude CLI
+    /// Resume the selected conversation in its original tool
     #[arg(
         long,
         short = 'c',
-        help = "Resume the selected conversation in Claude Code"
+        help = "Resume the selected conversation in its original tool"
     )]
     pub resume: bool,
 
@@ -123,10 +123,7 @@ pub struct Args {
     pub local: bool,
 
     /// Include conversations from deleted project directories
-    #[arg(
-        long,
-        help = "Include conversations from deleted project directories"
-    )]
+    #[arg(long, help = "Include conversations from deleted project directories")]
     pub show_deleted_projects: bool,
 
     /// Display output through a pager (less)

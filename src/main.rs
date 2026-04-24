@@ -19,9 +19,9 @@ use error::{AppError, Result};
 use history::LoaderMessage;
 use providers::Provider;
 use std::io::IsTerminal;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 
 fn main() {
     if let Err(e) = run() {
@@ -108,12 +108,14 @@ fn run() -> Result<()> {
         std::io::stdout().is_terminal(),
     );
     let use_global = !args.local && !config.local.unwrap_or(false);
-    let show_deleted_projects = args.show_deleted_projects || display_config.show_deleted_projects.unwrap_or(false);
+    let show_deleted_projects =
+        args.show_deleted_projects || display_config.show_deleted_projects.unwrap_or(false);
 
     // Build provider registry
     let exclude_paths = config.exclude.unwrap_or_default();
     let providers: Vec<Box<dyn Provider>> = vec![
         Box::new(providers::claude::ClaudeProvider::new(exclude_paths)),
+        Box::new(providers::cursor_agent::CursorAgentProvider::new()),
         Box::new(providers::cursor::CursorProvider::new()),
     ];
 
@@ -172,8 +174,14 @@ fn run() -> Result<()> {
             .collect();
         let rx = merge_streaming_loaders(receivers);
 
-        match tui::run_with_loader(rx, use_relative_time, tool_display, show_thinking, show_deleted_projects, &providers)?
-        {
+        match tui::run_with_loader(
+            rx,
+            use_relative_time,
+            tool_display,
+            show_thinking,
+            show_deleted_projects,
+            &providers,
+        )? {
             (tui::Action::Select(path), convs) => (convs, path),
             (tui::Action::Resume(path), convs) => {
                 resume_conversation(&convs, &path, &providers, default_args)?;
@@ -198,11 +206,8 @@ fn run() -> Result<()> {
                 Ok(mut convs) => {
                     // For non-Claude providers, filter to current directory
                     if provider.kind() != history::ProviderKind::Claude {
-                        convs.retain(|c| {
-                            c.project_path
-                                .as_ref()
-                                .is_some_and(|p| p == &current_dir)
-                        });
+                        convs
+                            .retain(|c| c.project_path.as_ref().is_some_and(|p| p == &current_dir));
                     }
                     conversations.extend(convs);
                 }
@@ -247,11 +252,7 @@ fn run() -> Result<()> {
         let conv = conversations.iter().find(|c| c.path == selected_path);
         let id = conv
             .map(|c| c.id.as_str())
-            .or_else(|| {
-                selected_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-            })
+            .or_else(|| selected_path.file_stem().and_then(|stem| stem.to_str()))
             .ok_or_else(|| {
                 AppError::ClaudeExecutionError(
                     "Conversation filename is not valid Unicode".to_string(),

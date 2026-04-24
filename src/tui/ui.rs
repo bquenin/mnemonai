@@ -91,17 +91,22 @@ fn format_tokens_long(tokens: u64) -> String {
 }
 
 /// Create a colored provider badge span
-fn provider_badge(provider: ProviderKind) -> Span<'static> {
+fn provider_badge_text(provider: ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Claude => Span::styled(
-            "[Claude] ",
-            Style::default().fg(Color::Rgb(218, 119, 86)), // Claude terracotta
-        ),
-        ProviderKind::Cursor => Span::styled(
-            "[Cursor] ",
-            Style::default().fg(Color::Rgb(180, 130, 230)), // Cursor purple
-        ),
+        ProviderKind::Claude => "[Claude] ",
+        ProviderKind::Cursor => "[Cursor] ",
+        ProviderKind::CursorAgent => "[Cursor CLI] ",
     }
+}
+
+fn provider_badge(provider: ProviderKind) -> Span<'static> {
+    let color = match provider {
+        ProviderKind::Claude => Color::Rgb(218, 119, 86), // Claude terracotta
+        ProviderKind::Cursor => Color::Rgb(180, 130, 230), // Cursor purple
+        ProviderKind::CursorAgent => Color::Rgb(94, 184, 255), // Cursor agent blue
+    };
+
+    Span::styled(provider_badge_text(provider), Style::default().fg(color))
 }
 
 /// Render the TUI
@@ -250,11 +255,7 @@ fn header_fits_single_line(conv: &crate::history::Conversation, terminal_width: 
         3 + formatted.len() // " · " + duration
     });
 
-    // Provider badge length: "[Claude] " = 10, "[Cursor] " = 10
-    let badge_len = match conv.provider {
-        ProviderKind::Claude => "[Claude] ".len(),
-        ProviderKind::Cursor => "[Cursor] ".len(),
-    };
+    let badge_len = provider_badge_text(conv.provider.clone()).len();
 
     // Format: "  [Provider] project · model · msg_count · duration · tokens · timestamp · summary"
     let total_len = 2
@@ -354,12 +355,16 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             // Calculate header length to determine if long token format fits
             let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
             let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
-            let badge_len = match conv.provider {
-                ProviderKind::Claude => "[Claude] ".len(),
-                ProviderKind::Cursor => "[Cursor] ".len(),
-            };
-            let base_len =
-                2 + badge_len + project.len() + 3 + model_len + msg_count.len() + duration_len + 3 + 16; // 16 = timestamp
+            let badge_len = provider_badge_text(conv.provider.clone()).len();
+            let base_len = 2
+                + badge_len
+                + project.len()
+                + 3
+                + model_len
+                + msg_count.len()
+                + duration_len
+                + 3
+                + 16; // 16 = timestamp
 
             let tokens = if conv.total_tokens > 0 {
                 let long_form = format_tokens_long(conv.total_tokens);
@@ -1090,16 +1095,14 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let right_len =
                 msg_count.chars().count() + duration_len + 3 + timestamp.chars().count(); // 3 for " · "
             let indicator_len = indicator.chars().count();
-            let badge_len = match conv.provider {
-                ProviderKind::Claude => "[Claude] ".chars().count(),
-                ProviderKind::Cursor => "[Cursor] ".chars().count(),
-            };
+            let badge_len = provider_badge_text(conv.provider.clone()).chars().count();
             let project_len = project_part.chars().count();
             let min_padding = 2; // Minimum padding between content and timestamp
 
             // Calculate available width for summary (filter empty summaries)
-            let available_for_summary =
-                width.saturating_sub(indicator_len + badge_len + project_len + right_len + min_padding + 4); // 4 for " · " prefix and ellipsis
+            let available_for_summary = width.saturating_sub(
+                indicator_len + badge_len + project_len + right_len + min_padding + 4,
+            ); // 4 for " · " prefix and ellipsis
 
             // Build summary part (dimmer, dynamically truncated based on available space)
             let summary_part = conv
@@ -1238,12 +1241,8 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     find_hidden_match(full_text, &truncated_preview, &query_words)
                 {
                     let context_width = width.saturating_sub(4); // Account for indicator
-                    let context_text = extract_match_context(
-                        full_text,
-                        match_pos,
-                        match_char_len,
-                        context_width,
-                    );
+                    let context_text =
+                        extract_match_context(full_text, match_pos, match_char_len, context_width);
 
                     // Truncate context if still too long
                     let truncated_context = if context_text.chars().count() > context_width {

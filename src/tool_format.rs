@@ -19,23 +19,36 @@ pub struct FormattedToolCall {
 pub fn format_tool_call(name: &str, input: &Value, max_width: usize) -> FormattedToolCall {
     match name {
         // Claude Code tools
-        "Task" => format_task(input),
-        "Bash" => format_bash(input, max_width),
-        "Read" => format_read(input),
+        "Task" | "Subagent" => format_task(input),
+        "Bash" | "Shell" => format_bash(input, max_width),
+        "Read" | "ReadFile" => format_read(input),
         "Grep" => format_grep(input),
         "Glob" => format_glob(input),
         "Edit" => format_edit(input),
         "Write" => format_write(input),
         "WebFetch" => format_web_fetch(input),
         "WebSearch" => format_web_search(input),
+        "ApplyPatch" => format_apply_patch(input),
+        "SemanticSearch" => format_cursor_search(input),
+        "Delete" => format_cursor_write(input),
         // Cursor tools — map to equivalent formatting
         "run_terminal_cmd" | "run_terminal_command_v2" => format_cursor_terminal(input, max_width),
         "read_file" | "read_file_v2" => format_cursor_read(input),
-        "edit_file" | "edit_file_v2" | "edit_file_v2_search_replace"
-        | "edit_file_v2_apply_based" | "edit_file_v2_write" | "search_replace"
-        | "apply_patch" | "MultiEdit" => format_cursor_edit(input),
-        "grep" | "grep_search" | "rg" | "ripgrep" | "ripgrep_raw_search"
-        | "codebase_search" | "semantic_search_full" => format_cursor_search(input),
+        "edit_file"
+        | "edit_file_v2"
+        | "edit_file_v2_search_replace"
+        | "edit_file_v2_apply_based"
+        | "edit_file_v2_write"
+        | "search_replace"
+        | "apply_patch"
+        | "MultiEdit" => format_cursor_edit(input),
+        "grep"
+        | "grep_search"
+        | "rg"
+        | "ripgrep"
+        | "ripgrep_raw_search"
+        | "codebase_search"
+        | "semantic_search_full" => format_cursor_search(input),
         "list_dir" | "list_dir_v2" | "glob_file_search" | "file_search" => {
             format_cursor_list(input)
         }
@@ -106,6 +119,7 @@ fn format_bash(input: &Value, max_width: usize) -> FormattedToolCall {
 fn format_read(input: &Value) -> FormattedToolCall {
     let file_path = input
         .get("file_path")
+        .or_else(|| input.get("path"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let offset = input.get("offset").and_then(|v| v.as_u64());
@@ -139,8 +153,15 @@ fn format_grep(input: &Value) -> FormattedToolCall {
 }
 
 fn format_glob(input: &Value) -> FormattedToolCall {
-    let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = input.get("path").and_then(|v| v.as_str());
+    let pattern = input
+        .get("pattern")
+        .or_else(|| input.get("glob_pattern"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let path = input
+        .get("path")
+        .or_else(|| input.get("target_directory"))
+        .and_then(|v| v.as_str());
 
     let header = match path {
         Some(p) => format!("Glob: {} in {}", pattern, p),
@@ -205,21 +226,34 @@ fn format_web_fetch(input: &Value) -> FormattedToolCall {
 }
 
 fn format_web_search(input: &Value) -> FormattedToolCall {
-    let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let query = input
+        .get("query")
+        .or_else(|| input.get("search_term"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let explanation = input.get("explanation").and_then(|v| v.as_str());
 
     FormattedToolCall {
         header: format!("Search: \"{}\"", query),
-        body: None,
+        body: explanation.map(|text| text.to_string()),
     }
+}
+
+fn format_apply_patch(input: &Value) -> FormattedToolCall {
+    if let Some(patch) = input.as_str() {
+        return FormattedToolCall {
+            header: "Patch".to_string(),
+            body: Some(patch.to_string()),
+        };
+    }
+
+    format_fallback("ApplyPatch", input)
 }
 
 // --- Cursor tool formatters ---
 
 fn format_cursor_terminal(input: &Value, max_width: usize) -> FormattedToolCall {
-    let command = input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let prefix = "Bash: ";
     let prefix_len = prefix.len();
     let available_width = max_width.saturating_sub(prefix_len);
@@ -285,23 +319,35 @@ fn format_cursor_search(input: &Value) -> FormattedToolCall {
     let path = input
         .get("path")
         .or_else(|| input.get("directory"))
-        .and_then(|v| v.as_str());
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .or_else(|| {
+            input
+                .get("target_directories")
+                .and_then(|v| v.as_array())
+                .map(|dirs| {
+                    dirs.iter()
+                        .filter_map(|dir| dir.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|dirs| !dirs.is_empty())
+        });
     let header = if let Some(p) = path {
         format!("Search: \"{}\" in {}", query, p)
     } else {
         format!("Search: \"{}\"", query)
     };
-    FormattedToolCall {
-        header,
-        body: None,
-    }
+    FormattedToolCall { header, body: None }
 }
 
 fn format_cursor_list(input: &Value) -> FormattedToolCall {
     let path = input
         .get("path")
         .or_else(|| input.get("directory"))
+        .or_else(|| input.get("target_directory"))
         .or_else(|| input.get("pattern"))
+        .or_else(|| input.get("glob_pattern"))
         .and_then(|v| v.as_str())
         .unwrap_or(".");
     FormattedToolCall {

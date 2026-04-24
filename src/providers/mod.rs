@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod cursor;
+pub mod cursor_agent;
 
 use crate::claude::LogEntry;
 use crate::error::Result;
@@ -13,10 +14,18 @@ pub trait Provider: Send + Sync {
     fn detect(&self) -> bool;
 
     /// Load conversations (synchronous, for single-project mode)
-    fn load_conversations(&self, show_last: bool, debug: Option<crate::cli::DebugLevel>) -> Result<Vec<Conversation>>;
+    fn load_conversations(
+        &self,
+        show_last: bool,
+        debug: Option<crate::cli::DebugLevel>,
+    ) -> Result<Vec<Conversation>>;
 
     /// Load conversations with streaming (for global mode)
-    fn load_conversations_streaming(&self, show_last: bool, debug: Option<crate::cli::DebugLevel>) -> Receiver<LoaderMessage>;
+    fn load_conversations_streaming(
+        &self,
+        show_last: bool,
+        debug: Option<crate::cli::DebugLevel>,
+    ) -> Receiver<LoaderMessage>;
 
     /// Read log entries for viewing/export (the core abstraction)
     fn read_entries(&self, conversation: &Conversation) -> Result<Vec<LogEntry>>;
