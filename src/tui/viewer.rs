@@ -5,6 +5,7 @@
 //! without using ANSI escape codes.
 
 use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent};
+use crate::text_processing::{process_command_message, short_agent_id};
 use crate::tool_format;
 use crate::tui::app::{LineStyle, RenderedLine};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -13,10 +14,11 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
-const NAME_WIDTH: usize = 9;
+const NAME_WIDTH: usize = 12;
 /// Width of timestamp prefix when timing is enabled (space + HH:MM + space)
 const TIMESTAMP_WIDTH: usize = 7;
 const WHITE: (u8, u8, u8) = (255, 255, 255);
+const USER_TEXT: (u8, u8, u8) = (240, 180, 100);
 const SEPARATOR_COLOR: (u8, u8, u8) = (80, 80, 80);
 const CODE_COLOR: (u8, u8, u8) = (147, 161, 199);
 const GREEN: (u8, u8, u8) = (0, 255, 0);
@@ -190,7 +192,12 @@ fn render_user_message(
     };
 
     if let Some(text) = text {
-        let md_lines = render_markdown_to_lines(&text, options.content_width);
+        let mut md_lines = render_markdown_to_lines(&text, options.content_width);
+        for line in &mut md_lines {
+            for (_, style) in &mut line.spans {
+                style.fg = Some(USER_TEXT);
+            }
+        }
         render_ledger_block_styled(lines, "You", WHITE, true, md_lines, ts_remaining);
         printed = true;
         ts_remaining = None;
@@ -1242,11 +1249,6 @@ fn render_tool_result(
     }
 }
 
-/// Get a truncated agent ID for display (max 7 characters)
-fn short_agent_id(agent_id: &str) -> &str {
-    &agent_id[..agent_id.len().min(7)]
-}
-
 /// Render agent (subagent) progress message
 fn render_agent_message(
     lines: &mut Vec<RenderedLine>,
@@ -1554,62 +1556,6 @@ fn render_continuation_dimmed(lines: &mut Vec<RenderedLine>, text: &str, show_ti
     }
 }
 
-/// Process user message text to handle command-related XML tags.
-/// Returns None if the message should be skipped entirely (e.g., empty local-command-stdout).
-fn process_command_message(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-
-    // Check for local-command-caveat - skip these system messages entirely
-    if trimmed.starts_with("<local-command-caveat>") && trimmed.ends_with("</local-command-caveat>")
-    {
-        return None;
-    }
-
-    // Check for empty or whitespace-only local-command-stdout - skip these entirely
-    if trimmed.starts_with("<local-command-stdout>") && trimmed.ends_with("</local-command-stdout>")
-    {
-        let tag_start = "<local-command-stdout>".len();
-        let tag_end = trimmed.len() - "</local-command-stdout>".len();
-        let inner = &trimmed[tag_start..tag_end];
-        if inner.trim().is_empty() {
-            return None;
-        }
-        // Non-empty local-command-stdout: show the content without the tags
-        return Some(inner.trim().to_string());
-    }
-
-    // Check if this is a command message with <command-name> tag
-    if let Some(start) = trimmed.find("<command-name>")
-        && let Some(end) = trimmed.find("</command-name>")
-    {
-        let content_start = start + "<command-name>".len();
-        if content_start < end {
-            let command_name = &trimmed[content_start..end];
-
-            // Skip /clear commands - internal context-clearing, not meaningful to display
-            if command_name == "/clear" {
-                return None;
-            }
-
-            // Also extract command args if present
-            if let Some(args_start) = trimmed.find("<command-args>")
-                && let Some(args_end) = trimmed.find("</command-args>")
-            {
-                let args_content_start = args_start + "<command-args>".len();
-                if args_content_start < args_end {
-                    let args = trimmed[args_content_start..args_end].trim();
-                    if !args.is_empty() {
-                        return Some(format!("{} {}", command_name, args));
-                    }
-                }
-            }
-
-            return Some(command_name.to_string());
-        }
-    }
-
-    Some(text.to_string())
-}
 
 #[cfg(test)]
 mod tests {

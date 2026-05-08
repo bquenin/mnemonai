@@ -5,6 +5,7 @@ use crate::debug_log;
 use crate::error::Result;
 use crate::markdown::render_markdown;
 use crate::pager;
+use crate::text_processing::{process_command_message, short_agent_id};
 use crate::tool_format;
 use colored::{ColoredString, Colorize, CustomColor};
 use crossterm::terminal;
@@ -27,11 +28,16 @@ pub struct DisplayOptions {
     pub no_color: bool,
 }
 
-const NAME_WIDTH: usize = 9;
+const NAME_WIDTH: usize = 12;
 const SEPARATOR: &str = " │ ";
 const SEPARATOR_WIDTH: usize = 3; // Display width of " │ "
 
 // Colors matching the TUI theme
+const USER_TEXT_COLOR: CustomColor = CustomColor {
+    r: 240,
+    g: 180,
+    b: 100,
+};
 const CLAUDE_TERRACOTTA: CustomColor = CustomColor {
     r: 218,
     g: 119,
@@ -184,12 +190,39 @@ impl<'a, W: Write + ?Sized> LedgerFormatter<'a, W> {
             let _ = writeln!(self.writer, "{}", line);
         }
     }
+
+    /// Print pre-formatted markdown text with colored content
+    fn print_markdown_colored<F>(&mut self, name: &str, style: F, text: &str, color: CustomColor)
+    where
+        F: Fn(&str) -> ColoredString,
+    {
+        let lines: Vec<&str> = text.lines().collect();
+
+        if lines.is_empty() {
+            let padded = format!("{:>width$}", name, width = NAME_WIDTH);
+            let _ = write!(self.writer, "{}", style(&padded));
+            let _ = write!(self.writer, "{}", SEPARATOR.custom_color(SEPARATOR_COLOR));
+            let _ = writeln!(self.writer);
+            return;
+        }
+
+        for (i, line) in lines.iter().enumerate() {
+            if i == 0 {
+                let padded = format!("{:>width$}", name, width = NAME_WIDTH);
+                let _ = write!(self.writer, "{}", style(&padded));
+            } else {
+                let _ = write!(self.writer, "{:>width$}", "", width = NAME_WIDTH);
+            }
+            let _ = write!(self.writer, "{}", SEPARATOR.custom_color(SEPARATOR_COLOR));
+            let _ = writeln!(self.writer, "{}", line.custom_color(color));
+        }
+    }
 }
 
 impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
     fn format_user_text(&mut self, text: &str) {
         let rendered = render_markdown(text, self.content_width);
-        self.print_markdown("You", |s| s.white().bold(), &rendered);
+        self.print_markdown_colored("You", |s| s.white().bold(), &rendered, USER_TEXT_COLOR);
     }
 
     fn format_assistant_text(&mut self, text: &str) {
@@ -367,63 +400,6 @@ fn format_tool_content(content: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Process user message text to handle command-related XML tags
-/// Returns None if the message should be skipped entirely (e.g., empty local-command-stdout)
-fn process_command_message(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-
-    // Check for local-command-caveat - skip these system messages entirely
-    if trimmed.starts_with("<local-command-caveat>") && trimmed.ends_with("</local-command-caveat>")
-    {
-        return None;
-    }
-
-    // Check for empty or whitespace-only local-command-stdout - skip these entirely
-    if trimmed.starts_with("<local-command-stdout>") && trimmed.ends_with("</local-command-stdout>")
-    {
-        let tag_start = "<local-command-stdout>".len();
-        let tag_end = trimmed.len() - "</local-command-stdout>".len();
-        let inner = &trimmed[tag_start..tag_end];
-        if inner.trim().is_empty() {
-            return None;
-        }
-        // Non-empty local-command-stdout: show the content without the tags
-        return Some(inner.trim().to_string());
-    }
-
-    // Check if this is a command message with <command-name> tag
-    if let Some(start) = trimmed.find("<command-name>")
-        && let Some(end) = trimmed.find("</command-name>")
-    {
-        let content_start = start + "<command-name>".len();
-        if content_start < end {
-            let command_name = &trimmed[content_start..end];
-
-            // Skip /clear commands - internal context-clearing, not meaningful to display
-            if command_name == "/clear" {
-                return None;
-            }
-
-            // Also extract command args if present
-            if let Some(args_start) = trimmed.find("<command-args>")
-                && let Some(args_end) = trimmed.find("</command-args>")
-            {
-                let args_content_start = args_start + "<command-args>".len();
-                if args_content_start < args_end {
-                    let args = trimmed[args_content_start..args_end].trim();
-                    if !args.is_empty() {
-                        return Some(format!("{} {}", command_name, args));
-                    }
-                }
-            }
-
-            return Some(command_name.to_string());
-        }
-    }
-
-    // Return original text for non-command messages
-    Some(text.to_string())
-}
 
 /// Get the terminal width, defaulting to 80 if unavailable
 fn get_terminal_width() -> usize {
@@ -689,9 +665,6 @@ fn process_assistant_message<F: OutputFormatter>(
 }
 
 /// Get a truncated agent ID for display (max 7 characters)
-fn short_agent_id(agent_id: &str) -> &str {
-    &agent_id[..agent_id.len().min(7)]
-}
 
 /// Process an agent progress message using the provided formatter
 fn process_agent_message<F: OutputFormatter>(
@@ -864,70 +837,3 @@ pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_command_message_skips_local_command_caveat() {
-        let caveat = "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>";
-        assert_eq!(process_command_message(caveat), None);
-    }
-
-    #[test]
-    fn process_command_message_skips_local_command_caveat_with_whitespace() {
-        let caveat = "  <local-command-caveat>Some caveat text</local-command-caveat>  ";
-        assert_eq!(process_command_message(caveat), None);
-    }
-
-    #[test]
-    fn process_command_message_preserves_normal_text() {
-        assert_eq!(
-            process_command_message("Hello world"),
-            Some("Hello world".to_string())
-        );
-    }
-
-    #[test]
-    fn process_command_message_skips_empty_stdout() {
-        assert_eq!(
-            process_command_message("<local-command-stdout></local-command-stdout>"),
-            None
-        );
-        assert_eq!(
-            process_command_message("<local-command-stdout>   </local-command-stdout>"),
-            None
-        );
-    }
-
-    #[test]
-    fn process_command_message_extracts_nonempty_stdout() {
-        assert_eq!(
-            process_command_message("<local-command-stdout>output here</local-command-stdout>"),
-            Some("output here".to_string())
-        );
-    }
-
-    #[test]
-    fn process_command_message_skips_clear_command() {
-        assert_eq!(
-            process_command_message("<command-name>/clear</command-name>"),
-            None
-        );
-        // Also skip clear with command-message and command-args tags
-        assert_eq!(
-            process_command_message(
-                "<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn process_command_message_extracts_other_command_names() {
-        assert_eq!(
-            process_command_message("<command-name>/help</command-name>"),
-            Some("/help".to_string())
-        );
-    }
-}
