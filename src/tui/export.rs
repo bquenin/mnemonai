@@ -260,7 +260,7 @@ fn generate_markdown_from_entries(entries: &[LogEntry], options: ExportOptions) 
 /// Generate ledger-style format from entries
 fn generate_ledger_from_entries(entries: &[LogEntry], options: ExportOptions) -> String {
     let mut output = String::new();
-    const NAME_WIDTH: usize = 9;
+    const NAME_WIDTH: usize = 12;
 
     for entry in entries {
         match entry {
