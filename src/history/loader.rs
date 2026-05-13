@@ -200,36 +200,14 @@ pub fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Projec
         .par_bridge()
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            let path = entry.path();
 
-            if !path.is_dir() {
+            if !entry.file_type().ok()?.is_dir() {
                 return None;
             }
 
-            // Check if project has any non-agent .jsonl files
-            let has_conversations = read_dir(&path).ok()?.any(|e| {
-                e.ok()
-                    .map(|e| {
-                        let path = e.path();
-                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        path.extension().map(|s| s == "jsonl").unwrap_or(false)
-                            && !name.starts_with("agent-")
-                    })
-                    .unwrap_or(false)
-            });
-
-            if !has_conversations {
-                return None;
-            }
-
-            let name = path.file_name()?.to_string_lossy().to_string();
-            // Heuristic decode: convert encoded directory name back to readable path
-            // The encoding replaces non-alphanumeric chars (except -) with -
-            // So / becomes -, but _ also becomes -, and __ becomes --
-            // We convert single dashes to / but preserve double dashes as _
+            let name = entry.file_name().to_string_lossy().to_string();
             let display_name = decode_project_dir_name(&name);
 
-            // Skip projects whose display name contains any exclude string
             if exclude_names
                 .iter()
                 .any(|ex| display_name.contains(ex.as_str()))

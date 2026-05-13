@@ -66,6 +66,11 @@ pub fn save_conversations<'a, I>(provider: ProviderKind, show_last: bool, entrie
 where
     I: IntoIterator<Item = (&'a Conversation, SourceFingerprint)>,
 {
+    let mut iter = entries.into_iter().peekable();
+    if iter.peek().is_none() {
+        return;
+    }
+
     let Some(mut conn) = open_index_db() else {
         return;
     };
@@ -94,7 +99,7 @@ where
         let provider_key = provider_key(&provider);
         let show_last = i64::from(show_last);
 
-        for (conversation, fingerprint) in entries {
+        for (conversation, fingerprint) in iter {
             let Some(text_lower) = &conversation.search_text_lower else {
                 continue;
             };
