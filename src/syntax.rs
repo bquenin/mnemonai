@@ -1,5 +1,6 @@
 //! Syntax highlighting for code blocks using syntect.
 
+use std::fmt::Write;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, ThemeSet};
@@ -65,8 +66,7 @@ pub fn highlight_code_ansi(code: &str, lang: &str) -> Option<String> {
         let ranges = highlighter.highlight_line(line, ps).ok()?;
         for (style, text) in ranges {
             let fg = style.foreground;
-            // Build ANSI escape sequence for foreground color
-            output.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+            let _ = write!(output, "\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b);
             if style.font_style.contains(FontStyle::BOLD) {
                 output.push_str("\x1b[1m");
             }

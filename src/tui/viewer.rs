@@ -236,7 +236,7 @@ fn render_user_message(
     }
 
     if printed {
-        lines.push(RenderedLine { spans: vec![] }); // Empty line after message
+        lines.push(RenderedLine { spans: vec![], search_text: None }); // Empty line after message
     }
 }
 
@@ -354,7 +354,7 @@ fn render_assistant_message(
     }
 
     if printed {
-        lines.push(RenderedLine { spans: vec![] });
+        lines.push(RenderedLine { spans: vec![], search_text: None });
     }
 }
 
@@ -942,7 +942,7 @@ fn render_ledger_block_styled(
             }
         }
 
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 
     // If no lines, still output at least the name
@@ -978,7 +978,7 @@ fn render_ledger_block_styled(
                 ..Default::default()
             },
         ));
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 }
 
@@ -1012,7 +1012,7 @@ fn render_truncation_indicator(
         },
     ));
 
-    lines.push(RenderedLine { spans });
+    lines.push(RenderedLine { spans, search_text: None });
 }
 
 /// Render a formatted tool call with proper styling
@@ -1076,7 +1076,7 @@ fn render_tool_call(
         },
     ));
 
-    lines.push(RenderedLine { spans });
+    lines.push(RenderedLine { spans, search_text: None });
 
     // Render the body if present, with empty line separator
     if let Some(body) = formatted.body {
@@ -1096,7 +1096,7 @@ fn render_tool_call(
                 ..Default::default()
             },
         ));
-        lines.push(RenderedLine { spans: empty_spans });
+        lines.push(RenderedLine { spans: empty_spans, search_text: None });
 
         if tool_display == ToolDisplayMode::Truncated {
             let body_lines: Vec<&str> = body.lines().collect();
@@ -1171,7 +1171,7 @@ fn render_tool_body(lines: &mut Vec<RenderedLine>, text: &str, dimmed: bool, sho
             ));
         }
 
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 }
 
@@ -1241,7 +1241,7 @@ fn render_tool_result(
             spans.push((text.clone(), style.clone()));
         }
 
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 
     if limit < total {
@@ -1390,7 +1390,7 @@ fn render_agent_message(
     }
 
     if printed {
-        lines.push(RenderedLine { spans: vec![] });
+        lines.push(RenderedLine { spans: vec![], search_text: None });
     }
 }
 
@@ -1439,7 +1439,7 @@ fn render_ledger_block_styled_dimmed(
             spans.push((text, style));
         }
 
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 
     if styled_lines.is_empty() {
@@ -1464,7 +1464,7 @@ fn render_ledger_block_styled_dimmed(
                 ..Default::default()
             },
         ));
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 }
 
@@ -1516,7 +1516,7 @@ fn render_ledger_block_plain_dimmed(
             },
         ));
 
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 }
 
@@ -1552,7 +1552,7 @@ fn render_continuation_dimmed(lines: &mut Vec<RenderedLine>, text: &str, show_ti
             },
         ));
 
-        lines.push(RenderedLine { spans });
+        lines.push(RenderedLine { spans, search_text: None });
     }
 }
 

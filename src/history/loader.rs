@@ -310,11 +310,7 @@ fn load_conversations_with_cache(
         ),
     );
 
-    // Sort by modification time (newest first)
-    files_with_meta.sort_by_key(|(_, modified, _)| modified.unwrap_or(SystemTime::UNIX_EPOCH));
-    files_with_meta.reverse();
-
-    // Process each file (potentially in parallel)
+    // Process each file in parallel (result is re-sorted after collection)
     let loaded: Vec<ConversationLoad> = files_with_meta
         .into_par_iter()
         .filter_map(|(path, modified, fingerprint)| {

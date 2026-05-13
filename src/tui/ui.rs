@@ -513,7 +513,7 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
         .take(visible_height)
         .map(|(line_idx, rendered)| {
             let is_current_match = state.search_matches.get(state.current_match) == Some(&line_idx);
-            let has_match = !query_lower.is_empty() && state.search_matches.contains(&line_idx);
+            let has_match = !query_lower.is_empty() && state.search_matches.binary_search(&line_idx).is_ok();
 
             let spans: Vec<Span> = if has_match && !query_lower.is_empty() {
                 highlight_line_matches(rendered, &query_lower, is_current_match)

@@ -113,6 +113,8 @@ pub enum ViewSearchMode {
 #[derive(Clone, Debug)]
 pub struct RenderedLine {
     pub spans: Vec<(String, LineStyle)>,
+    /// Cached lowercased concatenation of all span texts for search
+    pub search_text: Option<String>,
 }
 
 /// Style information for a span
@@ -1435,12 +1437,12 @@ impl App {
                 return;
             }
 
+            let query = query_lower;
             state.search_matches = state
                 .rendered_lines
-                .iter()
+                .iter_mut()
                 .enumerate()
-                .filter(|(_, line)| line_matches_query(line, &query_lower))
-                .map(|(i, _)| i)
+                .filter_map(|(i, line)| line_matches_query(line, &query).then_some(i))
                 .collect();
 
             // Jump to first match if any
@@ -1571,10 +1573,11 @@ impl App {
                     let query_lower = state.search_query.to_lowercase();
                     state.search_matches = state
                         .rendered_lines
-                        .iter()
+                        .iter_mut()
                         .enumerate()
-                        .filter(|(_, line)| line_matches_query(line, &query_lower))
-                        .map(|(i, _)| i)
+                        .filter_map(|(i, line)| {
+                            line_matches_query(line, &query_lower).then_some(i)
+                        })
                         .collect();
 
                     // Clamp current_match to valid range
@@ -1612,9 +1615,13 @@ struct TerminalGuard {
 
 /// Check if a rendered line matches the search query by concatenating all span texts.
 /// This allows multi-word queries to match across span boundaries.
-pub fn line_matches_query(line: &RenderedLine, query_lower: &str) -> bool {
-    let full_text: String = line.spans.iter().map(|(text, _)| text.as_str()).collect();
-    full_text.to_lowercase().contains(query_lower)
+/// Uses a cached lowercased text to avoid re-allocating on every keystroke.
+pub fn line_matches_query(line: &mut RenderedLine, query_lower: &str) -> bool {
+    let search_text = line.search_text.get_or_insert_with(|| {
+        let full_text: String = line.spans.iter().map(|(text, _)| text.as_str()).collect();
+        full_text.to_lowercase()
+    });
+    search_text.contains(query_lower)
 }
 
 impl TerminalGuard {

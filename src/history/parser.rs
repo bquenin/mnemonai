@@ -276,11 +276,22 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
             .join(" ... ")
     };
 
-    // Create full text for searching (all messages + summary)
-    let mut full_text = all_parts.join(" ");
-    if let Some(ref summary) = extracted_summary {
-        full_text = format!("{} {}", summary, full_text);
-    }
+    // Create full text for searching (summary + all messages), built in one pass
+    let full_text = {
+        let mut parts_iter = extracted_summary
+            .iter()
+            .map(|s| s.as_str())
+            .chain(all_parts.iter().map(|s| s.as_str()));
+        let mut result = String::new();
+        if let Some(first) = parts_iter.next() {
+            result.push_str(first);
+            for part in parts_iter {
+                result.push(' ');
+                result.push_str(part);
+            }
+        }
+        result
+    };
 
     // Normalize whitespace
     let preview = normalize_whitespace(&preview);
@@ -397,9 +408,16 @@ pub(crate) fn is_clear_only_conversation(user_messages: &[String]) -> bool {
     saw_caveat && saw_command && saw_stdout
 }
 
-/// Normalize whitespace in a string
+/// Normalize whitespace in a string (single-pass, no intermediate Vec)
 pub(crate) fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+    let mut result = String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        result.push_str(word);
+    }
+    result
 }
 
 #[cfg(test)]

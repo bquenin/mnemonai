@@ -181,7 +181,11 @@ fn load_provider_cache_from_conn(
             let search_topic_end: i64 = row.get(8)?;
             let message_count: i64 = row.get(12)?;
             let parse_errors_json: String = row.get(13)?;
-            let parse_errors = serde_json::from_str(&parse_errors_json).unwrap_or_default();
+            let parse_errors = if parse_errors_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str(&parse_errors_json).unwrap_or_default()
+            };
             let total_tokens: i64 = row.get(16)?;
             let duration_minutes: Option<i64> = row.get(17)?;
 
@@ -235,6 +239,7 @@ fn open_index_db() -> Option<Connection> {
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
          CREATE TABLE IF NOT EXISTS file_conversations (
              schema_version        INTEGER NOT NULL,
              provider              TEXT NOT NULL,
