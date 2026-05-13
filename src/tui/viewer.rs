@@ -15,8 +15,8 @@ use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 const NAME_WIDTH: usize = 12;
-/// Width of timestamp prefix when timing is enabled (space + HH:MM + space)
-const TIMESTAMP_WIDTH: usize = 7;
+const NAME_PAD: &str = "            "; // NAME_WIDTH spaces
+const TIMESTAMP_PAD: &str = "       "; // 7 spaces (HH:MM + margins)
 const WHITE: (u8, u8, u8) = (255, 255, 255);
 const USER_TEXT: (u8, u8, u8) = (240, 180, 100);
 const SEPARATOR_COLOR: (u8, u8, u8) = (80, 80, 80);
@@ -904,14 +904,14 @@ fn render_ledger_block_styled(
             }
         } else if timestamp.is_some() {
             // Pad continuation lines to align with timestamped first line
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
 
         // Name column (right-aligned, only on first line)
         let name_text = if i == 0 {
             format!("{:>width$}", name, width = NAME_WIDTH)
         } else {
-            " ".repeat(NAME_WIDTH)
+            NAME_PAD.to_string()
         };
 
         spans.push((
@@ -992,10 +992,10 @@ fn render_truncation_indicator(
     let mut spans = Vec::new();
 
     if show_timing {
-        spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+        spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
     }
 
-    spans.push((" ".repeat(NAME_WIDTH), LineStyle::default()));
+    spans.push((NAME_PAD.to_string(), LineStyle::default()));
     spans.push((
         " │ ".to_string(),
         LineStyle {
@@ -1085,9 +1085,9 @@ fn render_tool_call(
         // Empty line between header and body
         let mut empty_spans = Vec::new();
         if show_timing {
-            empty_spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            empty_spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
-        empty_spans.push((" ".repeat(NAME_WIDTH), LineStyle::default()));
+        empty_spans.push((NAME_PAD.to_string(), LineStyle::default()));
         empty_spans.push((
             " │ ".to_string(),
             LineStyle {
@@ -1126,11 +1126,11 @@ fn render_tool_body(lines: &mut Vec<RenderedLine>, text: &str, dimmed: bool, sho
 
         // Timing alignment padding (if timing is enabled)
         if show_timing {
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
 
         // Empty name column
-        spans.push((" ".repeat(NAME_WIDTH), LineStyle::default()));
+        spans.push((NAME_PAD.to_string(), LineStyle::default()));
 
         // Separator
         spans.push((
@@ -1211,7 +1211,7 @@ fn render_tool_result(
             }
         } else if timestamp.is_some() {
             // Pad continuation lines to align with timestamped first line
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
 
         // First line gets the label, rest are empty
@@ -1224,7 +1224,7 @@ fn render_tool_result(
                 },
             ));
         } else {
-            spans.push((" ".repeat(NAME_WIDTH), LineStyle::default()));
+            spans.push((NAME_PAD.to_string(), LineStyle::default()));
         }
 
         // Separator
@@ -1406,13 +1406,13 @@ fn render_ledger_block_styled_dimmed(
         let mut spans = Vec::new();
 
         if show_timing {
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
 
         let name_text = if i == 0 {
             format!("{:>width$}", name, width = NAME_WIDTH)
         } else {
-            " ".repeat(NAME_WIDTH)
+            NAME_PAD.to_string()
         };
 
         spans.push((
@@ -1445,7 +1445,7 @@ fn render_ledger_block_styled_dimmed(
     if styled_lines.is_empty() {
         let mut spans = Vec::new();
         if show_timing {
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
         spans.push((
             format!("{:>width$}", name, width = NAME_WIDTH),
@@ -1480,13 +1480,13 @@ fn render_ledger_block_plain_dimmed(
         let mut spans = Vec::new();
 
         if show_timing {
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
 
         let name_text = if i == 0 {
             format!("{:>width$}", name, width = NAME_WIDTH)
         } else {
-            " ".repeat(NAME_WIDTH)
+            NAME_PAD.to_string()
         };
 
         spans.push((
@@ -1526,11 +1526,11 @@ fn render_continuation_dimmed(lines: &mut Vec<RenderedLine>, text: &str, show_ti
         let mut spans = Vec::new();
 
         if show_timing {
-            spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
+            spans.push((TIMESTAMP_PAD.to_string(), LineStyle::default()));
         }
 
         spans.push((
-            " ".repeat(NAME_WIDTH),
+            NAME_PAD.to_string(),
             LineStyle {
                 dimmed: true,
                 ..Default::default()

@@ -278,6 +278,7 @@ fn open_cache_db() -> Option<Connection> {
     let conn = Connection::open(&db_path).ok()?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
          CREATE TABLE IF NOT EXISTS user_bubble_keys (
              conv_id      TEXT PRIMARY KEY,
              min_user_key TEXT,

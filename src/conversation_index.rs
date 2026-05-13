@@ -263,7 +263,9 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              total_tokens          INTEGER NOT NULL,
              duration_minutes      INTEGER,
              PRIMARY KEY (schema_version, provider, show_last, source_path)
-         );",
+         );
+         CREATE INDEX IF NOT EXISTS idx_provider_source_path
+         ON file_conversations (provider, source_path);",
     )
 }
 

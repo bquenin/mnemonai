@@ -131,20 +131,19 @@ pub fn search(
     }
 
     let mut scored: Vec<(usize, f64, DateTime<Local>)> = if let Some(indices) = narrow_from {
-        let allowed: std::collections::HashSet<usize> = indices.iter().copied().collect();
-        searchable
+        indices
             .par_iter()
-            .filter(|s| allowed.contains(&s.index))
-            .filter_map(|s| {
+            .filter_map(|&idx| {
+                let s = &searchable[idx];
                 let score = score_text(
                     &s.text_lower,
                     s.topic_end,
                     &query_terms,
-                    conversations[s.index].timestamp,
+                    conversations[idx].timestamp,
                     now,
                 );
                 if score > 0.0 {
-                    Some((s.index, score, conversations[s.index].timestamp))
+                    Some((idx, score, conversations[idx].timestamp))
                 } else {
                     None
                 }

@@ -116,7 +116,7 @@ impl CursorAgentProvider {
         for entry in fs::read_dir(&self.projects_root)? {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_dir() {
+            if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 continue;
             }
 
@@ -637,26 +637,32 @@ fn summarize_blocks_for_preview(blocks: &[CursorAgentTranscriptBlock]) -> Option
 }
 
 fn collect_transcript_files(transcripts_dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+    let mut files_with_mtime: Vec<(PathBuf, SystemTime)> = Vec::new();
     let entries = match fs::read_dir(transcripts_dir) {
         Ok(entries) => entries,
-        Err(_) => return files,
+        Err(_) => return Vec::new(),
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
-            files.push(path);
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+            let mtime = file_modified_time(&path).unwrap_or(SystemTime::UNIX_EPOCH);
+            files_with_mtime.push((path, mtime));
             continue;
         }
 
-        if !path.is_dir() {
+        if !file_type.is_dir() {
             continue;
         }
 
         let default_path = path.join(format!("{}.jsonl", entry.file_name().to_string_lossy()));
         if default_path.is_file() {
-            files.push(default_path);
+            let mtime = file_modified_time(&default_path).unwrap_or(SystemTime::UNIX_EPOCH);
+            files_with_mtime.push((default_path, mtime));
             continue;
         }
 
@@ -666,16 +672,20 @@ fn collect_transcript_files(transcripts_dir: &Path) -> Vec<PathBuf> {
         };
         for nested in nested_entries.flatten() {
             let nested_path = nested.path();
-            if nested_path.is_file() && nested_path.extension().is_some_and(|ext| ext == "jsonl") {
-                files.push(nested_path);
+            let nested_ft = match nested.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if nested_ft.is_file() && nested_path.extension().is_some_and(|ext| ext == "jsonl") {
+                let mtime = file_modified_time(&nested_path).unwrap_or(SystemTime::UNIX_EPOCH);
+                files_with_mtime.push((nested_path, mtime));
                 break;
             }
         }
     }
 
-    files.sort_by_key(|path| file_modified_time(path).unwrap_or(SystemTime::UNIX_EPOCH));
-    files.reverse();
-    files
+    files_with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+    files_with_mtime.into_iter().map(|(path, _)| path).collect()
 }
 
 fn load_workspace_path(project_dir: &Path) -> Option<PathBuf> {
@@ -742,7 +752,14 @@ fn command_exists(name: &str) -> bool {
 }
 
 fn normalize_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut result = String::with_capacity(input.len());
+    for word in input.split_whitespace() {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        result.push_str(word);
+    }
+    result
 }
 
 #[cfg(unix)]
