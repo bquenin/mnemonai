@@ -25,3 +25,4 @@ unicode-width = "0.2"
 arboard = "3.4"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+md5 = "0.7"

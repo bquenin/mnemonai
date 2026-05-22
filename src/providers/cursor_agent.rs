@@ -28,6 +28,7 @@ pub struct CursorAgentProvider {
 }
 
 struct AgentProject {
+    project_dir_name: String,
     workspace_path: Option<PathBuf>,
     transcript_files: Vec<PathBuf>,
     modified: SystemTime,
@@ -70,12 +71,6 @@ struct CursorAgentTranscriptBlock {
     tool_use_id: Option<String>,
     #[serde(default)]
     id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkspaceTrusted {
-    #[serde(rename = "workspacePath")]
-    workspace_path: String,
 }
 
 struct ParsedTranscriptLine {
@@ -136,8 +131,15 @@ impl CursorAgentProvider {
                 .max()
                 .unwrap_or(SystemTime::UNIX_EPOCH);
 
+            let project_dir_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string();
+
             projects.push(AgentProject {
-                workspace_path: load_workspace_path(&path),
+                project_dir_name,
+                workspace_path: None,
                 transcript_files,
                 modified,
             });
@@ -155,6 +157,7 @@ impl CursorAgentProvider {
         cache: &HashMap<PathBuf, CachedFileConversation>,
     ) -> Vec<Conversation> {
         let workspace_path = project.workspace_path.clone();
+        let project_dir_name = project.project_dir_name.clone();
         let loaded: Vec<ConversationLoad> = project
             .transcript_files
             .par_iter()
@@ -182,6 +185,7 @@ impl CursorAgentProvider {
                     path.clone(),
                     show_last,
                     workspace_path.clone(),
+                    project_dir_name.clone(),
                     debug_level,
                 ) {
                     Ok(Some(mut conversation)) => {
@@ -341,25 +345,33 @@ impl super::Provider for CursorAgentProvider {
     }
 
     fn resume(&self, conversation: &Conversation, _default_args: &[String]) -> Result<()> {
-        let workspace_path = conversation
+        let workspace_path = if let Some(path) = conversation
             .project_path
             .as_ref()
             .or(conversation.cwd.as_ref())
-            .ok_or_else(|| {
+            .filter(|p| p.is_dir())
+        {
+            path.clone()
+        } else {
+            let encoded_dir_name = extract_project_dir_name(&conversation.path).ok_or_else(|| {
+                AppError::ClaudeExecutionError(
+                    "Cannot determine project directory for this Cursor Agent conversation"
+                        .to_string(),
+                )
+            })?;
+            let chats_dir = self
+                .projects_root
+                .parent()
+                .map(|cursor_dir| cursor_dir.join("chats"));
+            resolve_workspace_path(&encoded_dir_name, chats_dir.as_deref()).ok_or_else(|| {
                 AppError::ClaudeExecutionError(
                     "Cannot determine workspace path for this Cursor Agent conversation"
                         .to_string(),
                 )
-            })?;
+            })?
+        };
 
-        if !workspace_path.exists() || !workspace_path.is_dir() {
-            return Err(AppError::ClaudeExecutionError(format!(
-                "Workspace path no longer exists: {}",
-                workspace_path.display()
-            )));
-        }
-
-        let mut command = build_resume_command(workspace_path, &conversation.id)?;
+        let mut command = build_resume_command(&workspace_path, &conversation.id)?;
         run_cursor_agent_command(&mut command)
     }
 
@@ -382,6 +394,7 @@ fn process_transcript_file(
     path: PathBuf,
     show_last: bool,
     workspace_path: Option<PathBuf>,
+    project_dir_name: String,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
     let file = File::open(&path)?;
@@ -494,7 +507,11 @@ fn process_transcript_file(
         .to_string();
     let project_name = workspace_path
         .as_ref()
-        .map(|workspace| format_short_name_from_path(workspace));
+        .map(|workspace| format_short_name_from_path(workspace))
+        .or_else(|| {
+            let last_segment = project_dir_name.rsplit('-').next()?;
+            (!last_segment.is_empty()).then(|| last_segment.to_string())
+        });
 
     Ok(Some(Conversation {
         path,
@@ -678,11 +695,155 @@ fn collect_transcript_files(transcripts_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn load_workspace_path(project_dir: &Path) -> Option<PathBuf> {
-    let trusted_path = project_dir.join(".workspace-trusted");
-    let content = fs::read_to_string(trusted_path).ok()?;
-    let trusted: WorkspaceTrusted = serde_json::from_str(&content).ok()?;
-    Some(PathBuf::from(trusted.workspace_path))
+/// Extracts the encoded project directory name from a transcript file path.
+///
+/// Transcript paths look like:
+/// `~/.cursor/projects/<encoded_dir>/agent-transcripts/<chatId>/<chatId>.jsonl`
+fn extract_project_dir_name(transcript_path: &Path) -> Option<String> {
+    for ancestor in transcript_path.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some("agent-transcripts") {
+            return ancestor
+                .parent()?
+                .file_name()?
+                .to_str()
+                .map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Reconstructs the workspace path from the encoded project directory name.
+///
+/// Cursor encodes workspace paths by replacing every non-alphanumeric character
+/// with `-`, collapsing runs, and trimming edges. This function reverses the
+/// encoding via DFS over hyphen positions, pruning branches where the path
+/// prefix doesn't exist on disk. If multiple candidates survive, the MD5 hash
+/// of `~/.cursor/chats/` directories is used as a tiebreaker.
+fn resolve_workspace_path(encoded_dir_name: &str, chats_dir: Option<&Path>) -> Option<PathBuf> {
+    let segments: Vec<&str> = encoded_dir_name.split('-').collect();
+    if segments.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    dfs_resolve(&segments, 0, String::from("/"), &mut candidates);
+
+    match candidates.len() {
+        0 => None,
+        1 => Some(PathBuf::from(candidates.into_iter().next().unwrap())),
+        _ => {
+            // MD5 tiebreaker: check which candidate has a matching chats directory
+            if let Some(chats_dir) = chats_dir.filter(|d| d.is_dir()) {
+                for candidate in &candidates {
+                    let hash = format!("{:x}", md5::compute(candidate.as_bytes()));
+                    if chats_dir.join(&hash).is_dir() {
+                        return Some(PathBuf::from(candidate));
+                    }
+                }
+            }
+            // Fall back to the longest path (most specific)
+            candidates.sort_by(|a, b| b.len().cmp(&a.len()));
+            Some(PathBuf::from(candidates.into_iter().next().unwrap()))
+        }
+    }
+}
+
+/// DFS over hyphen positions, trying each `-` as either a path separator (`/`)
+/// or a literal character kept in the current path component. Also tries `.`
+/// and ` ` since those are also encoded as `-`.
+///
+/// Prunes branches where the accumulated path prefix doesn't exist on disk.
+fn dfs_resolve(segments: &[&str], idx: usize, current: String, results: &mut Vec<String>) {
+    if idx >= segments.len() {
+        let path = PathBuf::from(&current);
+        if path.exists() {
+            results.push(current);
+        }
+        return;
+    }
+
+    if results.len() >= 8 {
+        return;
+    }
+
+    let segment = segments[idx];
+    let is_first = idx == 0;
+    let is_last = idx == segments.len() - 1;
+
+    if is_first {
+        let candidate = format!("/{}", segment);
+        if component_prefix_viable(&candidate, is_last) {
+            dfs_resolve(segments, idx + 1, candidate, results);
+        }
+        return;
+    }
+
+    // Option 1: `-` was a `/` — start a new path component
+    let with_slash = format!("{}/{}", current, segment);
+    if component_prefix_viable(&with_slash, is_last) {
+        dfs_resolve(segments, idx + 1, with_slash, results);
+    }
+
+    // Option 2: `-` was a `.` — common for hidden dirs and file extensions
+    let with_dot = format!("{}.{}", current, segment);
+    if component_prefix_viable(&with_dot, is_last) {
+        dfs_resolve(segments, idx + 1, with_dot, results);
+    }
+
+    // Option 3: `-` was a ` ` (space)
+    let with_space = format!("{} {}", current, segment);
+    if component_prefix_viable(&with_space, is_last) {
+        dfs_resolve(segments, idx + 1, with_space, results);
+    }
+
+    // Option 4: `-` was a literal `-` in the directory/file name
+    let with_hyphen = format!("{}-{}", current, segment);
+    if component_prefix_viable(&with_hyphen, is_last) {
+        dfs_resolve(segments, idx + 1, with_hyphen, results);
+    }
+
+    // Option 5: `-` was a `/` followed by a `.` — hidden directory
+    let with_hidden = format!("{}/.{}", current, segment);
+    if component_prefix_viable(&with_hidden, is_last) {
+        dfs_resolve(segments, idx + 1, with_hidden, results);
+    }
+}
+
+/// Checks whether this accumulated path prefix could lead to a valid final path.
+///
+/// For the last segment, the full path must exist. For intermediate segments,
+/// we check if the parent directory has any entry starting with the current
+/// file name component — this handles partial names like `/tmp/my-proj` where
+/// the final directory is `/tmp/my-project`.
+fn component_prefix_viable(prefix: &str, is_last: bool) -> bool {
+    let path = PathBuf::from(prefix);
+    if is_last {
+        return path.exists();
+    }
+    if path.is_dir() {
+        return true;
+    }
+    // The path doesn't exist as a directory yet — it might be a partial component
+    // name. Check if the parent dir has entries starting with this prefix.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name_prefix) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !parent.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(name_prefix) && name != name_prefix)
+        })
 }
 
 fn file_modified_time(path: &Path) -> Option<SystemTime> {
@@ -843,10 +1004,15 @@ mod tests {
         )
         .unwrap();
 
-        let conversation =
-            process_transcript_file(transcript_path, false, Some(workspace_path.clone()), None)
-                .unwrap()
-                .unwrap();
+        let conversation = process_transcript_file(
+            transcript_path,
+            false,
+            Some(workspace_path.clone()),
+            "test-workspace".to_string(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(conversation.provider, ProviderKind::CursorAgent);
         assert_eq!(conversation.id, "chat-123");
@@ -894,5 +1060,98 @@ mod tests {
 
         provider.delete(&conversation).unwrap();
         assert!(!transcript_dir.exists());
+    }
+
+    #[test]
+    fn extract_project_dir_name_from_transcript_path() {
+        let path = PathBuf::from(
+            "/home/user/.cursor/projects/Users-me-myproject/agent-transcripts/chat-1/chat-1.jsonl",
+        );
+        assert_eq!(
+            extract_project_dir_name(&path).as_deref(),
+            Some("Users-me-myproject")
+        );
+    }
+
+    #[test]
+    fn extract_project_dir_name_returns_none_for_unrelated_path() {
+        let path = PathBuf::from("/tmp/random/file.jsonl");
+        assert_eq!(extract_project_dir_name(&path), None);
+    }
+
+    #[test]
+    fn dfs_resolve_finds_path_with_all_slashes() {
+        // /tmp always exists on macOS/Linux
+        if !PathBuf::from("/tmp").is_dir() {
+            return;
+        }
+        let segments = vec!["tmp"];
+        let mut results = Vec::new();
+        dfs_resolve(&segments, 0, String::from("/"), &mut results);
+        assert!(
+            results.contains(&"/tmp".to_string()),
+            "DFS should find /tmp in {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn dfs_resolve_handles_hyphen_in_name() {
+        let test_dir =
+            PathBuf::from("/tmp").join(format!("mnemonai-dfs-test-{}", std::process::id()));
+        let test_target = test_dir.join("a-b");
+        fs::create_dir_all(&test_target).unwrap();
+
+        let encoded = format!("tmp-mnemonai-dfs-test-{}-a-b", std::process::id());
+        let result = resolve_workspace_path(&encoded, None);
+
+        let _ = fs::remove_dir_all(&test_dir);
+
+        assert_eq!(
+            result,
+            Some(test_target),
+            "DFS should reconstruct path with hyphenated directory name"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_path_returns_none_for_nonexistent() {
+        assert_eq!(
+            resolve_workspace_path("zzznonexistent-path-that-does-not-exist", None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_private_tmp() {
+        if !PathBuf::from("/private/tmp").is_dir() {
+            return;
+        }
+        let result = resolve_workspace_path("private-tmp", None);
+        assert_eq!(result, Some(PathBuf::from("/private/tmp")));
+    }
+
+    #[test]
+    fn project_name_falls_back_to_dir_name_segment() {
+        let temp = TestTempDir::new("project-name-fallback");
+        let transcript_path = temp.path.join("chat-456.jsonl");
+        let mut file = File::create(&transcript_path).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","timestamp":"2026-04-24T20:00:00Z","message":{{"content":[{{"type":"text","text":"hello"}}]}}}}"#
+        )
+        .unwrap();
+
+        let conversation = process_transcript_file(
+            transcript_path,
+            false,
+            None,
+            "Users-me-myproject".to_string(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(conversation.project_name.as_deref(), Some("myproject"));
     }
 }
