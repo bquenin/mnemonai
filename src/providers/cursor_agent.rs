@@ -107,6 +107,11 @@ impl CursorAgentProvider {
             return Ok(Vec::new());
         }
 
+        let chats_dir = self
+            .projects_root
+            .parent()
+            .map(|cursor_dir| cursor_dir.join("chats"));
+
         let mut projects = Vec::new();
         for entry in fs::read_dir(&self.projects_root)? {
             let entry = entry?;
@@ -137,10 +142,6 @@ impl CursorAgentProvider {
                 .unwrap_or("")
                 .to_string();
 
-            let chats_dir = self
-                .projects_root
-                .parent()
-                .map(|cursor_dir| cursor_dir.join("chats"));
             let workspace_path =
                 resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
 
