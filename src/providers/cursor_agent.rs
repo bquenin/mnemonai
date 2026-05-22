@@ -137,9 +137,16 @@ impl CursorAgentProvider {
                 .unwrap_or("")
                 .to_string();
 
+            let chats_dir = self
+                .projects_root
+                .parent()
+                .map(|cursor_dir| cursor_dir.join("chats"));
+            let workspace_path =
+                resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
+
             projects.push(AgentProject {
                 project_dir_name,
-                workspace_path: None,
+                workspace_path,
                 transcript_files,
                 modified,
             });
@@ -837,6 +844,9 @@ fn component_prefix_viable(prefix: &str, is_last: bool) -> bool {
     let Ok(entries) = fs::read_dir(parent) else {
         return false;
     };
+    // Exclude exact matches: if the only entry is the prefix itself, there's no
+    // longer name to continue building. Exact-match directories are already
+    // handled by the `path.is_dir()` check above.
     entries
         .filter_map(|e| e.ok())
         .any(|e| {
@@ -1095,21 +1105,42 @@ mod tests {
         );
     }
 
+    struct ShallowTempDir {
+        path: PathBuf,
+    }
+
+    impl ShallowTempDir {
+        fn under_tmp(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                PathBuf::from("/tmp").join(format!("mnemonai-{}-{}-{}", name, std::process::id(), unique));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for ShallowTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn dfs_resolve_handles_hyphen_in_name() {
-        let test_dir =
-            PathBuf::from("/tmp").join(format!("mnemonai-dfs-test-{}", std::process::id()));
-        let test_target = test_dir.join("a-b");
-        fs::create_dir_all(&test_target).unwrap();
+        let temp = ShallowTempDir::under_tmp("dfs-hyphen");
+        let nested = temp.path.join("sub").join("a-b");
+        fs::create_dir_all(&nested).unwrap();
 
-        let encoded = format!("tmp-mnemonai-dfs-test-{}-a-b", std::process::id());
+        let parent_name = temp.path.file_name().unwrap().to_str().unwrap();
+        let encoded = format!("tmp-{}-sub-a-b", parent_name);
         let result = resolve_workspace_path(&encoded, None);
-
-        let _ = fs::remove_dir_all(&test_dir);
 
         assert_eq!(
             result,
-            Some(test_target),
+            Some(nested),
             "DFS should reconstruct path with hyphenated directory name"
         );
     }
@@ -1153,5 +1184,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(conversation.project_name.as_deref(), Some("myproject"));
+    }
+
+    #[test]
+    fn dfs_resolve_handles_dot_in_name() {
+        let temp = ShallowTempDir::under_tmp("dfs-dot");
+        let dotfile = temp.path.join("my.config");
+        fs::create_dir_all(&dotfile).unwrap();
+
+        let parent_name = temp.path.file_name().unwrap().to_str().unwrap();
+        let encoded = format!("tmp-{}-my-config", parent_name);
+        let result = resolve_workspace_path(&encoded, None);
+
+        assert_eq!(
+            result,
+            Some(dotfile),
+            "DFS should reconstruct path with dot-separated name"
+        );
+    }
+
+    #[test]
+    fn md5_tiebreaker_selects_correct_candidate() {
+        let temp = ShallowTempDir::under_tmp("md5-tiebreaker");
+
+        // Create two candidates that the DFS would both find
+        let candidate_a = temp.path.join("x").join("y");
+        let candidate_b = temp.path.join("x-y");
+        fs::create_dir_all(&candidate_a).unwrap();
+        fs::create_dir_all(&candidate_b).unwrap();
+
+        // Create a fake chats dir with the MD5 of candidate_b
+        let chats_dir = temp.path.join("chats");
+        let hash_b = format!("{:x}", md5::compute(candidate_b.to_string_lossy().as_bytes()));
+        fs::create_dir_all(chats_dir.join(&hash_b)).unwrap();
+
+        let parent_name = temp.path.file_name().unwrap().to_str().unwrap();
+        let encoded = format!("tmp-{}-x-y", parent_name);
+        let result = resolve_workspace_path(&encoded, Some(chats_dir.as_path()));
+
+        assert_eq!(
+            result,
+            Some(candidate_b),
+            "MD5 tiebreaker should select the candidate with a matching chats directory"
+        );
     }
 }
