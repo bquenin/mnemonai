@@ -728,10 +728,10 @@ fn extract_project_dir_name(transcript_path: &Path) -> Option<String> {
 /// prefix doesn't exist on disk. If multiple candidates survive, the MD5 hash
 /// of `~/.cursor/chats/` directories is used as a tiebreaker.
 fn resolve_workspace_path(encoded_dir_name: &str, chats_dir: Option<&Path>) -> Option<PathBuf> {
-    let segments: Vec<&str> = encoded_dir_name.split('-').collect();
-    if segments.is_empty() {
+    if encoded_dir_name.is_empty() {
         return None;
     }
+    let segments: Vec<&str> = encoded_dir_name.split('-').collect();
 
     let mut candidates = Vec::new();
     dfs_resolve(&segments, 0, String::from("/"), &mut candidates);
