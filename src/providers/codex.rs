@@ -12,6 +12,7 @@ use crate::history::{
 use chrono::{DateTime, FixedOffset, Local};
 use rayon::prelude::*;
 use serde_json::Value;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -40,7 +41,6 @@ struct CodexParseState {
     last_timestamp: Option<DateTime<FixedOffset>>,
     entries: Vec<LogEntry>,
     all_parts: Vec<String>,
-    preview_parts: Vec<String>,
     message_count: usize,
     parse_errors: Vec<ParseError>,
 }
@@ -60,15 +60,16 @@ impl ConversationLoad {
 
 impl CodexProvider {
     pub fn new() -> Self {
-        let codex_home = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home::home_dir().map(|home| home.join(".codex")))
-            .unwrap_or_default();
-        Self { codex_home }
+        Self {
+            codex_home: resolve_codex_home(std::env::var_os("CODEX_HOME"), home::home_dir()),
+        }
     }
 
-    fn sessions_root(&self) -> PathBuf {
-        self.codex_home.join("sessions")
+    fn sessions_root(&self) -> Option<PathBuf> {
+        if self.codex_home.as_os_str().is_empty() {
+            return None;
+        }
+        Some(self.codex_home.join("sessions"))
     }
 
     fn load_all_conversations(
@@ -76,7 +77,9 @@ impl CodexProvider {
         show_last: bool,
         debug_level: Option<DebugLevel>,
     ) -> Result<Vec<Conversation>> {
-        let root = self.sessions_root();
+        let Some(root) = self.sessions_root() else {
+            return Ok(Vec::new());
+        };
         if !root.exists() {
             return Ok(Vec::new());
         }
@@ -171,7 +174,7 @@ impl super::Provider for CodexProvider {
     }
 
     fn detect(&self) -> bool {
-        self.sessions_root().exists()
+        self.sessions_root().is_some_and(|root| root.exists())
     }
 
     fn load_conversations(
@@ -215,13 +218,23 @@ impl super::Provider for CodexProvider {
     fn resume(&self, conversation: &Conversation, _default_args: &[String]) -> Result<()> {
         let mut command = Command::new("codex");
         command.arg("resume").arg(&conversation.id);
-        if let Some(project_path) = conversation
+        // Legacy transcripts may record no cwd at all; codex can still resume those
+        // by id, so only a recorded-but-missing directory is an error.
+        match conversation
             .project_path
             .as_ref()
             .or(conversation.cwd.as_ref())
-            .filter(|path| path.is_dir())
         {
-            command.current_dir(project_path);
+            Some(path) if path.is_dir() => {
+                command.current_dir(path);
+            }
+            Some(path) => {
+                return Err(AppError::ClaudeExecutionError(format!(
+                    "Project directory no longer exists: {}",
+                    path.display()
+                )));
+            }
+            None => {}
         }
 
         run_codex_command(command)
@@ -239,13 +252,17 @@ impl super::Provider for CodexProvider {
             command.current_dir(project_path);
         }
 
-        let status = command
-            .status()
+        // Capture output: this runs inside the live TUI (raw mode + alternate
+        // screen), so the child must not inherit the terminal.
+        let output = command
+            .output()
             .map_err(|err| AppError::ClaudeExecutionError(err.to_string()))?;
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(AppError::ClaudeExecutionError(format!(
-                "codex archive exited with status {}",
-                status
+                "codex archive exited with status {}: {}",
+                output.status,
+                stderr.trim()
             )));
         }
 
@@ -330,7 +347,7 @@ fn parse_codex_transcript_reader<R: BufRead>(
         }
     }
 
-    let entries = state.entries.clone();
+    let entries = std::mem::take(&mut state.entries);
     let conversation = build_codex_conversation(path, show_last, modified, state);
     Ok(ParsedCodexTranscript {
         conversation,
@@ -368,9 +385,10 @@ fn process_codex_record(state: &mut CodexParseState, record: &Value, line_idx: u
     let item = record.get("payload").unwrap_or(record);
     match item.get("type").and_then(Value::as_str) {
         Some("message") => process_message_item(state, item, timestamp),
-        Some("function_call") | Some("custom_tool_call") | Some("web_search_call") => {
+        Some("function_call") | Some("custom_tool_call") => {
             process_tool_call_item(state, item, timestamp, line_idx)
         }
+        Some("web_search_call") => process_web_search_item(state, item, timestamp, line_idx),
         Some("function_call_output") | Some("custom_tool_call_output") => {
             process_tool_output_item(state, item, timestamp, line_idx)
         }
@@ -493,8 +511,7 @@ fn process_message_item(
         _ => {}
     }
 
-    state.all_parts.push(text.clone());
-    state.preview_parts.push(text);
+    state.all_parts.push(text);
     state.message_count += 1;
 }
 
@@ -510,13 +527,61 @@ fn process_tool_call_item(
         .and_then(Value::as_str)
         .unwrap_or("tool")
         .to_string();
+    let input = parse_tool_input(item);
+    push_tool_call_entry(state, item, name, input, timestamp, line_idx);
+}
+
+// web_search_call items carry the request in `action` ({type: search|open_page,
+// query/queries/url}) instead of `arguments`; map them onto the web_search /
+// web_fetch formatters.
+fn process_web_search_item(
+    state: &mut CodexParseState,
+    item: &Value,
+    timestamp: Option<DateTime<FixedOffset>>,
+    line_idx: usize,
+) {
+    let action = item.get("action").unwrap_or(&Value::Null);
+    let query = action
+        .get("query")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            action
+                .get("queries")
+                .and_then(Value::as_array)
+                .map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+        })
+        .filter(|query| !query.is_empty());
+    let url = action.get("url").and_then(Value::as_str);
+
+    let (name, input) = match (query, url) {
+        (Some(query), _) => ("web_search", serde_json::json!({ "query": query })),
+        (None, Some(url)) => ("web_fetch", serde_json::json!({ "url": url })),
+        (None, None) => ("web_search", action.clone()),
+    };
+    push_tool_call_entry(state, item, name.to_string(), input, timestamp, line_idx);
+}
+
+fn push_tool_call_entry(
+    state: &mut CodexParseState,
+    item: &Value,
+    name: String,
+    input: Value,
+    timestamp: Option<DateTime<FixedOffset>>,
+    line_idx: usize,
+) {
     let id = item
         .get("call_id")
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("codex-call-{}", line_idx));
-    let input = parse_tool_input(item);
     let timestamp = timestamp_string(timestamp, state.metadata_timestamp);
 
     state.entries.push(LogEntry::Assistant {
@@ -614,13 +679,13 @@ fn build_codex_conversation(
     modified: Option<SystemTime>,
     state: CodexParseState,
 ) -> Option<Conversation> {
-    if state.preview_parts.is_empty() {
+    if state.all_parts.is_empty() {
         return None;
     }
 
     let preview = if show_last {
         state
-            .preview_parts
+            .all_parts
             .iter()
             .rev()
             .take(3)
@@ -629,7 +694,7 @@ fn build_codex_conversation(
             .join(" ... ")
     } else {
         state
-            .preview_parts
+            .all_parts
             .iter()
             .take(3)
             .cloned()
@@ -693,7 +758,10 @@ fn collect_session_files(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // file_type() does not follow symlinks, so symlinked directories are
+            // never descended (guards against cycles); symlinked files still
+            // resolve through path.is_file().
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 dirs.push(path);
             } else if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
                 files.push(path);
@@ -701,14 +769,16 @@ fn collect_session_files(root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    files.sort_by_key(|path| {
-        std::cmp::Reverse(
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH),
-        )
-    });
     files
+}
+
+fn resolve_codex_home(env_value: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+    env_value
+        // codex itself treats a set-but-empty CODEX_HOME as unset.
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".codex")))
+        .unwrap_or_default()
 }
 
 fn text_blocks_from_codex_content(
@@ -813,16 +883,21 @@ fn is_legacy_session_metadata(record: &Value) -> bool {
         && record.get("payload").is_none()
 }
 
+// Matches synthetic user-role records codex injects (instructions, environment
+// snapshots, Esc-interrupt markers). These always START with their marker;
+// matching anywhere in the text would eat genuine user messages that quote one.
 fn is_codex_metadata_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions for ")
         || trimmed.starts_with("<environment_context>")
-        || trimmed.contains("\n<environment_context>")
+        || trimmed.starts_with("<turn_aborted>")
 }
 
 fn session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    if stem.len() >= 36 {
+    // A UUID suffix is pure ASCII, so a non-char-boundary cut point (multi-byte
+    // character straddling it) can never hold one; slicing there would panic.
+    if stem.len() >= 36 && stem.is_char_boundary(stem.len() - 36) {
         let candidate = &stem[stem.len() - 36..];
         if is_uuid_like(candidate) {
             return Some(candidate.to_string());
@@ -939,5 +1014,104 @@ mod tests {
             session_id_from_path(&path).as_deref(),
             Some("019eb42f-a4e2-75e0-b7ad-2268948a559c")
         );
+    }
+
+    #[test]
+    fn filters_turn_aborted_but_keeps_users_quoting_metadata_tags() {
+        let content = [
+            r#"{"timestamp":"2026-06-11T00:58:16.813Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose."}]}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:20.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"why does codex inject this?\n<environment_context>\nnoise\n</environment_context>"}]}}"#,
+        ]
+        .join("\n");
+
+        let parsed = parse(&content, false);
+        let conversation = parsed.conversation.unwrap();
+
+        assert!(!conversation.full_text.contains("turn_aborted"));
+        assert!(
+            conversation
+                .full_text
+                .contains("why does codex inject this?")
+        );
+        assert_eq!(conversation.message_count, 1);
+        assert_eq!(parsed.entries.len(), 1);
+    }
+
+    #[test]
+    fn maps_web_search_calls_to_named_tool_entries() {
+        let content = [
+            r#"{"timestamp":"2026-06-11T00:58:16.813Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Search the docs"}]}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:17.000Z","type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{"type":"search","query":"codex config reference"}}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:18.000Z","type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{"type":"open_page","url":"https://example.com/docs"}}}"#,
+        ]
+        .join("\n");
+
+        let parsed = parse(&content, false);
+        let tool_uses: Vec<(&str, &Value)> = parsed
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LogEntry::Assistant { message, .. } => match message.content.first() {
+                    Some(ContentBlock::ToolUse { name, input, .. }) => Some((name.as_str(), input)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0].0, "web_search");
+        assert_eq!(
+            tool_uses[0].1.get("query").and_then(Value::as_str),
+            Some("codex config reference")
+        );
+        assert_eq!(tool_uses[1].0, "web_fetch");
+        assert_eq!(
+            tool_uses[1].1.get("url").and_then(Value::as_str),
+            Some("https://example.com/docs")
+        );
+    }
+
+    #[test]
+    fn session_id_handles_non_ascii_filenames() {
+        // 37-byte stem whose 36-bytes-from-the-end cut point lands inside 'é'.
+        let straddling = PathBuf::from(format!("é{}.jsonl", "a".repeat(35)));
+        let expected = format!("é{}", "a".repeat(35));
+        assert_eq!(
+            session_id_from_path(&straddling).as_deref(),
+            Some(expected.as_str())
+        );
+
+        let uuid_after_multibyte_prefix = PathBuf::from(
+            "日本語-rollout-2026-06-10T17-58-01-019eb42f-a4e2-75e0-b7ad-2268948a559c.jsonl",
+        );
+        assert_eq!(
+            session_id_from_path(&uuid_after_multibyte_prefix).as_deref(),
+            Some("019eb42f-a4e2-75e0-b7ad-2268948a559c")
+        );
+    }
+
+    #[test]
+    fn resolves_codex_home_treating_empty_env_as_unset() {
+        let home = Some(PathBuf::from("/home/user"));
+
+        assert_eq!(
+            resolve_codex_home(Some(OsString::from("/custom/codex")), home.clone()),
+            PathBuf::from("/custom/codex")
+        );
+        assert_eq!(
+            resolve_codex_home(Some(OsString::new()), home.clone()),
+            PathBuf::from("/home/user/.codex")
+        );
+        assert_eq!(
+            resolve_codex_home(None, home),
+            PathBuf::from("/home/user/.codex")
+        );
+        assert_eq!(resolve_codex_home(None, None), PathBuf::new());
+
+        let provider = CodexProvider {
+            codex_home: PathBuf::new(),
+        };
+        assert!(provider.sessions_root().is_none());
     }
 }
