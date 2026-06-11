@@ -94,6 +94,7 @@ fn format_tokens_long(tokens: u64) -> String {
 fn provider_badge_text(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "[Claude] ",
+        ProviderKind::Codex => "[Codex] ",
         ProviderKind::Cursor => "[Cursor] ",
         ProviderKind::CursorAgent => "[Cursor CLI] ",
     }
@@ -102,6 +103,7 @@ fn provider_badge_text(provider: ProviderKind) -> &'static str {
 fn provider_badge(provider: ProviderKind) -> Span<'static> {
     let color = match provider {
         ProviderKind::Claude => Color::Rgb(218, 119, 86), // Claude terracotta
+        ProviderKind::Codex => Color::Rgb(78, 201, 176),  // Codex teal
         ProviderKind::Cursor => Color::Rgb(180, 130, 230), // Cursor purple
         ProviderKind::CursorAgent => Color::Rgb(94, 184, 255), // Cursor agent blue
     };

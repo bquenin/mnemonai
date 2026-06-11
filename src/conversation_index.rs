@@ -265,6 +265,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 fn provider_key(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "claude",
+        ProviderKind::Codex => "codex",
         ProviderKind::Cursor => "cursor",
         ProviderKind::CursorAgent => "cursor-agent",
     }

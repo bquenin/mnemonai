@@ -117,6 +117,7 @@ fn run() -> Result<()> {
     let exclude_paths = config.exclude.unwrap_or_default();
     let providers: Vec<Box<dyn Provider>> = vec![
         Box::new(providers::claude::ClaudeProvider::new(exclude_paths)),
+        Box::new(providers::codex::CodexProvider::new()),
         Box::new(providers::cursor_agent::CursorAgentProvider::new()),
         Box::new(providers::cursor::CursorProvider::new()),
     ];
