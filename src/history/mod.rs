@@ -30,6 +30,7 @@ pub use path::{convert_path_to_project_dir_name, format_short_name_from_path};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
     Claude,
+    Codex,
     Cursor,
     CursorAgent,
 }

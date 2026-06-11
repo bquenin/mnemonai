@@ -22,6 +22,7 @@ use std::time::Duration;
 fn provider_theme(kind: &ProviderKind) -> (String, (u8, u8, u8), (u8, u8, u8)) {
     match kind {
         ProviderKind::Claude => ("Claude".to_string(), (218, 119, 86), (170, 93, 67)),
+        ProviderKind::Codex => ("Codex".to_string(), (78, 201, 176), (56, 150, 132)),
         ProviderKind::Cursor => ("Cursor IDE".to_string(), (180, 130, 230), (140, 100, 180)),
         ProviderKind::CursorAgent => ("Cursor Agent".to_string(), (94, 184, 255), (72, 140, 194)),
     }
@@ -737,6 +738,7 @@ impl App {
         let conv = self.conversations.iter().find(|c| c.path == path);
 
         let assistant_label = match conv.map(|c| &c.provider) {
+            Some(ProviderKind::Codex) => "Codex",
             Some(ProviderKind::Cursor) => "Cursor",
             Some(ProviderKind::CursorAgent) => "Cursor Agent",
             _ => "Claude",

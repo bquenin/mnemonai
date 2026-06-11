@@ -7,6 +7,7 @@ Universal AI coding conversation history browser. Search, browse, and resume con
 | Tool | History Format | Resume Support |
 |------|---------------|----------------|
 | **Claude Code** | JSONL files in `~/.claude/projects/` | `claude --resume <session-id>` |
+| **Codex** | JSONL transcripts in `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`) | `codex resume <session-id>` |
 | **Cursor Agent CLI** | JSONL transcripts in `~/.cursor/projects/*/agent-transcripts/` | `agent --resume <chat-id>` |
 | **Cursor (IDE)** | SQLite in workspace storage | Bridge extension + `cursor://` URI |
 
