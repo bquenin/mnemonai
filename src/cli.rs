@@ -42,6 +42,7 @@ impl fmt::Display for DebugLevel {
 
 #[derive(Parser, Debug)]
 #[command(name = "mnemonai")]
+#[command(version)]
 #[command(about = "Universal AI coding conversation history browser")]
 pub struct Args {
     /// Show tool calls in the conversation output
