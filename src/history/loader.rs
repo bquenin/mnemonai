@@ -11,7 +11,7 @@ use super::{Conversation, LoaderMessage, Project};
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
     CachedFileConversation, SourceFingerprint, fingerprint_from_metadata, load_provider_cache,
-    save_conversations,
+    prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -99,6 +99,13 @@ pub fn load_all_conversations(
         show_last,
         fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
     );
+
+    // Entries no project claimed belong to files that no longer exist.
+    let stale: Vec<PathBuf> = cache
+        .into_inner()
+        .map(|cache| cache.into_keys().collect())
+        .unwrap_or_default();
+    prune_conversations(ProviderKind::Claude, &stale);
 
     // Global sort by timestamp (newest first)
     all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -216,6 +223,13 @@ fn load_all_streaming_inner(
         show_last,
         fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
     );
+
+    // Entries no project claimed belong to files that no longer exist.
+    let stale: Vec<PathBuf> = cache
+        .into_inner()
+        .map(|cache| cache.into_keys().collect())
+        .unwrap_or_default();
+    prune_conversations(ProviderKind::Claude, &stale);
 
     let _ = tx.send(LoaderMessage::Done);
 }

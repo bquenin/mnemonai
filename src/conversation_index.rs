@@ -28,8 +28,11 @@ pub struct CachedFileConversation {
 impl CachedFileConversation {
     /// Consume the cache entry, returning the conversation when the source file
     /// is unchanged. Moving (rather than cloning) matters: cached entries carry
-    /// the full conversation text twice (original + lowercased).
-    pub fn into_conversation_if_fresh(self, fingerprint: SourceFingerprint) -> Option<Conversation> {
+    /// the conversation's full text.
+    pub fn into_conversation_if_fresh(
+        self,
+        fingerprint: SourceFingerprint,
+    ) -> Option<Conversation> {
         let fresh = self.fingerprint == fingerprint;
         fresh.then_some(self.conversation)
     }
@@ -64,8 +67,7 @@ where
     }
 
     let Some(mut conn) = open_index_db() else {
-        let _ =
-            crate::debug_log::log_debug("conversation index: failed to open database for save");
+        let _ = crate::debug_log::log_debug("conversation index: failed to open database for save");
         return;
     };
 
@@ -140,6 +142,32 @@ pub fn delete_conversation(provider: ProviderKind, path: &std::path::Path) {
     };
 
     let _ = delete_conversation_from_conn(&conn, provider, path);
+}
+
+/// Remove cached rows for source files that no longer exist. Callers pass the
+/// paths left over in the cache map after a full provider scan consumed every
+/// current file — anything still in the map has disappeared from disk (or been
+/// excluded), and keeping it would grow the database and slow every load.
+/// Only call this after a complete scan, never for a single-project load.
+pub fn prune_conversations(provider: ProviderKind, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+
+    let Some(mut conn) = open_index_db() else {
+        return;
+    };
+
+    let Ok(tx) = conn.transaction() else {
+        return;
+    };
+    for path in paths {
+        let _ = tx.execute(
+            "DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2",
+            params![provider_key(&provider), path.to_string_lossy()],
+        );
+    }
+    let _ = tx.commit();
 }
 
 fn delete_conversation_from_conn(
@@ -437,7 +465,7 @@ mod tests {
         init_schema(&conn).unwrap();
 
         // Save + load must round-trip after the rebuild.
-        let mut conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
+        let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
         let fingerprint = SourceFingerprint {
             modified_millis: 1,
             size: 2,
@@ -458,7 +486,7 @@ mod tests {
     fn init_schema_preserves_rows_when_schema_matches() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let mut conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
+        let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
         let fingerprint = SourceFingerprint {
             modified_millis: 1,
             size: 2,
@@ -482,7 +510,7 @@ mod tests {
     fn delete_conversation_removes_cached_rows_for_all_preview_modes() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let mut conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
+        let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
         let fingerprint = SourceFingerprint {
             modified_millis: 123,
             size: 456,

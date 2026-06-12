@@ -2,7 +2,7 @@ use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent, UserM
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
     SourceFingerprint, delete_conversation, fingerprint_from_metadata, load_provider_cache,
-    save_conversations,
+    prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -153,6 +153,13 @@ impl CodexProvider {
                 ConversationLoad::Cached(_) => None,
             }),
         );
+
+        // Entries no session file claimed belong to files that no longer exist.
+        let stale: Vec<PathBuf> = cache
+            .into_inner()
+            .map(|cache| cache.into_keys().collect())
+            .unwrap_or_default();
+        prune_conversations(ProviderKind::Codex, &stale);
 
         let mut conversations: Vec<Conversation> = loaded
             .into_iter()

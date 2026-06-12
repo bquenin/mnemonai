@@ -4,7 +4,7 @@ use crate::claude::{
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
     CachedFileConversation, SourceFingerprint, delete_conversation, fingerprint_from_metadata,
-    load_provider_cache, save_conversations,
+    load_provider_cache, prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -113,46 +113,50 @@ impl CursorAgentProvider {
             .parent()
             .map(|cursor_dir| cursor_dir.join("chats"));
 
-        let mut projects = Vec::new();
-        for entry in fs::read_dir(&self.projects_root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
+        // Each project costs real I/O: listing transcripts plus the DFS
+        // filesystem probing in resolve_workspace_path. Run them in parallel.
+        let entries: Vec<_> = fs::read_dir(&self.projects_root)?.flatten().collect();
+        let mut projects: Vec<AgentProject> = entries
+            .par_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return None;
+                }
 
-            let transcripts_dir = path.join("agent-transcripts");
-            if !transcripts_dir.is_dir() {
-                continue;
-            }
+                let transcripts_dir = path.join("agent-transcripts");
+                if !transcripts_dir.is_dir() {
+                    return None;
+                }
 
-            let transcript_files = collect_transcript_files(&transcripts_dir);
-            if transcript_files.is_empty() {
-                continue;
-            }
+                let transcript_files = collect_transcript_files(&transcripts_dir);
+                if transcript_files.is_empty() {
+                    return None;
+                }
 
-            let modified = transcript_files
-                .iter()
-                .filter_map(|path| file_modified_time(path))
-                .max()
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+                let modified = transcript_files
+                    .iter()
+                    .filter_map(|path| file_modified_time(path))
+                    .max()
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
 
-            let project_dir_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_string();
+                let project_dir_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_string();
 
-            let workspace_path =
-                resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
+                let workspace_path =
+                    resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
 
-            projects.push(AgentProject {
-                project_dir_name,
-                workspace_path,
-                transcript_files,
-                modified,
-            });
-        }
+                Some(AgentProject {
+                    project_dir_name,
+                    workspace_path,
+                    transcript_files,
+                    modified,
+                })
+            })
+            .collect();
 
         projects.sort_by(|a, b| b.modified.cmp(&a.modified));
         Ok(projects)
@@ -296,6 +300,13 @@ impl super::Provider for CursorAgentProvider {
                 .map(|(conv, fingerprint)| (conv, *fingerprint)),
         );
 
+        // Entries no project claimed belong to files that no longer exist.
+        let stale: Vec<PathBuf> = cache
+            .into_inner()
+            .map(|cache| cache.into_keys().collect())
+            .unwrap_or_default();
+        prune_conversations(ProviderKind::CursorAgent, &stale);
+
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         for (idx, conversation) in conversations.iter_mut().enumerate() {
             conversation.index = idx;
@@ -313,6 +324,12 @@ impl super::Provider for CursorAgentProvider {
         let projects_root = self.projects_root.clone();
 
         std::thread::spawn(move || {
+            // The conversation index read is independent of the filesystem
+            // walk in list_projects — overlap the two.
+            let cache_handle = std::thread::spawn(move || {
+                Mutex::new(load_provider_cache(ProviderKind::CursorAgent, show_last))
+            });
+
             let provider = CursorAgentProvider { projects_root };
             let projects = match provider.list_projects() {
                 Ok(projects) => projects,
@@ -322,7 +339,9 @@ impl super::Provider for CursorAgentProvider {
                 }
             };
 
-            let cache = Mutex::new(load_provider_cache(ProviderKind::CursorAgent, show_last));
+            let cache = cache_handle
+                .join()
+                .unwrap_or_else(|_| Mutex::new(HashMap::new()));
             let mut all_fresh: Vec<(Conversation, SourceFingerprint)> = Vec::new();
             for project in &projects {
                 let (conversations, fresh) =
@@ -342,6 +361,13 @@ impl super::Provider for CursorAgentProvider {
                     .iter()
                     .map(|(conv, fingerprint)| (conv, *fingerprint)),
             );
+
+            // Entries no project claimed belong to files that no longer exist.
+            let stale: Vec<PathBuf> = cache
+                .into_inner()
+                .map(|cache| cache.into_keys().collect())
+                .unwrap_or_default();
+            prune_conversations(ProviderKind::CursorAgent, &stale);
 
             let _ = tx.send(LoaderMessage::Done);
         });
