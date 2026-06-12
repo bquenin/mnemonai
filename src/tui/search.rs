@@ -371,8 +371,10 @@ mod tests {
     #[test]
     fn recency_halves_the_boost_at_the_half_life() {
         let now = Local::now();
-        let at_half_life =
-            recency_multiplier(now - Duration::days(RECENCY_HALF_LIFE_DAYS as i64), now);
+        // Derive the age in seconds so the test stays correct if the constant
+        // is ever changed to a fractional number of days.
+        let half_life = Duration::seconds((RECENCY_HALF_LIFE_DAYS * 86_400.0).round() as i64);
+        let at_half_life = recency_multiplier(now - half_life, now);
         let expected = 1.0 + RECENCY_MAX_BOOST / 2.0;
         assert!((at_half_life - expected).abs() < 1e-6);
     }
