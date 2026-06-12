@@ -122,6 +122,11 @@ fn run() -> Result<()> {
         Box::new(providers::cursor::CursorProvider::new()),
     ];
 
+    // Handle --bench-startup flag: time the streaming load headlessly and exit
+    if args.bench_startup {
+        return bench_startup(&providers, show_last, args.debug);
+    }
+
     // Handle --render flag: render a JSONL file in ledger format and exit
     if let Some(ref render_path) = args.render {
         let display_options = display::DisplayOptions {
@@ -304,6 +309,92 @@ fn run() -> Result<()> {
     } else {
         display::display_conversation(&selected_path, &display_options)?;
     }
+
+    Ok(())
+}
+
+/// Drain every provider's streaming loader without the TUI and print timing
+/// information. Used to measure startup loading performance (--bench-startup).
+fn bench_startup(
+    providers: &[Box<dyn Provider>],
+    show_last: bool,
+    debug_level: Option<cli::DebugLevel>,
+) -> Result<()> {
+    use std::time::Instant;
+
+    let overall = Instant::now();
+
+    // Start all providers first (mirrors real startup), then drain each in its
+    // own thread so a slow provider doesn't block the others' message streams.
+    let receivers: Vec<(String, Receiver<LoaderMessage>)> = providers
+        .iter()
+        .map(|p| {
+            (
+                p.name().to_string(),
+                p.load_conversations_streaming(show_last, debug_level),
+            )
+        })
+        .collect();
+
+    let handles: Vec<_> = receivers
+        .into_iter()
+        .map(|(name, rx)| {
+            std::thread::spawn(move || {
+                let mut first_batch_ms: Option<u128> = None;
+                let mut conversations = 0usize;
+                let mut batches = 0usize;
+                let mut errors = 0usize;
+                for msg in rx {
+                    match msg {
+                        LoaderMessage::Batch(batch) => {
+                            batches += 1;
+                            conversations += batch.len();
+                            first_batch_ms.get_or_insert_with(|| overall.elapsed().as_millis());
+                        }
+                        LoaderMessage::ProjectError => errors += 1,
+                        LoaderMessage::Fatal(_) => {
+                            errors += 1;
+                            break;
+                        }
+                        LoaderMessage::Done => break,
+                    }
+                }
+                let done_ms = overall.elapsed().as_millis();
+                (name, first_batch_ms, done_ms, conversations, batches, errors)
+            })
+        })
+        .collect();
+
+    let mut results: Vec<_> = handles
+        .into_iter()
+        .filter_map(|h| h.join().ok())
+        .collect();
+    results.sort_by_key(|r| r.2);
+
+    let total_ms = overall.elapsed().as_millis();
+    let total_convs: usize = results.iter().map(|r| r.3).sum();
+
+    println!(
+        "{:<18} {:>12} {:>10} {:>8} {:>8} {:>7}",
+        "provider", "first batch", "done", "convs", "batches", "errors"
+    );
+    for (name, first_batch_ms, done_ms, convs, batches, errors) in &results {
+        println!(
+            "{:<18} {:>12} {:>10} {:>8} {:>8} {:>7}",
+            name,
+            first_batch_ms
+                .map(|ms| format!("{} ms", ms))
+                .unwrap_or_else(|| "-".to_string()),
+            format!("{} ms", done_ms),
+            convs,
+            batches,
+            errors
+        );
+    }
+    println!(
+        "\ntotal: {} conversations in {} ms (all providers done)",
+        total_convs, total_ms
+    );
 
     Ok(())
 }

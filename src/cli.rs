@@ -147,6 +147,10 @@ pub struct Args {
     #[arg(long, help = "Disable colored output")]
     pub no_color: bool,
 
+    /// Benchmark startup loading (headless) and exit
+    #[arg(long, hide = true)]
+    pub bench_startup: bool,
+
     /// Input JSONL file to view directly (skips conversation selection)
     #[arg(
         value_name = "FILE",
