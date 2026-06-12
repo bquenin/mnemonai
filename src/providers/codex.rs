@@ -1,8 +1,8 @@
 use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage};
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    SourceFingerprint, attach_search_cache, delete_conversation, fingerprint_from_metadata,
-    load_provider_cache, save_conversations,
+    SourceFingerprint, delete_conversation, fingerprint_from_metadata, load_provider_cache,
+    save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -17,6 +17,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
@@ -85,7 +86,7 @@ impl CodexProvider {
         }
 
         let files = collect_session_files(&root);
-        let cache = load_provider_cache(ProviderKind::Codex, show_last);
+        let cache = Mutex::new(load_provider_cache(ProviderKind::Codex, show_last));
         let loaded: Vec<ConversationLoad> = files
             .into_par_iter()
             .filter_map(|path| {
@@ -102,8 +103,10 @@ impl CodexProvider {
 
                 if let Some(fingerprint) = fingerprint
                     && let Some(conversation) = cache
-                        .get(&path)
-                        .and_then(|cached| cached.conversation_if_fresh(fingerprint))
+                        .lock()
+                        .ok()
+                        .and_then(|mut cache| cache.remove(&path))
+                        .and_then(|cached| cached.into_conversation_if_fresh(fingerprint))
                 {
                     debug::debug(
                         debug_level,
@@ -113,7 +116,7 @@ impl CodexProvider {
                 }
 
                 match process_codex_transcript_file(path, show_last, modified, debug_level) {
-                    Ok(Some(mut conversation)) => {
+                    Ok(Some(conversation)) => {
                         debug::debug(
                             debug_level,
                             &format!(
@@ -121,7 +124,6 @@ impl CodexProvider {
                                 filename, conversation.preview
                             ),
                         );
-                        attach_search_cache(&mut conversation);
                         match fingerprint {
                             Some(fingerprint) => {
                                 Some(ConversationLoad::Fresh(conversation, fingerprint))

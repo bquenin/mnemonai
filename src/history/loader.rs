@@ -10,8 +10,8 @@ use super::path::{
 use super::{Conversation, LoaderMessage, Project};
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, attach_search_cache, fingerprint_from_metadata,
-    load_provider_cache, save_conversations,
+    CachedFileConversation, SourceFingerprint, fingerprint_from_metadata, load_provider_cache,
+    save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::SystemTime;
@@ -52,7 +53,8 @@ pub fn load_all_conversations(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
-    let cache = load_provider_cache(ProviderKind::Claude, show_last);
+    let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
+    let fresh_acc: Mutex<Vec<(Conversation, SourceFingerprint)>> = Mutex::new(Vec::new());
 
     // Load conversations from all projects in parallel
     let mut all_conversations: Vec<Conversation> = projects
@@ -60,7 +62,11 @@ pub fn load_all_conversations(
         .flat_map(|project| {
             let project_dir = root.join(&project.name);
             match load_conversations_with_cache(&project_dir, show_last, debug_level, &cache) {
-                Ok(mut convs) => {
+                Ok((mut convs, fresh)) => {
+                    if !fresh.is_empty() {
+                        fresh_acc.lock().unwrap().extend(fresh);
+                    }
+
                     // Fallback path for old JSONL files without cwd field
                     let fallback_path = decode_project_dir_name_to_path(&project.name);
 
@@ -84,6 +90,15 @@ pub fn load_all_conversations(
             }
         })
         .collect();
+
+    // One write transaction for the whole run, instead of one per project
+    // racing each other for the SQLite write lock.
+    let fresh = fresh_acc.into_inner().unwrap_or_default();
+    save_conversations(
+        ProviderKind::Claude,
+        show_last,
+        fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
+    );
 
     // Global sort by timestamp (newest first)
     all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -156,14 +171,18 @@ fn load_all_streaming_inner(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
-    let cache = load_provider_cache(ProviderKind::Claude, show_last);
+    let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
+    let fresh_acc: Mutex<Vec<(Conversation, SourceFingerprint)>> = Mutex::new(Vec::new());
 
     // Process projects in parallel and send batches as they complete
     projects.par_iter().for_each(|project| {
         let project_dir = root.join(&project.name);
 
         match load_conversations_with_cache(&project_dir, show_last, debug_level, &cache) {
-            Ok(mut convs) => {
+            Ok((mut convs, fresh)) => {
+                if !fresh.is_empty() {
+                    fresh_acc.lock().unwrap().extend(fresh);
+                }
                 if convs.is_empty() {
                     return;
                 }
@@ -188,6 +207,15 @@ fn load_all_streaming_inner(
             }
         }
     });
+
+    // All batches are on the channel; persist newly parsed conversations in a
+    // single write transaction so the next start can skip re-parsing them.
+    let fresh = fresh_acc.into_inner().unwrap_or_default();
+    save_conversations(
+        ProviderKind::Claude,
+        show_last,
+        fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
+    );
 
     let _ = tx.send(LoaderMessage::Done);
 }
@@ -264,16 +292,26 @@ pub fn load_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    let cache = load_provider_cache(ProviderKind::Claude, show_last);
-    load_conversations_with_cache(projects_dir, show_last, debug_level, &cache)
+    let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
+    let (conversations, fresh) =
+        load_conversations_with_cache(projects_dir, show_last, debug_level, &cache)?;
+    save_conversations(
+        ProviderKind::Claude,
+        show_last,
+        fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
+    );
+    Ok(conversations)
 }
 
+/// Load one project directory. Returns the conversations plus clones of the
+/// freshly parsed ones (cache misses) so the caller can persist them in a
+/// single batch — per-project writes would race for the SQLite write lock.
 fn load_conversations_with_cache(
     projects_dir: &Path,
     show_last: bool,
     debug_level: Option<DebugLevel>,
-    cache: &HashMap<PathBuf, CachedFileConversation>,
-) -> Result<Vec<Conversation>> {
+    cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
+) -> Result<(Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>)> {
     // Find all JSONL files and capture metadata in one pass
     let mut files_with_meta = Vec::new();
     let mut skipped_agent_files = 0;
@@ -326,8 +364,10 @@ fn load_conversations_with_cache(
 
             if let Some(fingerprint) = fingerprint
                 && let Some(conversation) = cache
-                    .get(&path)
-                    .and_then(|cached| cached.conversation_if_fresh(fingerprint))
+                    .lock()
+                    .ok()
+                    .and_then(|mut cache| cache.remove(&path))
+                    .and_then(|cached| cached.into_conversation_if_fresh(fingerprint))
             {
                 debug::debug(
                     debug_level,
@@ -337,12 +377,11 @@ fn load_conversations_with_cache(
             }
 
             match process_conversation_file(path, show_last, modified, debug_level) {
-                Ok(Some(mut conversation)) => {
+                Ok(Some(conversation)) => {
                     debug::debug(
                         debug_level,
                         &format!("Loaded {}: {}", filename, conversation.preview),
                     );
-                    attach_search_cache(&mut conversation);
                     match fingerprint {
                         Some(fingerprint) => {
                             Some(ConversationLoad::Fresh(conversation, fingerprint))
@@ -362,16 +401,18 @@ fn load_conversations_with_cache(
         })
         .collect();
 
-    save_conversations(
-        ProviderKind::Claude,
-        show_last,
-        loaded.iter().filter_map(|loaded| match loaded {
+    // Clone the freshly parsed conversations for the caller to persist later.
+    // On warm starts nearly everything is cached, so this clones little or
+    // nothing; only a cold start pays for the copies.
+    let fresh: Vec<(Conversation, SourceFingerprint)> = loaded
+        .iter()
+        .filter_map(|loaded| match loaded {
             ConversationLoad::Fresh(conversation, fingerprint) => {
-                Some((conversation, *fingerprint))
+                Some((conversation.clone(), *fingerprint))
             }
             ConversationLoad::Cached(_) => None,
-        }),
-    );
+        })
+        .collect();
 
     let mut conversations: Vec<Conversation> = loaded
         .into_iter()
@@ -401,5 +442,5 @@ fn load_conversations_with_cache(
         &format!("Total conversations loaded: {}", conversations.len()),
     );
 
-    Ok(conversations)
+    Ok((conversations, fresh))
 }
