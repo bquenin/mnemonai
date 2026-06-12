@@ -209,34 +209,55 @@ impl CursorProvider {
     }
 }
 
-/// GROUP BY query to enumerate all conversations with counts and boundary keys.
-/// Only accesses keys (no value I/O), so this is a fast index scan.
+/// Enumerate all conversations with counts and boundary keys.
+/// Only accesses keys (no value I/O), so this is a fast index scan. The
+/// grouping happens in Rust: the ordered scan already delivers all keys of a
+/// conversation contiguously, whereas GROUP BY on a SUBSTR() expression makes
+/// SQLite materialize and sort every key a second time.
 fn query_conv_infos(conn: &Connection, show_last: bool) -> Result<Vec<ConvInfo>> {
-    let order_func = if show_last { "MAX" } else { "MIN" };
-    let query = format!(
-        "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) as conv_id, \
-                COUNT(*) as cnt, \
-                MIN(key) as first_key, \
-                {}(key) as preview_key \
-         FROM cursorDiskKV \
+    let mut stmt = conn.prepare(
+        "SELECT key FROM cursorDiskKV \
          WHERE key >= 'bubbleId:' AND key < 'bubbleId;' \
-         GROUP BY conv_id",
-        order_func
-    );
-    let mut stmt = conn.prepare(&query)?;
-    let infos = stmt
-        .query_map([], |row| {
-            Ok(ConvInfo {
-                conv_id: row.get(0)?,
-                bubble_count: row.get::<_, usize>(1)?,
-                first_key: row.get(2)?,
-                preview_key: row.get(3)?,
+         ORDER BY key",
+    )?;
+
+    let mut infos: Vec<ConvInfo> = Vec::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let Ok(key) = row.get_ref(0)?.as_str() else {
+            continue;
+        };
+        let Some(conv_id) = conv_id_from_bubble_key(key) else {
+            continue;
+        };
+
+        match infos.last_mut() {
+            Some(info) if info.conv_id == conv_id => {
+                info.bubble_count += 1;
+                // MIN(key) is the first key of the group; MAX(key) the last.
+                if show_last {
+                    info.preview_key.clear();
+                    info.preview_key.push_str(key);
+                }
+            }
+            _ => infos.push(ConvInfo {
+                conv_id: conv_id.to_string(),
+                bubble_count: 1,
+                first_key: key.to_string(),
+                preview_key: key.to_string(),
                 user_preview_key: None,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+            }),
+        }
+    }
+
     Ok(infos)
+}
+
+/// Extract `<conv_id>` from a `bubbleId:<conv_id>:<bubble_id>` key.
+fn conv_id_from_bubble_key(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("bubbleId:")?;
+    let colon = rest.find(':')?;
+    Some(&rest[..colon]).filter(|conv_id| !conv_id.is_empty())
 }
 
 /// Query for the first/last user-type bubble per conversation using json_extract.
@@ -343,6 +364,43 @@ fn query_user_key_for_conv(
     result.unwrap_or((None, None))
 }
 
+/// Resolve user bubble keys for many conversations, in parallel across
+/// read-only connections when the database can be reopened by path.
+/// Returns (conv_id, min_user_key, max_user_key) tuples; conversations whose
+/// chunk failed are simply absent.
+fn query_user_keys_for_convs(
+    db_path: &Path,
+    fallback_conn: &Connection,
+    conv_ids: &[String],
+) -> Vec<(String, Option<String>, Option<String>)> {
+    if conv_ids.len() <= 4 || open_global_ro(db_path).is_none() {
+        return conv_ids
+            .iter()
+            .map(|conv_id| {
+                let (min_key, max_key) = query_user_key_for_conv(fallback_conn, conv_id);
+                (conv_id.clone(), min_key, max_key)
+            })
+            .collect();
+    }
+
+    conv_ids
+        .par_chunks(32)
+        .filter_map(|chunk| {
+            let conn = open_global_ro(db_path)?;
+            Some(
+                chunk
+                    .iter()
+                    .map(|conv_id| {
+                        let (min_key, max_key) = query_user_key_for_conv(&conn, conv_id);
+                        (conv_id.clone(), min_key, max_key)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
 /// Batch-insert user bubble key entries into the cache in a single transaction.
 fn save_user_keys_to_cache(
     cache_conn: &Connection,
@@ -439,25 +497,72 @@ fn build_full_text_map(
     conv_infos: &[ConvInfo],
     cache_conn: Option<&Connection>,
 ) -> HashMap<String, String> {
-    let mut full_text_map = HashMap::with_capacity(conv_infos.len());
-
     let cached = cache_conn
         .map(|c| load_cached_full_text(c))
         .unwrap_or_default();
+    build_full_text_map_from_cached(None, cursor_conn, conv_infos, &cached, cache_conn)
+}
 
-    let mut new_entries: Vec<(String, String, usize)> = Vec::new();
+/// Like `build_full_text_map`, but with cache entries preloaded (so the cache
+/// read can happen on another thread) and, when `parallel_db_path` is given,
+/// cache misses fetched in parallel across read-only connections.
+fn build_full_text_map_from_cached(
+    parallel_db_path: Option<&Path>,
+    cursor_conn: &Connection,
+    conv_infos: &[ConvInfo],
+    cached: &HashMap<String, (String, usize)>,
+    cache_conn: Option<&Connection>,
+) -> HashMap<String, String> {
+    let mut full_text_map = HashMap::with_capacity(conv_infos.len());
+    let mut misses: Vec<&ConvInfo> = Vec::new();
 
     for info in conv_infos {
-        if let Some((text, count)) = cached.get(&info.conv_id) {
-            if *count == info.bubble_count {
+        match cached.get(&info.conv_id) {
+            Some((text, count)) if *count == info.bubble_count => {
                 full_text_map.insert(info.conv_id.clone(), text.clone());
-                continue;
             }
+            // Cache miss or stale — query fresh
+            _ => misses.push(info),
         }
-        // Cache miss or stale — query fresh
-        let text = query_full_text_for_conv(cursor_conn, &info.conv_id);
-        full_text_map.insert(info.conv_id.clone(), text.clone());
-        new_entries.push((info.conv_id.clone(), text, info.bubble_count));
+    }
+
+    let parallel = parallel_db_path
+        .filter(|path| misses.len() > 2 && open_global_ro(path).is_some())
+        .map(Path::to_path_buf);
+    let new_entries: Vec<(String, String, usize)> = match parallel {
+        Some(db_path) => misses
+            .par_chunks(32)
+            .filter_map(|chunk| {
+                let conn = open_global_ro(&db_path)?;
+                Some(
+                    chunk
+                        .iter()
+                        .map(|info| {
+                            (
+                                info.conv_id.clone(),
+                                query_full_text_for_conv(&conn, &info.conv_id),
+                                info.bubble_count,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect(),
+        None => misses
+            .iter()
+            .map(|info| {
+                (
+                    info.conv_id.clone(),
+                    query_full_text_for_conv(cursor_conn, &info.conv_id),
+                    info.bubble_count,
+                )
+            })
+            .collect(),
+    };
+
+    for (conv_id, text, _) in &new_entries {
+        full_text_map.insert(conv_id.clone(), text.clone());
     }
 
     if let Some(cache) = cache_conn {
@@ -465,6 +570,49 @@ fn build_full_text_map(
     }
 
     full_text_map
+}
+
+/// Open an additional read-only connection to the global database so
+/// independent queries can run in parallel. Returns None for databases that
+/// can't be reopened by path (e.g. in-memory databases in tests).
+fn open_global_ro(db_path: &Path) -> Option<Connection> {
+    if !db_path.is_file() {
+        return None;
+    }
+    Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+/// Batch-fetch bubble values in parallel across read-only connections.
+/// Falls back to the single supplied connection when the database can't be
+/// reopened by path. Chunks that fail to fetch are skipped rather than
+/// failing the whole load.
+fn batch_fetch_bubbles_parallel(
+    db_path: &Path,
+    fallback_conn: &Connection,
+    keys: &[String],
+) -> Result<HashMap<String, Value>> {
+    const CHUNK: usize = 200;
+    if keys.len() <= CHUNK || open_global_ro(db_path).is_none() {
+        return batch_fetch_bubbles(fallback_conn, keys);
+    }
+
+    let maps: Vec<HashMap<String, Value>> = keys
+        .par_chunks(CHUNK)
+        .filter_map(|chunk| {
+            let conn = open_global_ro(db_path)?;
+            batch_fetch_bubbles(&conn, chunk).ok()
+        })
+        .collect();
+
+    let mut merged = HashMap::with_capacity(keys.len());
+    for map in maps {
+        merged.extend(map);
+    }
+    Ok(merged)
 }
 
 /// Batch-fetch bubble values by key using IN clauses.
@@ -783,10 +931,28 @@ impl super::Provider for CursorProvider {
                 }
             };
 
-            let workspace_map = provider.build_workspace_map();
+            // The workspace map (hundreds of per-workspace databases) and the
+            // sidecar cache are independent of the global-database queries
+            // below — load them on their own threads so their I/O overlaps
+            // the scans of the (multi-GB) global database.
+            let workspace_handle = std::thread::spawn(move || provider.build_workspace_map());
+            let cache_handle = std::thread::spawn(|| {
+                let cache_conn = open_cache_db();
+                let user_keys = cache_conn
+                    .as_ref()
+                    .map(load_cached_user_keys)
+                    .unwrap_or_default();
+                let full_text = cache_conn
+                    .as_ref()
+                    .map(load_cached_full_text)
+                    .unwrap_or_default();
+                (cache_conn, user_keys, full_text)
+            });
+
             let index_timestamps = load_index_timestamps(&conn);
 
-            // Enumerate all conversations via GROUP BY (fast index scan, ~30ms).
+            // Enumerate all conversations via GROUP BY (index scan over every
+            // bubble key; the most expensive single query in this pipeline).
             let mut conv_infos = match query_conv_infos(&conn, show_last) {
                 Ok(infos) => infos,
                 Err(_) => {
@@ -795,35 +961,44 @@ impl super::Provider for CursorProvider {
                 }
             };
 
+            let (cache_conn, cached_user_keys, cached_full_text) = cache_handle
+                .join()
+                .unwrap_or_else(|_| (None, HashMap::new(), HashMap::new()));
+
             // Resolve user_preview_keys from cache BEFORE splitting into phases.
             // On warm cache this fills all keys, so every conversation builds in the
             // first batch — no visible refresh when phase 2 arrives.
-            let cache_conn = open_cache_db();
-            if let Some(ref cache) = cache_conn {
-                let cached = load_cached_user_keys(cache);
-                for info in &mut conv_infos {
-                    if let Some((min_key, max_key)) = cached.get(&info.conv_id) {
-                        info.user_preview_key = if show_last {
-                            max_key.clone()
-                        } else {
-                            min_key.clone()
-                        };
-                    }
+            for info in &mut conv_infos {
+                if let Some((min_key, max_key)) = cached_user_keys.get(&info.conv_id) {
+                    info.user_preview_key = if show_last {
+                        max_key.clone()
+                    } else {
+                        min_key.clone()
+                    };
                 }
             }
 
             // Batch-fetch all keys we know about (first, preview, and cached user keys).
             let phase1_keys = collect_keys_to_fetch(&conv_infos);
-            let bubble_map = match batch_fetch_bubbles(&conn, &phase1_keys) {
-                Ok(m) => m,
-                Err(_) => {
-                    let _ = tx.send(LoaderMessage::Done);
-                    return;
-                }
-            };
+            let bubble_map =
+                match batch_fetch_bubbles_parallel(&global_db_path, &conn, &phase1_keys) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _ = tx.send(LoaderMessage::Done);
+                        return;
+                    }
+                };
 
             // Build full-text search index for all conversations (cached, sub-ms per miss).
-            let full_text_map = build_full_text_map(&conn, &conv_infos, cache_conn.as_ref());
+            let full_text_map = build_full_text_map_from_cached(
+                Some(&global_db_path),
+                &conn,
+                &conv_infos,
+                &cached_full_text,
+                cache_conn.as_ref(),
+            );
+
+            let workspace_map = workspace_handle.join().unwrap_or_default();
 
             // Phase 1: build every conversation we can (includes cached user keys).
             let mut phase1_convs = Vec::new();
@@ -850,15 +1025,27 @@ impl super::Provider for CursorProvider {
             // Phase 2: resolve uncached conversations (cold cache or new conversations).
             if !remaining_infos.is_empty() {
                 if let Some(ref cache) = cache_conn {
+                    let conv_ids: Vec<String> = remaining_infos
+                        .iter()
+                        .map(|info| info.conv_id.clone())
+                        .collect();
+                    let resolved: HashMap<String, (Option<String>, Option<String>)> =
+                        query_user_keys_for_convs(&global_db_path, &conn, &conv_ids)
+                            .into_iter()
+                            .map(|(conv_id, min_key, max_key)| (conv_id, (min_key, max_key)))
+                            .collect();
+
                     let mut new_entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
                     for info in &mut remaining_infos {
-                        let (min_key, max_key) = query_user_key_for_conv(&conn, &info.conv_id);
+                        let Some((min_key, max_key)) = resolved.get(&info.conv_id) else {
+                            continue;
+                        };
                         info.user_preview_key = if show_last {
                             max_key.clone()
                         } else {
                             min_key.clone()
                         };
-                        new_entries.push((info.conv_id.clone(), min_key, max_key));
+                        new_entries.push((info.conv_id.clone(), min_key.clone(), max_key.clone()));
                     }
                     save_user_keys_to_cache(cache, &new_entries);
                 } else {
@@ -877,7 +1064,9 @@ impl super::Provider for CursorProvider {
 
                 let mut full_map = bubble_map;
                 if !extra_keys.is_empty() {
-                    if let Ok(extra) = batch_fetch_bubbles(&conn, &extra_keys) {
+                    if let Ok(extra) =
+                        batch_fetch_bubbles_parallel(&global_db_path, &conn, &extra_keys)
+                    {
                         full_map.extend(extra);
                     }
                 }

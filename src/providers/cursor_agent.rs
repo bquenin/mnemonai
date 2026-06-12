@@ -3,8 +3,8 @@ use crate::claude::{
 };
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, attach_search_cache, delete_conversation,
-    fingerprint_from_metadata, load_provider_cache, save_conversations,
+    CachedFileConversation, SourceFingerprint, delete_conversation, fingerprint_from_metadata,
+    load_provider_cache, prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -20,6 +20,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
@@ -112,58 +113,65 @@ impl CursorAgentProvider {
             .parent()
             .map(|cursor_dir| cursor_dir.join("chats"));
 
-        let mut projects = Vec::new();
-        for entry in fs::read_dir(&self.projects_root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
+        // Each project costs real I/O: listing transcripts plus the DFS
+        // filesystem probing in resolve_workspace_path. Run them in parallel.
+        let entries: Vec<_> = fs::read_dir(&self.projects_root)?.flatten().collect();
+        let mut projects: Vec<AgentProject> = entries
+            .par_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return None;
+                }
 
-            let transcripts_dir = path.join("agent-transcripts");
-            if !transcripts_dir.is_dir() {
-                continue;
-            }
+                let transcripts_dir = path.join("agent-transcripts");
+                if !transcripts_dir.is_dir() {
+                    return None;
+                }
 
-            let transcript_files = collect_transcript_files(&transcripts_dir);
-            if transcript_files.is_empty() {
-                continue;
-            }
+                let transcript_files = collect_transcript_files(&transcripts_dir);
+                if transcript_files.is_empty() {
+                    return None;
+                }
 
-            let modified = transcript_files
-                .iter()
-                .filter_map(|path| file_modified_time(path))
-                .max()
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+                let modified = transcript_files
+                    .iter()
+                    .filter_map(|path| file_modified_time(path))
+                    .max()
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
 
-            let project_dir_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_string();
+                let project_dir_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_string();
 
-            let workspace_path =
-                resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
+                let workspace_path =
+                    resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
 
-            projects.push(AgentProject {
-                project_dir_name,
-                workspace_path,
-                transcript_files,
-                modified,
-            });
-        }
+                Some(AgentProject {
+                    project_dir_name,
+                    workspace_path,
+                    transcript_files,
+                    modified,
+                })
+            })
+            .collect();
 
         projects.sort_by(|a, b| b.modified.cmp(&a.modified));
         Ok(projects)
     }
 
+    /// Load one project's transcripts. Returns the conversations plus clones of
+    /// the freshly parsed ones (cache misses) so the caller can persist them in
+    /// a single batch at the end of the run.
     fn load_project_conversations(
         &self,
         project: &AgentProject,
         show_last: bool,
         debug_level: Option<DebugLevel>,
-        cache: &HashMap<PathBuf, CachedFileConversation>,
-    ) -> Vec<Conversation> {
+        cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
+    ) -> (Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>) {
         let workspace_path = project.workspace_path.clone();
         let project_dir_name = project.project_dir_name.clone();
         let loaded: Vec<ConversationLoad> = project
@@ -177,10 +185,12 @@ impl CursorAgentProvider {
                     .to_string();
                 let fingerprint = file_fingerprint(path);
 
-                if let Some(fingerprint) = fingerprint
-                    && let Some(conversation) = cache
-                        .get(path)
-                        .and_then(|cached| cached.conversation_if_fresh(fingerprint))
+                // Always consume the cache entry for a file we've seen: whatever
+                // remains in the map afterwards is treated as deleted and pruned,
+                // and a file that merely failed to stat or parse isn't deleted.
+                let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(path));
+                if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
+                    && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
                 {
                     debug::debug(
                         debug_level,
@@ -196,7 +206,7 @@ impl CursorAgentProvider {
                     project_dir_name.clone(),
                     debug_level,
                 ) {
-                    Ok(Some(mut conversation)) => {
+                    Ok(Some(conversation)) => {
                         debug::debug(
                             debug_level,
                             &format!(
@@ -204,7 +214,6 @@ impl CursorAgentProvider {
                                 filename, conversation.preview
                             ),
                         );
-                        attach_search_cache(&mut conversation);
                         match fingerprint {
                             Some(fingerprint) => {
                                 Some(ConversationLoad::Fresh(conversation, fingerprint))
@@ -227,16 +236,15 @@ impl CursorAgentProvider {
             })
             .collect();
 
-        save_conversations(
-            ProviderKind::CursorAgent,
-            show_last,
-            loaded.iter().filter_map(|loaded| match loaded {
+        let fresh: Vec<(Conversation, SourceFingerprint)> = loaded
+            .iter()
+            .filter_map(|loaded| match loaded {
                 ConversationLoad::Fresh(conversation, fingerprint) => {
-                    Some((conversation, *fingerprint))
+                    Some((conversation.clone(), *fingerprint))
                 }
                 ConversationLoad::Cached(_) => None,
-            }),
-        );
+            })
+            .collect();
 
         let mut conversations: Vec<Conversation> = loaded
             .into_iter()
@@ -247,7 +255,7 @@ impl CursorAgentProvider {
         for (idx, conversation) in conversations.iter_mut().enumerate() {
             conversation.index = idx;
         }
-        conversations
+        (conversations, fresh)
     }
 }
 
@@ -274,13 +282,30 @@ impl super::Provider for CursorAgentProvider {
             return Ok(Vec::new());
         }
 
-        let cache = load_provider_cache(ProviderKind::CursorAgent, show_last);
-        let mut conversations: Vec<Conversation> = projects
-            .iter()
-            .flat_map(|project| {
-                self.load_project_conversations(project, show_last, debug_level, &cache)
-            })
-            .collect();
+        let cache = Mutex::new(load_provider_cache(ProviderKind::CursorAgent, show_last));
+        let mut all_fresh: Vec<(Conversation, SourceFingerprint)> = Vec::new();
+        let mut conversations: Vec<Conversation> = Vec::new();
+        for project in &projects {
+            let (convs, fresh) =
+                self.load_project_conversations(project, show_last, debug_level, &cache);
+            conversations.extend(convs);
+            all_fresh.extend(fresh);
+        }
+
+        save_conversations(
+            ProviderKind::CursorAgent,
+            show_last,
+            all_fresh
+                .iter()
+                .map(|(conv, fingerprint)| (conv, *fingerprint)),
+        );
+
+        // Entries no project claimed belong to files that no longer exist.
+        let stale: Vec<PathBuf> = cache
+            .into_inner()
+            .map(|cache| cache.into_keys().collect())
+            .unwrap_or_default();
+        prune_conversations(ProviderKind::CursorAgent, &stale);
 
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         for (idx, conversation) in conversations.iter_mut().enumerate() {
@@ -299,6 +324,12 @@ impl super::Provider for CursorAgentProvider {
         let projects_root = self.projects_root.clone();
 
         std::thread::spawn(move || {
+            // The conversation index read is independent of the filesystem
+            // walk in list_projects — overlap the two.
+            let cache_handle = std::thread::spawn(move || {
+                Mutex::new(load_provider_cache(ProviderKind::CursorAgent, show_last))
+            });
+
             let provider = CursorAgentProvider { projects_root };
             let projects = match provider.list_projects() {
                 Ok(projects) => projects,
@@ -308,14 +339,35 @@ impl super::Provider for CursorAgentProvider {
                 }
             };
 
-            let cache = load_provider_cache(ProviderKind::CursorAgent, show_last);
+            let cache = cache_handle
+                .join()
+                .unwrap_or_else(|_| Mutex::new(HashMap::new()));
+            let mut all_fresh: Vec<(Conversation, SourceFingerprint)> = Vec::new();
             for project in &projects {
-                let conversations =
+                let (conversations, fresh) =
                     provider.load_project_conversations(project, show_last, debug_level, &cache);
+                all_fresh.extend(fresh);
                 if !conversations.is_empty() {
                     let _ = tx.send(LoaderMessage::Batch(conversations));
                 }
             }
+
+            // All batches are on the channel; persist newly parsed transcripts
+            // in one write transaction instead of one per project.
+            save_conversations(
+                ProviderKind::CursorAgent,
+                show_last,
+                all_fresh
+                    .iter()
+                    .map(|(conv, fingerprint)| (conv, *fingerprint)),
+            );
+
+            // Entries no project claimed belong to files that no longer exist.
+            let stale: Vec<PathBuf> = cache
+                .into_inner()
+                .map(|cache| cache.into_keys().collect())
+                .unwrap_or_default();
+            prune_conversations(ProviderKind::CursorAgent, &stale);
 
             let _ = tx.send(LoaderMessage::Done);
         });

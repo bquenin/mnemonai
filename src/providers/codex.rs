@@ -1,8 +1,8 @@
 use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage};
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    SourceFingerprint, attach_search_cache, delete_conversation, fingerprint_from_metadata,
-    load_provider_cache, save_conversations,
+    SourceFingerprint, delete_conversation, fingerprint_from_metadata, load_provider_cache,
+    prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -17,6 +17,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
@@ -85,7 +86,7 @@ impl CodexProvider {
         }
 
         let files = collect_session_files(&root);
-        let cache = load_provider_cache(ProviderKind::Codex, show_last);
+        let cache = Mutex::new(load_provider_cache(ProviderKind::Codex, show_last));
         let loaded: Vec<ConversationLoad> = files
             .into_par_iter()
             .filter_map(|path| {
@@ -100,10 +101,12 @@ impl CodexProvider {
                     .and_then(|metadata| metadata.modified().ok());
                 let fingerprint = metadata.as_ref().map(fingerprint_from_metadata);
 
-                if let Some(fingerprint) = fingerprint
-                    && let Some(conversation) = cache
-                        .get(&path)
-                        .and_then(|cached| cached.conversation_if_fresh(fingerprint))
+                // Always consume the cache entry for a file we've seen: whatever
+                // remains in the map afterwards is treated as deleted and pruned,
+                // and a file that merely failed to stat or parse isn't deleted.
+                let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
+                if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
+                    && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
                 {
                     debug::debug(
                         debug_level,
@@ -113,7 +116,7 @@ impl CodexProvider {
                 }
 
                 match process_codex_transcript_file(path, show_last, modified, debug_level) {
-                    Ok(Some(mut conversation)) => {
+                    Ok(Some(conversation)) => {
                         debug::debug(
                             debug_level,
                             &format!(
@@ -121,7 +124,6 @@ impl CodexProvider {
                                 filename, conversation.preview
                             ),
                         );
-                        attach_search_cache(&mut conversation);
                         match fingerprint {
                             Some(fingerprint) => {
                                 Some(ConversationLoad::Fresh(conversation, fingerprint))
@@ -151,6 +153,13 @@ impl CodexProvider {
                 ConversationLoad::Cached(_) => None,
             }),
         );
+
+        // Entries no session file claimed belong to files that no longer exist.
+        let stale: Vec<PathBuf> = cache
+            .into_inner()
+            .map(|cache| cache.into_keys().collect())
+            .unwrap_or_default();
+        prune_conversations(ProviderKind::Codex, &stale);
 
         let mut conversations: Vec<Conversation> = loaded
             .into_iter()

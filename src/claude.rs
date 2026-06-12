@@ -53,6 +53,12 @@ pub enum LogEntry {
         #[serde(flatten)]
         extra: serde_json::Value,
     },
+    /// Entry types this version doesn't understand (attachment, ai-title,
+    /// queue-operation, ...). Newer Claude Code builds keep introducing types;
+    /// treating them as parse errors used to record megabytes of line content
+    /// and context per file.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize, Clone)]
