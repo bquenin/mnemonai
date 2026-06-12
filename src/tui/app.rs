@@ -380,14 +380,22 @@ impl App {
     /// Update filtered results based on current query
     fn update_filter(&mut self) {
         let now = Local::now();
-        // When the new query extends the previous one, only rescore the already-filtered subset
-        let narrow_hint =
-            if !self.previous_query.is_empty() && self.query.starts_with(&self.previous_query) {
-                // Move filtered out to avoid clone; search() will produce the new value
-                Some(std::mem::take(&mut self.filtered))
-            } else {
-                None
-            };
+        // When the new query extends the previous one, only rescore the
+        // already-filtered subset. This is only valid when extending can never
+        // match MORE conversations than the previous query did. A query ending
+        // in whitespace breaks that: its trailing term is whole-word
+        // constrained, while the same term in the extended query is
+        // prefix-matchable again — so narrowing from "auth " would permanently
+        // drop "authentication" matches from "auth flow".
+        let narrow_hint = if !self.previous_query.is_empty()
+            && !self.previous_query.ends_with(|c: char| c.is_whitespace())
+            && self.query.starts_with(&self.previous_query)
+        {
+            // Move filtered out to avoid clone; search() will produce the new value
+            Some(std::mem::take(&mut self.filtered))
+        } else {
+            None
+        };
         self.filtered = search::search(
             &self.conversations,
             &self.searchable,
@@ -1916,5 +1924,85 @@ pub fn run_single_file(
         {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::ProviderKind;
+    use chrono::Local;
+
+    fn make_conv(text: &str, idx: usize) -> Conversation {
+        Conversation {
+            path: PathBuf::from(format!("/tmp/conv-{idx}.jsonl")),
+            index: idx,
+            provider: ProviderKind::Claude,
+            id: format!("conv-{idx}"),
+            timestamp: Local::now(),
+            preview: text.to_string(),
+            full_text: text.to_string(),
+            project_name: None,
+            project_path: None,
+            cwd: None,
+            message_count: 1,
+            parse_errors: Vec::new(),
+            summary: None,
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+            search_text_lower: None,
+            search_topic_end: None,
+        }
+    }
+
+    fn type_query(app: &mut App, query: &str) {
+        let providers: Vec<Box<dyn Provider>> = Vec::new();
+        for ch in query.chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE, 20, &providers);
+        }
+    }
+
+    /// Typing a query one keystroke at a time must find the same conversations
+    /// as entering it at once. The narrow-on-extend optimization used to narrow
+    /// from the `"auth "` state, whose trailing term is whole-word constrained —
+    /// permanently dropping conversations that match "auth" only as a prefix
+    /// (e.g. "authentication") from every later result set.
+    #[test]
+    fn typing_multiword_query_keeps_prefix_matches_of_earlier_terms() {
+        let convs = vec![
+            make_conv("authentication flow setup", 0),
+            make_conv("auth flow setup", 1),
+        ];
+        let mut app = App::new(convs, false, ToolDisplayMode::Hidden, false, true);
+
+        type_query(&mut app, "auth flow");
+
+        let mut found: Vec<usize> = app.filtered().to_vec();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec![0, 1],
+            "both the 'auth' and 'authentication' conversations should match"
+        );
+    }
+
+    /// While the query ends in whitespace the last term is whole-word
+    /// constrained — that part of the behavior is intended and must stay.
+    #[test]
+    fn trailing_space_still_filters_to_whole_words() {
+        let convs = vec![
+            make_conv("authentication flow setup", 0),
+            make_conv("auth flow setup", 1),
+        ];
+        let mut app = App::new(convs, false, ToolDisplayMode::Hidden, false, true);
+
+        type_query(&mut app, "auth ");
+
+        assert_eq!(
+            app.filtered(),
+            &[1],
+            "with a trailing space only the whole-word 'auth' conversation matches"
+        );
     }
 }
