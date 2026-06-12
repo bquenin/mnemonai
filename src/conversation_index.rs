@@ -5,7 +5,7 @@
 
 use crate::history::{Conversation, ProviderKind};
 use chrono::{DateTime, Local};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::fs::Metadata;
 use std::path::PathBuf;
@@ -258,11 +258,11 @@ fn open_index_db() -> Option<Connection> {
         .join("state")
         .join("mnemonai");
     std::fs::create_dir_all(&dir).ok()?;
-    let conn = Connection::open(dir.join("conversation_index.db")).ok()?;
+    let mut conn = Connection::open(dir.join("conversation_index.db")).ok()?;
     // Providers load and save in parallel threads; wait for the write lock
     // instead of failing with SQLITE_BUSY and silently dropping the batch.
     conn.busy_timeout(std::time::Duration::from_secs(5)).ok()?;
-    init_schema(&conn).ok()?;
+    init_schema(&mut conn).ok()?;
     Some(conn)
 }
 
@@ -312,7 +312,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS file_conversations (
              PRIMARY KEY (schema_version, provider, show_last, source_path)
          );";
 
-fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     // synchronous=NORMAL is safe with WAL (no corruption on crash) and makes
     // the large cold-start commit considerably cheaper than FULL.
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
@@ -321,12 +321,28 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     // column" — and the cache never reads or writes again. Validate the column
     // set and rebuild on drift; this is a cache, so the only cost is one
     // re-parse of changed providers.
-    if !table_matches_expected_columns(conn)? {
-        conn.execute_batch("DROP TABLE IF EXISTS file_conversations;")?;
+    if table_matches_expected_columns(conn)? {
+        return Ok(());
+    }
+
+    // Re-check under the write lock: providers open this database concurrently
+    // at startup, and the check-then-rebuild must be atomic so a stale check
+    // can never drop a table another connection just rebuilt (and possibly
+    // populated). Exactly one connection rebuilds; the rest see the fresh
+    // table here and leave it alone.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let drifted = !table_matches_expected_columns(&tx)?;
+    if drifted {
+        tx.execute_batch("DROP TABLE IF EXISTS file_conversations;")?;
+        tx.execute_batch(CREATE_TABLE_SQL)?;
+    }
+    tx.commit()?;
+
+    if drifted {
         // Return the dropped table's pages to the filesystem; without this a
-        // previously bloated database file keeps its size forever.
-        conn.execute_batch("VACUUM;")?;
-        conn.execute_batch(CREATE_TABLE_SQL)?;
+        // previously bloated database file keeps its size forever. Best-effort:
+        // VACUUM cannot run inside the transaction above.
+        let _ = conn.execute_batch("VACUUM;");
     }
     Ok(())
 }
@@ -402,7 +418,7 @@ mod tests {
     #[test]
     fn load_cache_round_trips_conversation() {
         let mut conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+        init_schema(&mut conn).unwrap();
         let mut conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
         conversation.parse_errors.push(crate::history::ParseError {
             line_number: 7,
@@ -462,7 +478,7 @@ mod tests {
         )
         .unwrap();
 
-        init_schema(&conn).unwrap();
+        init_schema(&mut conn).unwrap();
 
         // Save + load must round-trip after the rebuild.
         let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
@@ -485,7 +501,7 @@ mod tests {
     #[test]
     fn init_schema_preserves_rows_when_schema_matches() {
         let mut conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+        init_schema(&mut conn).unwrap();
         let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
         let fingerprint = SourceFingerprint {
             modified_millis: 1,
@@ -500,7 +516,7 @@ mod tests {
         .unwrap();
 
         // Re-running init_schema (a second app start) must not wipe the cache.
-        init_schema(&conn).unwrap();
+        init_schema(&mut conn).unwrap();
 
         let cache = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
         assert!(cache.contains_key(&conversation.path));
@@ -509,7 +525,7 @@ mod tests {
     #[test]
     fn delete_conversation_removes_cached_rows_for_all_preview_modes() {
         let mut conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+        init_schema(&mut conn).unwrap();
         let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
         let fingerprint = SourceFingerprint {
             modified_millis: 123,

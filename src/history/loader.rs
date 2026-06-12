@@ -55,6 +55,7 @@ pub fn load_all_conversations(
 
     let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
     let fresh_acc: Mutex<Vec<(Conversation, SourceFingerprint)>> = Mutex::new(Vec::new());
+    let failed_projects: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     // Load conversations from all projects in parallel
     let mut all_conversations: Vec<Conversation> = projects
@@ -85,6 +86,7 @@ pub fn load_all_conversations(
                         debug_level,
                         &format!("Failed to load project {}: {}", project.display_name, e),
                     );
+                    failed_projects.lock().unwrap().push(project_dir);
                     Vec::new()
                 }
             }
@@ -100,10 +102,17 @@ pub fn load_all_conversations(
         fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
     );
 
-    // Entries no project claimed belong to files that no longer exist.
+    // Entries no project claimed belong to files that no longer exist — except
+    // under a project that failed to load, where we simply don't know.
+    let failed = failed_projects.into_inner().unwrap_or_default();
     let stale: Vec<PathBuf> = cache
         .into_inner()
-        .map(|cache| cache.into_keys().collect())
+        .map(|cache| {
+            cache
+                .into_keys()
+                .filter(|path| !failed.iter().any(|dir| path.starts_with(dir)))
+                .collect()
+        })
         .unwrap_or_default();
     prune_conversations(ProviderKind::Claude, &stale);
 
@@ -180,6 +189,7 @@ fn load_all_streaming_inner(
 
     let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
     let fresh_acc: Mutex<Vec<(Conversation, SourceFingerprint)>> = Mutex::new(Vec::new());
+    let failed_projects: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     // Process projects in parallel and send batches as they complete
     projects.par_iter().for_each(|project| {
@@ -210,6 +220,7 @@ fn load_all_streaming_inner(
                     debug_level,
                     &format!("Failed to load project {}: {}", project.display_name, e),
                 );
+                failed_projects.lock().unwrap().push(project_dir);
                 let _ = tx.send(LoaderMessage::ProjectError);
             }
         }
@@ -224,10 +235,17 @@ fn load_all_streaming_inner(
         fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
     );
 
-    // Entries no project claimed belong to files that no longer exist.
+    // Entries no project claimed belong to files that no longer exist — except
+    // under a project that failed to load, where we simply don't know.
+    let failed = failed_projects.into_inner().unwrap_or_default();
     let stale: Vec<PathBuf> = cache
         .into_inner()
-        .map(|cache| cache.into_keys().collect())
+        .map(|cache| {
+            cache
+                .into_keys()
+                .filter(|path| !failed.iter().any(|dir| path.starts_with(dir)))
+                .collect()
+        })
         .unwrap_or_default();
     prune_conversations(ProviderKind::Claude, &stale);
 
@@ -376,12 +394,12 @@ fn load_conversations_with_cache(
                 .unwrap_or("unknown")
                 .to_owned();
 
-            if let Some(fingerprint) = fingerprint
-                && let Some(conversation) = cache
-                    .lock()
-                    .ok()
-                    .and_then(|mut cache| cache.remove(&path))
-                    .and_then(|cached| cached.into_conversation_if_fresh(fingerprint))
+            // Always consume the cache entry for a file we've seen: whatever
+            // remains in the map afterwards is treated as deleted and pruned,
+            // and a file that merely failed to stat or parse isn't deleted.
+            let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
+            if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
+                && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
             {
                 debug::debug(
                     debug_level,

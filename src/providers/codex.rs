@@ -101,12 +101,12 @@ impl CodexProvider {
                     .and_then(|metadata| metadata.modified().ok());
                 let fingerprint = metadata.as_ref().map(fingerprint_from_metadata);
 
-                if let Some(fingerprint) = fingerprint
-                    && let Some(conversation) = cache
-                        .lock()
-                        .ok()
-                        .and_then(|mut cache| cache.remove(&path))
-                        .and_then(|cached| cached.into_conversation_if_fresh(fingerprint))
+                // Always consume the cache entry for a file we've seen: whatever
+                // remains in the map afterwards is treated as deleted and pruned,
+                // and a file that merely failed to stat or parse isn't deleted.
+                let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
+                if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
+                    && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
                 {
                     debug::debug(
                         debug_level,
