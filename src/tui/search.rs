@@ -1,5 +1,5 @@
 use crate::history::Conversation;
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Local};
 use rayon::prelude::*;
 
 /// Size of the "topic window" — the first ~2000 characters of a conversation,
@@ -256,30 +256,33 @@ fn score_text(
     density * recency_multiplier(timestamp, now)
 }
 
-/// Calculate recency multiplier based on age
+/// Recency boost half-life: a conversation this old gets half the boost.
+const RECENCY_HALF_LIFE_DAYS: f64 = 14.0;
+
+/// Maximum recency boost, applied at age zero and decaying smoothly toward 0.
+/// Capped at 1.0 (a 2x multiplier) so recency breaks ties between similarly
+/// relevant conversations instead of overriding topical relevance: per-term
+/// relevance is sqrt-dampened, so a larger boost lets today's passing mention
+/// outrank an older conversation that is actually about the topic.
+const RECENCY_MAX_BOOST: f64 = 1.0;
+
+/// Calculate recency multiplier based on age.
+///
+/// Smooth exponential decay rather than day/week/month steps: step cliffs
+/// reshuffled rankings whenever a conversation aged across a bucket boundary
+/// (an 8-day-old conversation was penalized 25% against a 6-day-old one).
 fn recency_multiplier(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
-    let age = now.signed_duration_since(timestamp);
-
-    // Handle future timestamps (shouldn't happen, but be safe)
-    if age < Duration::zero() {
-        return 3.0;
-    }
-
-    if age < Duration::days(1) {
-        3.0
-    } else if age < Duration::days(7) {
-        2.0
-    } else if age < Duration::days(30) {
-        1.5
-    } else {
-        1.0
-    }
+    // Clamp future timestamps (clock skew) to "now".
+    let age_seconds = now.signed_duration_since(timestamp).num_seconds().max(0);
+    let age_days = age_seconds as f64 / 86_400.0;
+    1.0 + RECENCY_MAX_BOOST * 0.5_f64.powf(age_days / RECENCY_HALF_LIFE_DAYS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::history::Conversation;
+    use chrono::Duration;
     use std::path::PathBuf;
 
     fn make_conv(text: &str, timestamp: DateTime<Local>) -> Conversation {
@@ -346,31 +349,71 @@ mod tests {
     }
 
     #[test]
-    fn recency_today_gets_highest_multiplier() {
+    fn recency_boost_decays_monotonically() {
         let now = Local::now();
-        let timestamp = now - Duration::hours(1);
-        assert_eq!(recency_multiplier(timestamp, now), 3.0);
+        let m = |days: i64| recency_multiplier(now - Duration::days(days), now);
+        assert!(m(0) > m(1));
+        assert!(m(1) > m(7));
+        assert!(m(7) > m(30));
+        assert!(m(30) > m(90));
+        assert!(m(365) >= 1.0);
     }
 
     #[test]
-    fn recency_this_week_gets_medium_multiplier() {
+    fn recency_boost_is_bounded() {
         let now = Local::now();
-        let timestamp = now - Duration::days(3);
-        assert_eq!(recency_multiplier(timestamp, now), 2.0);
+        assert_eq!(recency_multiplier(now, now), 1.0 + RECENCY_MAX_BOOST);
+        let very_old = recency_multiplier(now - Duration::days(3650), now);
+        assert!(very_old >= 1.0);
+        assert!(very_old < 1.001);
     }
 
     #[test]
-    fn recency_this_month_gets_low_multiplier() {
+    fn recency_halves_the_boost_at_the_half_life() {
         let now = Local::now();
-        let timestamp = now - Duration::days(15);
-        assert_eq!(recency_multiplier(timestamp, now), 1.5);
+        let at_half_life =
+            recency_multiplier(now - Duration::days(RECENCY_HALF_LIFE_DAYS as i64), now);
+        let expected = 1.0 + RECENCY_MAX_BOOST / 2.0;
+        assert!((at_half_life - expected).abs() < 1e-6);
     }
 
     #[test]
-    fn recency_older_gets_base_multiplier() {
+    fn recency_has_no_cliffs() {
         let now = Local::now();
-        let timestamp = now - Duration::days(60);
-        assert_eq!(recency_multiplier(timestamp, now), 1.0);
+        // The old step function dropped the boost 33% between these two ages.
+        let before = recency_multiplier(now - Duration::hours(23), now);
+        let after = recency_multiplier(now - Duration::hours(25), now);
+        assert!(
+            (before - after) / before < 0.01,
+            "aging two hours should barely change the boost: {before} vs {after}"
+        );
+    }
+
+    /// The complaint that motivated smooth decay: a conversation that is
+    /// actually about the topic but fell off the old 30-day cliff lost to a
+    /// conversation from today that mentions the term once in passing.
+    #[test]
+    fn topical_month_old_convo_outranks_recent_passing_mention() {
+        let now = Local::now();
+        let mut convs = vec![
+            make_conv(
+                "grpc retries grpc deadlines grpc pooling grpc keepalive notes",
+                now - Duration::days(35),
+            ),
+            make_conv(
+                &format!(
+                    "planning notes {} grpc might be worth a look",
+                    "filler text ".repeat(70)
+                ),
+                now,
+            ),
+        ];
+        let searchable = precompute_search_text(&mut convs);
+        let results = search(&convs, &searchable, "grpc", now, None);
+        assert_eq!(
+            results[0], 0,
+            "the conversation about grpc should outrank today's passing mention"
+        );
     }
 
     #[test]
@@ -397,10 +440,10 @@ mod tests {
     }
 
     #[test]
-    fn future_timestamp_gets_highest_multiplier() {
+    fn future_timestamp_clamps_to_max_boost() {
         let now = Local::now();
         let timestamp = now + Duration::hours(1);
-        assert_eq!(recency_multiplier(timestamp, now), 3.0);
+        assert_eq!(recency_multiplier(timestamp, now), 1.0 + RECENCY_MAX_BOOST);
     }
 
     #[test]
