@@ -600,7 +600,12 @@ fn parse_transcript_line(
     line_idx: usize,
     workspace_path: Option<&Path>,
 ) -> Result<Option<ParsedTranscriptLine>> {
-    let record: CursorAgentTranscriptRecord = serde_json::from_str(line)?;
+    let value: Value = serde_json::from_str(line)?;
+    if is_cursor_agent_event_record(&value) {
+        return Ok(None);
+    }
+
+    let record: CursorAgentTranscriptRecord = serde_json::from_value(value)?;
     let timestamp = record
         .timestamp
         .as_deref()
@@ -657,6 +662,14 @@ fn parse_transcript_line(
         timestamp,
         counts_as_message: true,
     }))
+}
+
+fn is_cursor_agent_event_record(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("type")
+            && !object.contains_key("role")
+            && !object.contains_key("message")
+    })
 }
 
 fn block_to_content_block(
@@ -1046,6 +1059,30 @@ mod tests {
             other => panic!("expected assistant entry, got {:?}", other),
         }
         assert_eq!(parsed.text_for_preview.as_deref(), Some("Checking now"));
+    }
+
+    #[test]
+    fn parse_transcript_line_skips_cursor_agent_events() {
+        let line = r#"{"type":"turn_ended","status":"success"}"#;
+
+        let parsed = parse_transcript_line(line, 1, None).unwrap();
+
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_transcript_line_still_rejects_malformed_messages() {
+        let line = r#"{"message":{"content":[{"type":"text","text":"missing role"}]}}"#;
+
+        assert!(parse_transcript_line(line, 1, None).is_err());
+    }
+
+    #[test]
+    fn parse_transcript_line_rejects_message_like_records_with_type_but_no_role() {
+        let line =
+            r#"{"type":"future_message","message":{"content":[{"type":"text","text":"missing role"}]}}"#;
+
+        assert!(parse_transcript_line(line, 1, None).is_err());
     }
 
     #[test]
