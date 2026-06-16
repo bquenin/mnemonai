@@ -665,9 +665,11 @@ fn parse_transcript_line(
 }
 
 fn is_cursor_agent_event_record(value: &Value) -> bool {
-    value
-        .as_object()
-        .is_some_and(|object| object.contains_key("type") && !object.contains_key("role"))
+    value.as_object().is_some_and(|object| {
+        object.contains_key("type")
+            && !object.contains_key("role")
+            && !object.contains_key("message")
+    })
 }
 
 fn block_to_content_block(
@@ -1071,6 +1073,14 @@ mod tests {
     #[test]
     fn parse_transcript_line_still_rejects_malformed_messages() {
         let line = r#"{"message":{"content":[{"type":"text","text":"missing role"}]}}"#;
+
+        assert!(parse_transcript_line(line, 1, None).is_err());
+    }
+
+    #[test]
+    fn parse_transcript_line_rejects_message_like_records_with_type_but_no_role() {
+        let line =
+            r#"{"type":"future_message","message":{"content":[{"type":"text","text":"missing role"}]}}"#;
 
         assert!(parse_transcript_line(line, 1, None).is_err());
     }
