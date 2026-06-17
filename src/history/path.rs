@@ -80,15 +80,32 @@ pub fn format_short_name_from_path(path: &Path) -> String {
 /// exists, we treat it as live too. Only when the whole repository is gone do
 /// we consider the conversation's project deleted.
 pub fn project_path_is_live(path: &Path) -> bool {
-    if path.exists() {
-        return true;
+    resolve_project_dir(path).is_some()
+}
+
+/// Resolve the directory a resumed session should be launched from, for a
+/// conversation whose recorded project path may have been a torn-down worktree.
+///
+/// - The path itself if it still exists.
+/// - Otherwise, for a worktree-shaped path, the nearest surviving ancestor that
+///   is a git repo — i.e. the repository the worktree branched from.
+/// - Otherwise `None`: the whole project is gone, so there's nowhere to resume.
+pub fn resolve_project_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        return Some(path.to_path_buf());
     }
 
-    // Only rescue worktree-shaped paths, so deleting a real project still hides
-    // its conversations. `ancestors()` yields the path itself first; skip it
-    // since we already know it's gone, then keep the conversation if any
-    // surviving ancestor is the git repo the worktree came from.
-    is_worktree_path(path) && path.ancestors().skip(1).any(is_git_repo)
+    // `ancestors()` yields the path itself first; skip it since we know it's
+    // gone, then take the first surviving ancestor that is a git repo.
+    if is_worktree_path(path) {
+        return path
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| is_git_repo(ancestor))
+            .map(Path::to_path_buf);
+    }
+
+    None
 }
 
 /// Detect the common worktree-container path components: `worktrees`,
@@ -375,6 +392,23 @@ mod tests {
             "/Users/u/code/repo/.agent-pr-review/worktrees/pr-4"
         )));
         assert!(!is_worktree_path(Path::new("/Users/u/code/repo/src")));
+    }
+
+    #[test]
+    fn resolve_project_dir_returns_repo_for_gone_worktree() {
+        let repo = std::env::temp_dir().join("mnemonai_resolve_repo");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // A gone worktree resolves to the surviving repo it branched from.
+        let gone = repo.join(".agent-pr-review/worktrees/pr-4");
+        assert_eq!(resolve_project_dir(&gone), Some(repo.clone()));
+        // An existing directory resolves to itself.
+        assert_eq!(resolve_project_dir(&repo), Some(repo.clone()));
+        // A gone, non-worktree path has nowhere to resume.
+        assert_eq!(resolve_project_dir(&repo.join("src/gone")), None);
+
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]

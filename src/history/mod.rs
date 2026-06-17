@@ -26,6 +26,7 @@ pub use loader::{load_all_conversations_streaming, load_conversations};
 pub use parser::process_conversation_file;
 pub use path::{
     convert_path_to_project_dir_name, format_short_name_from_path, project_path_is_live,
+    resolve_project_dir,
 };
 
 /// Identifies which AI tool provider a conversation originated from
