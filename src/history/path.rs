@@ -70,6 +70,43 @@ pub fn format_short_name_from_path(path: &Path) -> String {
         .unwrap_or_else(|| path_str.into_owned())
 }
 
+/// Whether a conversation's project directory should count as "live" for the
+/// deleted-projects filter.
+///
+/// A path is live if it still exists. But PR-review and feature worktrees are
+/// ephemeral by design — they get torn down after use — yet the conversations
+/// that happened inside them are still about a repository you have. So if the
+/// path looks like a worktree path and the repository it branched from still
+/// exists, we treat it as live too. Only when the whole repository is gone do
+/// we consider the conversation's project deleted.
+pub fn project_path_is_live(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+
+    // Only rescue worktree-shaped paths, so deleting a real project still hides
+    // its conversations. `ancestors()` yields the path itself first; skip it
+    // since we already know it's gone, then keep the conversation if any
+    // surviving ancestor is the git repo the worktree came from.
+    is_worktree_path(path) && path.ancestors().skip(1).any(is_git_repo)
+}
+
+/// Detect the common worktree-container path components: `worktrees`,
+/// `.worktrees`, and the `<project>__worktrees` form, regardless of nesting
+/// (e.g. `repo/.agent-pr-review/worktrees/pr-4`).
+fn is_worktree_path(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.to_ascii_lowercase().ends_with("worktrees"))
+    })
+}
+
+/// A normal repo has a `.git` directory; a linked worktree has a `.git` file.
+fn is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
 /// Decode a project directory name back to a path (simple heuristic fallback).
 ///
 /// Claude's encoding replaces all non-alphanumeric characters (except `-`) with `-`.
@@ -322,6 +359,55 @@ mod tests {
         // Combined display
         let display = format!("{}/{}", main_project, worktree);
         assert_eq!(display, "WalkingMate/template-engine");
+    }
+
+    // === project_path_is_live tests ===
+
+    #[test]
+    fn is_worktree_path_matches_common_shapes() {
+        assert!(is_worktree_path(Path::new(
+            "/Users/u/code/mnemonai__worktrees/feature"
+        )));
+        assert!(is_worktree_path(Path::new(
+            "/Users/u/code/workmux/.worktrees/uncommitted"
+        )));
+        assert!(is_worktree_path(Path::new(
+            "/Users/u/code/repo/.agent-pr-review/worktrees/pr-4"
+        )));
+        assert!(!is_worktree_path(Path::new("/Users/u/code/repo/src")));
+    }
+
+    #[test]
+    fn live_when_path_exists() {
+        // The repo we're running in always exists.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(project_path_is_live(&cwd));
+    }
+
+    #[test]
+    fn not_live_when_nonexistent_and_not_a_worktree() {
+        let path = Path::new("/Users/u/code/this-project-was-deleted-xyz");
+        assert!(!project_path_is_live(path));
+    }
+
+    #[test]
+    fn live_when_deleted_worktree_of_surviving_repo() {
+        // Build a temp git repo, then a worktree-shaped subpath that doesn't
+        // exist on disk. The repo survives, so the conversation stays live.
+        let repo = std::env::temp_dir().join("mnemonai_wt_test_repo");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let gone_worktree = repo.join(".agent-pr-review/worktrees/pr-4");
+        assert!(!gone_worktree.exists());
+        assert!(project_path_is_live(&gone_worktree));
+
+        // But a deleted worktree of a *deleted* repo is not rescued.
+        let orphan =
+            std::env::temp_dir().join("mnemonai_no_such_repo_xyz/.agent-pr-review/worktrees/pr-4");
+        assert!(!project_path_is_live(&orphan));
+
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::debug_log;
 use crate::error::{AppError, Result};
 use crate::history::{
     Conversation, LoaderMessage, ProviderKind, format_short_name_from_path,
-    process_conversation_file,
+    process_conversation_file, project_path_is_live,
 };
 use crate::providers::Provider;
 use crate::tui::search::{self, SearchableConversation};
@@ -184,7 +184,11 @@ impl App {
         show_deleted_projects: bool,
     ) -> Self {
         if !show_deleted_projects {
-            conversations.retain(|c| c.project_path.as_ref().map_or(true, |p| p.exists()));
+            conversations.retain(|c| {
+                c.project_path
+                    .as_ref()
+                    .is_none_or(|p| project_path_is_live(p))
+            });
         }
         let searchable = search::precompute_search_text(&mut conversations);
         let filtered: Vec<usize> = (0..conversations.len()).collect();
@@ -306,7 +310,11 @@ impl App {
     /// repeated O(n log n) work while provider batches are still arriving.
     pub fn append_conversations(&mut self, mut new_convs: Vec<Conversation>) {
         if !self.show_deleted_projects {
-            new_convs.retain(|c| c.project_path.as_ref().map_or(true, |p| p.exists()));
+            new_convs.retain(|c| {
+                c.project_path
+                    .as_ref()
+                    .is_none_or(|p| project_path_is_live(p))
+            });
         }
         self.conversations.extend(new_convs);
 

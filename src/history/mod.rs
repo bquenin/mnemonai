@@ -24,7 +24,9 @@ use std::time::SystemTime;
 // Re-export public API
 pub use loader::{load_all_conversations_streaming, load_conversations};
 pub use parser::process_conversation_file;
-pub use path::{convert_path_to_project_dir_name, format_short_name_from_path};
+pub use path::{
+    convert_path_to_project_dir_name, format_short_name_from_path, project_path_is_live,
+};
 
 /// Identifies which AI tool provider a conversation originated from
 #[derive(Clone, Debug, PartialEq, Eq)]
