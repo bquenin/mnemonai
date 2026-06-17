@@ -87,35 +87,57 @@ pub fn project_path_is_live(path: &Path) -> bool {
 /// conversation whose recorded project path may have been a torn-down worktree.
 ///
 /// - The path itself if it still exists.
-/// - Otherwise, for a worktree-shaped path, the nearest surviving ancestor that
-///   is a git repo — i.e. the repository the worktree branched from.
+/// - Otherwise, for a worktree-shaped path, the repository the worktree branched
+///   from, found across the two worktree topologies:
+///   - **nested** (`<repo>/.worktrees/<name>`, `<repo>/.../worktrees/<name>`):
+///     the repo is a surviving ancestor of the worktree;
+///   - **sibling** (`<repo>__worktrees/<name>`): the repo is a sibling, reached
+///     by stripping the `__worktrees` suffix from the container directory.
 /// - Otherwise `None`: the whole project is gone, so there's nowhere to resume.
 pub fn resolve_project_dir(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());
     }
+    if !is_worktree_path(path) {
+        return None;
+    }
 
-    // `ancestors()` yields the path itself first; skip it since we know it's
-    // gone, then take the first surviving ancestor that is a git repo.
-    if is_worktree_path(path) {
-        return path
-            .ancestors()
-            .skip(1)
-            .find(|ancestor| is_git_repo(ancestor))
-            .map(Path::to_path_buf);
+    // `ancestors()` yields the path itself first; skip it since we know it's gone.
+    for ancestor in path.ancestors().skip(1) {
+        // Sibling layout: `…/<project>__worktrees/<name>` — the repo is a sibling
+        // of the worktrees container, named by the stripped prefix.
+        if let Some(stem) = ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix("__worktrees"))
+        {
+            let repo = ancestor.with_file_name(stem);
+            if is_git_repo(&repo) {
+                return Some(repo);
+            }
+        }
+        // Nested layout: an ancestor is itself the repo.
+        if is_git_repo(ancestor) {
+            return Some(ancestor.to_path_buf());
+        }
     }
 
     None
 }
 
-/// Detect the common worktree-container path components: `worktrees`,
-/// `.worktrees`, and the `<project>__worktrees` form, regardless of nesting
-/// (e.g. `repo/.agent-pr-review/worktrees/pr-4`).
+/// Detect the worktree-container path components: an exact `worktrees` or
+/// `.worktrees`, or a `<project>__worktrees` sibling-layout directory. The
+/// suffix is matched precisely so unrelated names like `client-worktrees`
+/// don't trip the deleted-project rescue.
 fn is_worktree_path(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|s| s.to_ascii_lowercase().ends_with("worktrees"))
+    path.components()
+        .any(|c| is_worktree_component(c.as_os_str().to_str()))
+}
+
+fn is_worktree_component(name: Option<&str>) -> bool {
+    name.is_some_and(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower == "worktrees" || lower == ".worktrees" || lower.ends_with("__worktrees")
     })
 }
 
@@ -392,6 +414,25 @@ mod tests {
             "/Users/u/code/repo/.agent-pr-review/worktrees/pr-4"
         )));
         assert!(!is_worktree_path(Path::new("/Users/u/code/repo/src")));
+        // A name that merely ends with "worktrees" must not be treated as one.
+        assert!(!is_worktree_path(Path::new(
+            "/Users/u/code/client-worktrees/thing"
+        )));
+    }
+
+    #[test]
+    fn resolve_project_dir_handles_sibling_worktrees_layout() {
+        // Sibling layout: repo at `…/code/proj`, worktrees at `…/code/proj__worktrees/*`.
+        let base = std::env::temp_dir().join("mnemonai_resolve_sibling");
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("proj");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let gone = base.join("proj__worktrees/feature");
+        assert!(!gone.exists());
+        assert_eq!(resolve_project_dir(&gone), Some(repo.clone()));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
