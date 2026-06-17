@@ -1,6 +1,6 @@
 [package]
 name = "mnemonai"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 description = "Universal AI coding conversation history browser"
 license = "MIT"
