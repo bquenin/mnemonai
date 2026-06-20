@@ -1,4 +1,5 @@
-use clap::Parser;
+use crate::history::ProviderKind;
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -45,6 +46,9 @@ impl fmt::Display for DebugLevel {
 #[command(version)]
 #[command(about = "Universal AI coding conversation history browser")]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Show tool calls in the conversation output
     #[arg(long, short = 't', group = "tools_display")]
     pub show_tools: bool,
@@ -158,4 +162,118 @@ pub struct Args {
         conflicts_with_all = ["local", "show_dir", "resume", "show_path", "show_id", "plain", "render"]
     )]
     pub input_file: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// List conversations without opening the TUI
+    List(ListCommand),
+
+    /// Show one conversation without opening the TUI
+    Show(ShowCommand),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProviderFilter {
+    Claude,
+    Codex,
+    Cursor,
+    CursorAgent,
+}
+
+impl ProviderFilter {
+    /// The provider kind this filter selects.
+    pub fn kind(self) -> ProviderKind {
+        match self {
+            ProviderFilter::Claude => ProviderKind::Claude,
+            ProviderFilter::Codex => ProviderKind::Codex,
+            ProviderFilter::Cursor => ProviderKind::Cursor,
+            ProviderFilter::CursorAgent => ProviderKind::CursorAgent,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+pub struct ListCommand {
+    /// Output a JSON array (default)
+    #[arg(long, group = "headless_list_output")]
+    pub json: bool,
+
+    /// Output one JSON object per line
+    #[arg(long, group = "headless_list_output")]
+    pub jsonl: bool,
+
+    /// Only include conversations from this provider
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderFilter>,
+
+    /// Only include conversations from the current project directory
+    #[arg(long)]
+    pub local: bool,
+
+    /// Include conversations from deleted project directories
+    #[arg(long)]
+    pub show_deleted_projects: bool,
+
+    /// Limit the number of conversations returned
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Parser, Debug)]
+pub struct ShowCommand {
+    /// Conversation ID or source path
+    pub target: String,
+
+    /// Output structured JSON (default)
+    #[arg(long)]
+    pub json: bool,
+
+    /// Only search conversations from this provider
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderFilter>,
+
+    /// Only search conversations from the current project directory
+    #[arg(long)]
+    pub local: bool,
+
+    /// Include conversations from deleted project directories
+    #[arg(long)]
+    pub show_deleted_projects: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_list_subcommand() {
+        let args = Args::try_parse_from([
+            "mnemonai",
+            "list",
+            "--jsonl",
+            "--provider",
+            "cursor-agent",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::List(command)) => {
+                assert!(command.jsonl);
+                assert_eq!(command.provider, Some(ProviderFilter::CursorAgent));
+                assert_eq!(command.limit, Some(10));
+            }
+            other => panic!("expected list command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_file_argument_mode() {
+        let args = Args::try_parse_from(["mnemonai", "session.jsonl"]).unwrap();
+
+        assert!(args.command.is_none());
+        assert_eq!(args.input_file, Some(PathBuf::from("session.jsonl")));
+    }
 }

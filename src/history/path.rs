@@ -6,6 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Lossily render an optional path as an optional string.
+pub fn path_to_string(path: Option<&Path>) -> Option<String> {
+    path.map(|path| path.to_string_lossy().to_string())
+}
+
 /// Convert the current working directory into Claude's project directory name.
 pub fn convert_path_to_project_dir_name(path: &Path) -> String {
     path.to_string_lossy()
@@ -28,10 +33,10 @@ pub fn convert_path_to_project_dir_name(path: &Path) -> String {
 /// For regular paths, returns just the folder name.
 pub fn format_short_name_from_path(path: &Path) -> String {
     // If the path is the user's home directory, display as ~
-    if let Some(home) = home::home_dir() {
-        if path == home {
-            return "~".to_string();
-        }
+    if let Some(home) = home::home_dir()
+        && path == home
+    {
+        return "~".to_string();
     }
 
     let path_str = path.to_string_lossy();
@@ -247,10 +252,7 @@ mod tests {
     fn converts_various_separators_and_punctuation() {
         let path = Path::new("/Users/user/code/workmux/.worktrees/uncommitted");
         let converted = convert_path_to_project_dir_name(path);
-        assert_eq!(
-            converted,
-            "-Users-user-code-workmux--worktrees-uncommitted"
-        );
+        assert_eq!(converted, "-Users-user-code-workmux--worktrees-uncommitted");
     }
 
     #[test]

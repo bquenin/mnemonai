@@ -4,7 +4,9 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent};
+use crate::claude::{
+    AssistantMessage, ContentBlock, LogEntry, UserContent, extract_tool_result_text,
+};
 use crate::text_processing::{process_command_message, short_agent_id};
 use crate::tool_format;
 use crate::tui::app::{LineStyle, RenderedLine};
@@ -92,7 +94,11 @@ fn format_timestamp(iso_timestamp: &str) -> Option<String> {
         .map(|dt| dt.with_timezone(&Local).format("%H:%M").to_string())
 }
 
-/// Read log entries from a JSONL file
+/// Read log entries from a JSONL file.
+///
+/// Unreadable lines are skipped rather than aborting the read, so a single
+/// corrupt line doesn't truncate an otherwise-parseable transcript.
+#[allow(clippy::lines_filter_map_ok)]
 pub fn read_log_entries(file_path: &Path) -> std::io::Result<Vec<LogEntry>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -241,28 +247,6 @@ fn render_user_message(
     }
 }
 
-/// Extract text content from tool result for markdown rendering.
-/// Returns Some(text) if content is a string or array of text blocks.
-/// Returns None for JSON structures that should be pretty-printed instead.
-fn extract_tool_result_text(content: Option<&serde_json::Value>) -> Option<String> {
-    match content {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Array(arr)) => {
-            // Handle array of content blocks (e.g., [{type: "text", text: "..."}])
-            let texts: Vec<&str> = arr
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                Some(texts.join("\n\n"))
-            } else {
-                None // Array without text blocks - render as JSON
-            }
-        }
-        _ => None, // Objects, null, etc. - render as JSON
-    }
-}
-
 /// Format tool result content to a string for display (non-text content)
 fn format_tool_result_content(content: Option<&serde_json::Value>) -> String {
     match content {
@@ -293,7 +277,14 @@ fn render_assistant_message(
                 continue;
             }
             let md_lines = render_markdown_to_lines(text, options.content_width);
-            render_ledger_block_styled(lines, &options.assistant_label, options.assistant_color, true, md_lines, ts_remaining);
+            render_ledger_block_styled(
+                lines,
+                &options.assistant_label,
+                options.assistant_color,
+                true,
+                md_lines,
+                ts_remaining,
+            );
             printed = true;
             // After first block consumes the timestamp, use blank padding for alignment
             if ts_remaining.is_some() {
@@ -348,7 +339,14 @@ fn render_assistant_message(
                 } else {
                     None
                 };
-                render_ledger_block_styled(lines, "Thinking", options.assistant_dim_color, false, styled_lines, ts);
+                render_ledger_block_styled(
+                    lines,
+                    "Thinking",
+                    options.assistant_dim_color,
+                    false,
+                    styled_lines,
+                    ts,
+                );
                 printed = true;
             }
         }
@@ -1557,7 +1555,6 @@ fn render_continuation_dimmed(lines: &mut Vec<RenderedLine>, text: &str, show_ti
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1794,7 +1791,7 @@ mod tests {
             .position(|l| l.starts_with("2. "))
             .expect("Should find '2. '");
         assert!(
-            line2_idx >= 1 && line2_idx <= 4,
+            (1..=4).contains(&line2_idx),
             "Second item should appear after first"
         );
     }

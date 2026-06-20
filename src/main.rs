@@ -6,7 +6,9 @@ mod debug;
 mod debug_log;
 mod display;
 mod error;
+mod headless;
 mod history;
+mod loader;
 mod markdown;
 mod pager;
 mod providers;
@@ -30,6 +32,11 @@ fn main() {
         match e {
             AppError::SelectionCancelled => {
                 // User cancelled, exit silently
+                std::process::exit(0);
+            }
+            // A consumer closing the pipe early (e.g. `mnemonai list | head`) is
+            // normal; exit quietly instead of printing a misleading error.
+            AppError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => {
                 std::process::exit(0);
             }
             _ => {
@@ -122,6 +129,17 @@ fn run() -> Result<()> {
         Box::new(providers::cursor::CursorProvider::new()),
     ];
 
+    if let Some(ref command) = args.command {
+        let settings = headless::HeadlessSettings {
+            cli_local: args.local,
+            config_local: config.local.unwrap_or(false),
+            show_last,
+            show_deleted_projects,
+            debug: args.debug,
+        };
+        return headless::run_command(command, &providers, &settings);
+    }
+
     // Handle --bench-startup flag: time the streaming load headlessly and exit
     if args.bench_startup {
         return bench_startup(&providers, show_last, args.debug);
@@ -142,9 +160,23 @@ fn run() -> Result<()> {
     // Handle direct file input mode
     if let Some(ref input_file) = args.input_file {
         if !input_file.exists() {
+            // A bare word with no path separator or extension (e.g. `dump`,
+            // `search`, or a misspelled `list`) was likely meant as a
+            // subcommand, which clap routed to the legacy file positional.
+            let looks_like_subcommand = input_file
+                .to_str()
+                .is_some_and(|name| !name.contains(['/', '\\', '.']));
+            let message = if looks_like_subcommand {
+                format!(
+                    "File not found: {} (if you meant a subcommand, see `mnemonai --help`)",
+                    input_file.display()
+                )
+            } else {
+                format!("File not found: {}", input_file.display())
+            };
             return Err(AppError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("File not found: {}", input_file.display()),
+                message,
             )));
         }
         if !input_file.is_file() {
@@ -165,10 +197,10 @@ fn run() -> Result<()> {
 
     // Handle --show-dir flag (Claude-specific, print directory and exit)
     if args.show_dir {
-        if let Ok(current_dir) = std::env::current_dir() {
-            if let Ok(projects_dir) = history::get_claude_projects_dir(&current_dir) {
-                println!("{}", projects_dir.display());
-            }
+        if let Ok(current_dir) = std::env::current_dir()
+            && let Ok(projects_dir) = history::get_claude_projects_dir(&current_dir)
+        {
+            println!("{}", projects_dir.display());
         }
         return Ok(());
     }
@@ -200,28 +232,7 @@ fn run() -> Result<()> {
         }
     } else {
         // Local mode - load from all providers for current directory
-        let current_dir = std::env::current_dir().map_err(|e| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Failed to get current directory: {}", e),
-            ))
-        })?;
-
-        let mut conversations = Vec::new();
-
-        for provider in &providers {
-            match provider.load_conversations(show_last, args.debug) {
-                Ok(mut convs) => {
-                    // For non-Claude providers, filter to current directory
-                    if provider.kind() != history::ProviderKind::Claude {
-                        convs
-                            .retain(|c| c.project_path.as_ref().is_some_and(|p| p == &current_dir));
-                    }
-                    conversations.extend(convs);
-                }
-                Err(_) => {} // Silently skip providers that fail in local mode
-            }
-        }
+        let mut conversations = loader::load_local(&providers, show_last, args.debug, None)?;
 
         // Sort merged conversations by timestamp (newest first) and re-index
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -360,15 +371,19 @@ fn bench_startup(
                     }
                 }
                 let done_ms = overall.elapsed().as_millis();
-                (name, first_batch_ms, done_ms, conversations, batches, errors)
+                (
+                    name,
+                    first_batch_ms,
+                    done_ms,
+                    conversations,
+                    batches,
+                    errors,
+                )
             })
         })
         .collect();
 
-    let mut results: Vec<_> = handles
-        .into_iter()
-        .filter_map(|h| h.join().ok())
-        .collect();
+    let mut results: Vec<_> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
     results.sort_by_key(|r| r.2);
 
     let total_ms = overall.elapsed().as_millis();

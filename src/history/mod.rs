@@ -25,8 +25,8 @@ use std::time::SystemTime;
 pub use loader::{load_all_conversations_streaming, load_conversations};
 pub use parser::process_conversation_file;
 pub use path::{
-    convert_path_to_project_dir_name, format_short_name_from_path, project_path_is_live,
-    resolve_project_dir,
+    convert_path_to_project_dir_name, format_short_name_from_path, path_to_string,
+    project_path_is_live, resolve_project_dir,
 };
 
 /// Identifies which AI tool provider a conversation originated from
@@ -36,6 +36,19 @@ pub enum ProviderKind {
     Codex,
     Cursor,
     CursorAgent,
+}
+
+impl ProviderKind {
+    /// Stable lowercase key used in the cache schema and the headless JSON
+    /// output. Keep these strings stable; consumers depend on them.
+    pub fn key(&self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "claude",
+            ProviderKind::Codex => "codex",
+            ProviderKind::Cursor => "cursor",
+            ProviderKind::CursorAgent => "cursor-agent",
+        }
+    }
 }
 
 /// Represents a JSONL parsing error with context for debugging

@@ -151,6 +151,25 @@ pub fn extract_text_from_assistant(message: &AssistantMessage) -> String {
     extract_text_from_blocks(&message.content)
 }
 
+/// Extract text content from a tool result block.
+///
+/// Returns `Some(text)` when the content is a string or an array of text
+/// blocks (e.g. `[{type: "text", text: "..."}]`), and `None` for JSON
+/// structures that should be pretty-printed instead.
+pub fn extract_tool_result_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(arr)) => {
+            let texts: Vec<&str> = arr
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect();
+            (!texts.is_empty()).then(|| texts.join("\n\n"))
+        }
+        _ => None,
+    }
+}
+
 /// Agent progress data from subagent conversations
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentProgressData {
