@@ -94,7 +94,11 @@ fn format_timestamp(iso_timestamp: &str) -> Option<String> {
         .map(|dt| dt.with_timezone(&Local).format("%H:%M").to_string())
 }
 
-/// Read log entries from a JSONL file
+/// Read log entries from a JSONL file.
+///
+/// Unreadable lines are skipped rather than aborting the read, so a single
+/// corrupt line doesn't truncate an otherwise-parseable transcript.
+#[allow(clippy::lines_filter_map_ok)]
 pub fn read_log_entries(file_path: &Path) -> std::io::Result<Vec<LogEntry>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -1787,7 +1791,7 @@ mod tests {
             .position(|l| l.starts_with("2. "))
             .expect("Should find '2. '");
         assert!(
-            line2_idx >= 1 && line2_idx <= 4,
+            (1..=4).contains(&line2_idx),
             "Second item should appear after first"
         );
     }

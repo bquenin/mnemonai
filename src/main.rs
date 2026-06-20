@@ -197,10 +197,10 @@ fn run() -> Result<()> {
 
     // Handle --show-dir flag (Claude-specific, print directory and exit)
     if args.show_dir {
-        if let Ok(current_dir) = std::env::current_dir() {
-            if let Ok(projects_dir) = history::get_claude_projects_dir(&current_dir) {
-                println!("{}", projects_dir.display());
-            }
+        if let Ok(current_dir) = std::env::current_dir()
+            && let Ok(projects_dir) = history::get_claude_projects_dir(&current_dir)
+        {
+            println!("{}", projects_dir.display());
         }
         return Ok(());
     }

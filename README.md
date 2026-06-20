@@ -42,16 +42,72 @@ mnemonai --local
 
 ## Headless Usage
 
+Stable, non-interactive commands for tools and skills that want to analyze
+structured conversation data instead of scraping the TUI.
+
 ```bash
-# List all conversations as JSON
+# List all conversations as a JSON array
 mnemonai list --json
 
-# Stream conversation summaries as JSONL
+# Stream conversation summaries as JSONL (one object per line)
 mnemonai list --jsonl --provider codex --limit 100
 
-# Show one conversation by ID or source path
-mnemonai show <session-id> --json
+# Show one conversation by session ID or source path
+mnemonai show <session-id-or-path> --json
+
+# Skill-style pipeline
+mnemonai list --jsonl --limit 500 | jq -r 'select(.message_count > 50) | .id'
 ```
+
+`list` and `show` accept `--provider <claude|codex|cursor|cursor-agent>`,
+`--local` (current directory only), and `--show-deleted-projects`. `list` also
+takes `--limit <n>`. Output is JSON by default; on errors (no match, ambiguous
+target) the command prints a message to stderr and exits non-zero.
+
+### `list` output — conversation summary
+
+Each conversation is an object with these fields (nullable fields are omitted
+when empty):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `provider` | string | `claude` \| `codex` \| `cursor` \| `cursor-agent` |
+| `id` | string | session ID (use with `show`) |
+| `path` | string | absolute source path |
+| `timestamp` | string | RFC 3339 |
+| `project_name` | string? | |
+| `project_path` | string? | |
+| `cwd` | string? | |
+| `preview` | string | short text preview |
+| `summary` | string? | title, when available |
+| `model` | string? | when available |
+| `message_count` | number | |
+| `total_tokens` | number | |
+| `duration_minutes` | number? | |
+| `parse_errors` | array | diagnostics; entries can include raw transcript lines, so this may be large for broken transcripts |
+
+### `show` output — conversation detail
+
+`{ "conversation": <summary>, "messages": [<message>, ...] }`, where each message
+carries `role` plus whichever of these apply (absent fields are omitted):
+
+| Field | Populated for |
+|-------|---------------|
+| `role` | always — one of `summary`, `user`, `assistant`, `tool_call`, `tool_result`, `thinking`, `image`, `system`, or `agent_<type>` for sub-agent turns |
+| `timestamp` | most messages (RFC 3339) |
+| `text` | text messages, tool results, summaries |
+| `tool_name` | `tool_call` |
+| `tool_input` | `tool_call` — raw, tool-specific JSON (opaque) |
+| `tool_result` | `tool_result` — raw, provider-specific JSON (opaque) |
+| `thinking` | `thinking` |
+| `model` | assistant/thinking, when available |
+| `agent_id` | sub-agent messages |
+| `subtype` / `level` / `duration_ms` | `system` |
+| `source` | `image` — raw provider-specific image source (opaque) |
+
+`tool_input`, `tool_result`, and `source` are passed through verbatim from the
+underlying transcript; treat their inner shape as opaque rather than a stable
+contract.
 
 ## Keyboard Shortcuts
 
