@@ -227,7 +227,11 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
 
     fn format_assistant_text(&mut self, text: &str) {
         let rendered = render_markdown(text, self.content_width);
-        self.print_markdown("Claude", |s| s.custom_color(CLAUDE_TERRACOTTA).bold(), &rendered);
+        self.print_markdown(
+            "Claude",
+            |s| s.custom_color(CLAUDE_TERRACOTTA).bold(),
+            &rendered,
+        );
     }
 
     fn format_tool_call(&mut self, name: &str, input: &serde_json::Value) {
@@ -235,7 +239,11 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
 
         // Print the header with appropriate styling
         let padded_name = format!("{:>width$}", "Claude", width = NAME_WIDTH);
-        let _ = write!(self.writer, "{}", padded_name.custom_color(CLAUDE_TERRACOTTA_DIM));
+        let _ = write!(
+            self.writer,
+            "{}",
+            padded_name.custom_color(CLAUDE_TERRACOTTA_DIM)
+        );
         let _ = write!(self.writer, "{}", SEPARATOR.custom_color(SEPARATOR_COLOR));
 
         // Print the header in subtle gray
@@ -262,7 +270,11 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
     }
 
     fn format_thinking(&mut self, thought: &str) {
-        self.print_lines("Thinking", |s| s.custom_color(CLAUDE_TERRACOTTA_DIM), thought);
+        self.print_lines(
+            "Thinking",
+            |s| s.custom_color(CLAUDE_TERRACOTTA_DIM),
+            thought,
+        );
     }
 
     fn end_message(&mut self) {
@@ -278,7 +290,11 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
     fn format_agent_assistant_text(&mut self, agent_id: &str, text: &str) {
         let rendered = render_markdown(text, self.content_width);
         let name = format!("↳{}", short_agent_id(agent_id));
-        self.print_markdown(&name, |s| s.custom_color(CLAUDE_TERRACOTTA).dimmed(), &rendered);
+        self.print_markdown(
+            &name,
+            |s| s.custom_color(CLAUDE_TERRACOTTA).dimmed(),
+            &rendered,
+        );
     }
 
     fn format_agent_tool_call(&mut self, agent_id: &str, name: &str, input: &serde_json::Value) {
@@ -399,7 +415,6 @@ fn format_tool_content(content: Option<&serde_json::Value>) -> String {
         None => "<no content>".to_string(),
     }
 }
-
 
 /// Get the terminal width, defaulting to 80 if unavailable
 fn get_terminal_width() -> usize {
@@ -773,8 +788,8 @@ pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<
         show_timing: false, // Non-TUI render doesn't support timing toggle
         content_width,
         assistant_label: "Claude".to_string(),
-        assistant_color: (218, 119, 86),      // Claude terracotta
-        assistant_dim_color: (170, 93, 67),   // Claude terracotta dim
+        assistant_color: (218, 119, 86),    // Claude terracotta
+        assistant_dim_color: (170, 93, 67), // Claude terracotta dim
     };
 
     let rendered_lines = render_conversation(file_path, &render_options)?;
@@ -837,4 +852,3 @@ pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<
 
     Ok(())
 }
-

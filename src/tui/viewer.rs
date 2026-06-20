@@ -293,7 +293,14 @@ fn render_assistant_message(
                 continue;
             }
             let md_lines = render_markdown_to_lines(text, options.content_width);
-            render_ledger_block_styled(lines, &options.assistant_label, options.assistant_color, true, md_lines, ts_remaining);
+            render_ledger_block_styled(
+                lines,
+                &options.assistant_label,
+                options.assistant_color,
+                true,
+                md_lines,
+                ts_remaining,
+            );
             printed = true;
             // After first block consumes the timestamp, use blank padding for alignment
             if ts_remaining.is_some() {
@@ -348,7 +355,14 @@ fn render_assistant_message(
                 } else {
                     None
                 };
-                render_ledger_block_styled(lines, "Thinking", options.assistant_dim_color, false, styled_lines, ts);
+                render_ledger_block_styled(
+                    lines,
+                    "Thinking",
+                    options.assistant_dim_color,
+                    false,
+                    styled_lines,
+                    ts,
+                );
                 printed = true;
             }
         }
@@ -1556,7 +1570,6 @@ fn render_continuation_dimmed(lines: &mut Vec<RenderedLine>, text: &str, show_ti
         lines.push(RenderedLine { spans });
     }
 }
-
 
 #[cfg(test)]
 mod tests {

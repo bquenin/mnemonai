@@ -247,10 +247,7 @@ mod tests {
     fn converts_various_separators_and_punctuation() {
         let path = Path::new("/Users/user/code/workmux/.worktrees/uncommitted");
         let converted = convert_path_to_project_dir_name(path);
-        assert_eq!(
-            converted,
-            "-Users-user-code-workmux--worktrees-uncommitted"
-        );
+        assert_eq!(converted, "-Users-user-code-workmux--worktrees-uncommitted");
     }
 
     #[test]

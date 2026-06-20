@@ -40,6 +40,19 @@ mnemonai
 mnemonai --local
 ```
 
+## Headless Usage
+
+```bash
+# List all conversations as JSON
+mnemonai list --json
+
+# Stream conversation summaries as JSONL
+mnemonai list --jsonl --provider codex --limit 100
+
+# Show one conversation by ID or source path
+mnemonai show <session-id> --json
+```
+
 ## Keyboard Shortcuts
 
 Press `?` at any time to open the help overlay.

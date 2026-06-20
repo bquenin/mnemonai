@@ -413,12 +413,13 @@ impl super::Provider for CursorAgentProvider {
         {
             path.clone()
         } else {
-            let encoded_dir_name = extract_project_dir_name(&conversation.path).ok_or_else(|| {
-                AppError::ClaudeExecutionError(
-                    "Cannot determine project directory for this Cursor Agent conversation"
-                        .to_string(),
-                )
-            })?;
+            let encoded_dir_name =
+                extract_project_dir_name(&conversation.path).ok_or_else(|| {
+                    AppError::ClaudeExecutionError(
+                        "Cannot determine project directory for this Cursor Agent conversation"
+                            .to_string(),
+                    )
+                })?;
             let chats_dir = self
                 .projects_root
                 .parent()
@@ -913,13 +914,11 @@ fn component_prefix_viable(prefix: &str, is_last: bool) -> bool {
     // Exclude exact matches: if the only entry is the prefix itself, there's no
     // longer name to continue building. Exact-match directories are already
     // handled by the `path.is_dir()` check above.
-    entries
-        .filter_map(|e| e.ok())
-        .any(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(name_prefix) && name != name_prefix)
-        })
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(name_prefix) && name != name_prefix)
+    })
 }
 
 fn file_modified_time(path: &Path) -> Option<SystemTime> {
@@ -1079,8 +1078,7 @@ mod tests {
 
     #[test]
     fn parse_transcript_line_rejects_message_like_records_with_type_but_no_role() {
-        let line =
-            r#"{"type":"future_message","message":{"content":[{"type":"text","text":"missing role"}]}}"#;
+        let line = r#"{"type":"future_message","message":{"content":[{"type":"text","text":"missing role"}]}}"#;
 
         assert!(parse_transcript_line(line, 1, None).is_err());
     }
@@ -1205,8 +1203,12 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path =
-                PathBuf::from("/tmp").join(format!("mnemonai-{}-{}-{}", name, std::process::id(), unique));
+            let path = PathBuf::from("/tmp").join(format!(
+                "mnemonai-{}-{}-{}",
+                name,
+                std::process::id(),
+                unique
+            ));
             fs::create_dir_all(&path).unwrap();
             Self { path }
         }
@@ -1305,7 +1307,10 @@ mod tests {
 
         // Create a fake chats dir with the MD5 of candidate_b
         let chats_dir = temp.path.join("chats");
-        let hash_b = format!("{:x}", md5::compute(candidate_b.to_string_lossy().as_bytes()));
+        let hash_b = format!(
+            "{:x}",
+            md5::compute(candidate_b.to_string_lossy().as_bytes())
+        );
         fs::create_dir_all(chats_dir.join(&hash_b)).unwrap();
 
         let parent_name = temp.path.file_name().unwrap().to_str().unwrap();

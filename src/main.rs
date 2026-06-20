@@ -6,6 +6,7 @@ mod debug;
 mod debug_log;
 mod display;
 mod error;
+mod headless;
 mod history;
 mod markdown;
 mod pager;
@@ -121,6 +122,17 @@ fn run() -> Result<()> {
         Box::new(providers::cursor_agent::CursorAgentProvider::new()),
         Box::new(providers::cursor::CursorProvider::new()),
     ];
+
+    if let Some(ref command) = args.command {
+        let settings = headless::HeadlessSettings {
+            cli_local: args.local,
+            config_local: config.local.unwrap_or(false),
+            show_last,
+            show_deleted_projects,
+            debug: args.debug,
+        };
+        return headless::run_command(command, &providers, &settings);
+    }
 
     // Handle --bench-startup flag: time the streaming load headlessly and exit
     if args.bench_startup {
@@ -360,15 +372,19 @@ fn bench_startup(
                     }
                 }
                 let done_ms = overall.elapsed().as_millis();
-                (name, first_batch_ms, done_ms, conversations, batches, errors)
+                (
+                    name,
+                    first_batch_ms,
+                    done_ms,
+                    conversations,
+                    batches,
+                    errors,
+                )
             })
         })
         .collect();
 
-    let mut results: Vec<_> = handles
-        .into_iter()
-        .filter_map(|h| h.join().ok())
-        .collect();
+    let mut results: Vec<_> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
     results.sort_by_key(|r| r.2);
 
     let total_ms = overall.elapsed().as_millis();

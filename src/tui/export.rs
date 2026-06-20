@@ -236,7 +236,10 @@ fn generate_markdown_from_entries(entries: &[LogEntry], options: ExportOptions) 
                 for block in &message.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            output.push_str(&format!("## {}\n\n{}\n\n", options.assistant_label, text));
+                            output.push_str(&format!(
+                                "## {}\n\n{}\n\n",
+                                options.assistant_label, text
+                            ));
                         }
                         ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
                             let formatted = format_tool_call_for_export(name, input);
@@ -290,7 +293,12 @@ fn generate_ledger_from_entries(entries: &[LogEntry], options: ExportOptions) ->
                 for block in &message.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            append_ledger_block(&mut output, &options.assistant_label, text, NAME_WIDTH);
+                            append_ledger_block(
+                                &mut output,
+                                &options.assistant_label,
+                                text,
+                                NAME_WIDTH,
+                            );
                             output.push('\n');
                         }
                         ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
