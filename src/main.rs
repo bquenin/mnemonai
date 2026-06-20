@@ -132,7 +132,6 @@ fn run() -> Result<()> {
     if let Some(ref command) = args.command {
         let settings = headless::HeadlessSettings {
             cli_local: args.local,
-            config_local: config.local.unwrap_or(false),
             show_last,
             show_deleted_projects,
             debug: args.debug,

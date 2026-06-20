@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 
 pub struct HeadlessSettings {
     pub cli_local: bool,
-    pub config_local: bool,
     pub show_last: bool,
     pub show_deleted_projects: bool,
     pub debug: Option<DebugLevel>,
@@ -237,7 +236,7 @@ fn load_conversations(
     command_show_deleted: bool,
     force_global: bool,
 ) -> Result<Vec<Conversation>> {
-    let local = !force_global && (command_local || settings.cli_local || settings.config_local);
+    let local = use_local_scope(settings, command_local, force_global);
     let show_deleted_projects = command_show_deleted || settings.show_deleted_projects;
     let mut conversations = if local {
         crate::loader::load_local(
@@ -268,6 +267,13 @@ fn load_conversations(
     reindex_conversations(&mut conversations);
 
     Ok(conversations)
+}
+
+fn use_local_scope(settings: &HeadlessSettings, command_local: bool, force_global: bool) -> bool {
+    // Headless commands default to global output even when the interactive TUI
+    // config has `local = true`; scripts and skills need stable scope unless the
+    // caller explicitly passes --local.
+    !force_global && (command_local || settings.cli_local)
 }
 
 fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListCommand) -> Result<()> {
@@ -1238,6 +1244,34 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn headless_scope_is_global_without_explicit_local_flag() {
+        let settings = HeadlessSettings {
+            cli_local: false,
+            show_last: false,
+            show_deleted_projects: false,
+            debug: None,
+        };
+
+        assert!(
+            !use_local_scope(&settings, false, false),
+            "headless commands must default to global scope"
+        );
+        assert!(use_local_scope(&settings, true, false));
+
+        let cli_settings = HeadlessSettings {
+            cli_local: true,
+            show_last: false,
+            show_deleted_projects: false,
+            debug: None,
+        };
+        assert!(use_local_scope(&cli_settings, false, false));
+        assert!(
+            !use_local_scope(&cli_settings, true, true),
+            "--cwd must force global loading before cwd filtering"
+        );
     }
 
     #[test]
