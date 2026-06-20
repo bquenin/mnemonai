@@ -52,6 +52,10 @@ mnemonai list --json
 # Stream conversation summaries as JSONL (one object per line)
 mnemonai list --jsonl --provider codex --limit 100
 
+# Scope list output for retrospective analysis
+mnemonai list --json --since 7d --limit 50
+mnemonai list --json --cwd ~/code/my-repo --after 2026-06-01 --before 2026-06-20
+
 # Show one conversation by session ID or source path
 mnemonai show <session-id-or-path> --json
 
@@ -61,8 +65,13 @@ mnemonai list --jsonl --limit 500 | jq -r 'select(.message_count > 50) | .id'
 
 `list` and `show` accept `--provider <claude|codex|cursor|cursor-agent>`,
 `--local` (current directory only), and `--show-deleted-projects`. `list` also
-takes `--limit <n>`. Output is JSON by default; on errors (no match, ambiguous
-target) the command prints a message to stderr and exits non-zero.
+takes `--limit <n>`, `--since <duration>` (for example `7d`, `24h`, `2w`),
+`--after <timestamp>`, `--before <timestamp>`, and `--cwd <path>`.
+`--after`/`--before` accept RFC 3339 timestamps or `YYYY-MM-DD`; the lower bound
+is inclusive and the upper bound is exclusive. `--cwd` matches conversations
+whose recorded `cwd` or `project_path` is at or under the path. Output is JSON by
+default; on errors (no match, ambiguous target) the command prints a message to
+stderr and exits non-zero.
 
 ### `list` output — conversation summary
 
@@ -93,21 +102,29 @@ carries `role` plus whichever of these apply (absent fields are omitted):
 
 | Field | Populated for |
 |-------|---------------|
+| `index` | always — zero-based normalized message index |
+| `entry_index` | always — zero-based source log entry index |
+| `block_index` | content-block messages, when applicable |
 | `role` | always — one of `summary`, `user`, `assistant`, `tool_call`, `tool_result`, `thinking`, `image`, `system`, or `agent_<type>` for sub-agent turns |
 | `timestamp` | most messages (RFC 3339) |
 | `text` | text messages, tool results, summaries |
+| `tool_call_id` | `tool_call` and `tool_result`; use this to pair calls with results |
 | `tool_name` | `tool_call` |
 | `tool_input` | `tool_call` — raw, tool-specific JSON (opaque) |
 | `tool_result` | `tool_result` — raw, provider-specific JSON (opaque) |
+| `tool_result_status` | `tool_result`, when the provider exposes status |
+| `tool_result_exit_code` | `tool_result`, when command-style output exposes an exit code |
+| `tool_result_error` | `tool_result`, when an explicit or recognizable error/success marker exists |
 | `thinking` | `thinking` |
 | `model` | assistant/thinking, when available |
 | `agent_id` | sub-agent messages |
 | `subtype` / `level` / `duration_ms` | `system` |
 | `source` | `image` — raw provider-specific image source (opaque) |
 
-`tool_input`, `tool_result`, and `source` are passed through verbatim from the
-underlying transcript; treat their inner shape as opaque rather than a stable
-contract.
+`tool_call_id`, `index`, `entry_index`, and `block_index` are intended for
+tool-trace analysis. `tool_input`, `tool_result`, and `source` are passed
+through verbatim from the underlying transcript; treat their inner shape as
+opaque rather than a stable contract.
 
 ## Keyboard Shortcuts
 

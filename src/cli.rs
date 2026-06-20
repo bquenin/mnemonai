@@ -211,6 +211,22 @@ pub struct ListCommand {
     #[arg(long)]
     pub local: bool,
 
+    /// Only include conversations whose cwd or project path is at or under this path
+    #[arg(long, value_name = "PATH", conflicts_with = "local")]
+    pub cwd: Option<PathBuf>,
+
+    /// Only include conversations from the last duration (for example: 7d, 24h, 2w)
+    #[arg(long, value_name = "DURATION", conflicts_with = "after")]
+    pub since: Option<String>,
+
+    /// Only include conversations at or after this timestamp (RFC 3339 or YYYY-MM-DD)
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub after: Option<String>,
+
+    /// Only include conversations before this timestamp (RFC 3339 or YYYY-MM-DD)
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub before: Option<String>,
+
     /// Include conversations from deleted project directories
     #[arg(long)]
     pub show_deleted_projects: bool,
@@ -254,6 +270,10 @@ mod tests {
             "--jsonl",
             "--provider",
             "cursor-agent",
+            "--since",
+            "7d",
+            "--cwd",
+            ".",
             "--limit",
             "10",
         ])
@@ -263,6 +283,8 @@ mod tests {
             Some(Command::List(command)) => {
                 assert!(command.jsonl);
                 assert_eq!(command.provider, Some(ProviderFilter::CursorAgent));
+                assert_eq!(command.since.as_deref(), Some("7d"));
+                assert_eq!(command.cwd, Some(PathBuf::from(".")));
                 assert_eq!(command.limit, Some(10));
             }
             other => panic!("expected list command, got {:?}", other),

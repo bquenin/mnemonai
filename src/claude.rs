@@ -112,10 +112,13 @@ pub enum ContentBlock {
         input: serde_json::Value,
     },
     ToolResult {
-        #[allow(dead_code)]
         tool_use_id: String,
         #[serde(default)]
         content: Option<serde_json::Value>, // Optional in some user tool result entries
+        #[serde(default)]
+        is_error: Option<bool>,
+        #[serde(default)]
+        status: Option<String>,
     },
     Thinking {
         thinking: String,

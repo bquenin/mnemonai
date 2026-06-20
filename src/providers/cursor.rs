@@ -1210,7 +1210,6 @@ struct Bubble {
     tool_args: Option<String>,
     tool_call_id: Option<String>,
     tool_result: Option<String>,
-    #[allow(dead_code)]
     tool_status: Option<String>,
 }
 
@@ -1467,11 +1466,18 @@ fn bubble_to_log_entry(bubble: &Bubble) -> Option<LogEntry> {
                 // Add tool result if present
                 if let Some(ref result) = bubble.tool_result {
                     let truncated = truncate_str(result, 500);
-                    content_blocks.push(serde_json::json!({
+                    let mut result_block = serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": id,
                         "content": truncated
-                    }));
+                    });
+                    if let Some(status) = &bubble.tool_status {
+                        result_block
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("status".to_string(), Value::String(status.clone()));
+                    }
+                    content_blocks.push(result_block);
                 }
             }
 

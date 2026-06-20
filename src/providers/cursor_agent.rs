@@ -72,6 +72,10 @@ struct CursorAgentTranscriptBlock {
     tool_use_id: Option<String>,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    is_error: Option<bool>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 struct ParsedTranscriptLine {
@@ -697,6 +701,8 @@ fn block_to_content_block(
                 .clone()
                 .unwrap_or_else(|| format!("cursor-agent-result-{}-{}", line_idx, block_idx)),
             content: block.content.clone(),
+            is_error: block.is_error,
+            status: block.status.clone(),
         }),
         "thinking" => Some(ContentBlock::Thinking {
             thinking: block.thinking.clone().unwrap_or_default(),
