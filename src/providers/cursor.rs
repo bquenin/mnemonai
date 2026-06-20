@@ -274,13 +274,13 @@ fn query_user_bubble_keys(conn: &Connection, show_last: bool) -> HashMap<String,
         order_func
     );
     let mut user_keys = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(&user_query) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    if let Ok(mut stmt) = conn.prepare(&user_query)
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }) {
-            for row in rows.flatten() {
-                user_keys.insert(row.0, row.1);
-            }
+        })
+    {
+        for row in rows.flatten() {
+            user_keys.insert(row.0, row.1);
         }
     }
     user_keys
@@ -497,9 +497,7 @@ fn build_full_text_map(
     conv_infos: &[ConvInfo],
     cache_conn: Option<&Connection>,
 ) -> HashMap<String, String> {
-    let cached = cache_conn
-        .map(|c| load_cached_full_text(c))
-        .unwrap_or_default();
+    let cached = cache_conn.map(load_cached_full_text).unwrap_or_default();
     build_full_text_map_from_cached(None, cursor_conn, conv_infos, &cached, cache_conn)
 }
 
@@ -648,11 +646,10 @@ fn load_index_timestamps(conn: &Connection) -> HashMap<String, i64> {
         "SELECT value FROM ItemTable WHERE key = 'conversationClassificationScoredConversations'",
         [],
         |row| row.get(0),
-    ) {
-        if let Ok(index) = serde_json::from_str::<Vec<ConversationIndexEntry>>(&json) {
-            for entry in index {
-                timestamps.insert(entry.conversation_id, entry.timestamp);
-            }
+    ) && let Ok(index) = serde_json::from_str::<Vec<ConversationIndexEntry>>(&json)
+    {
+        for entry in index {
+            timestamps.insert(entry.conversation_id, entry.timestamp);
         }
     }
     timestamps
@@ -1063,12 +1060,11 @@ impl super::Provider for CursorProvider {
                     .collect();
 
                 let mut full_map = bubble_map;
-                if !extra_keys.is_empty() {
-                    if let Ok(extra) =
+                if !extra_keys.is_empty()
+                    && let Ok(extra) =
                         batch_fetch_bubbles_parallel(&global_db_path, &conn, &extra_keys)
-                    {
-                        full_map.extend(extra);
-                    }
+                {
+                    full_map.extend(extra);
                 }
 
                 let phase2_convs: Vec<Conversation> = remaining_infos
@@ -1117,7 +1113,7 @@ impl super::Provider for CursorProvider {
         // Uses cwd which stores the open_path (may be a .code-workspace file)
         if let Some(ref path) = conversation.cwd {
             Command::new("cursor")
-                .arg(&path.to_string_lossy().as_ref())
+                .arg(path.to_string_lossy().as_ref())
                 .spawn()
                 .map_err(|e| {
                     AppError::ClaudeExecutionError(format!("Failed to launch Cursor: {}", e))
@@ -1173,22 +1169,17 @@ impl super::Provider for CursorProvider {
             "SELECT value FROM ItemTable WHERE key = 'conversationClassificationScoredConversations'",
             [],
             |row| row.get(0),
-        ) {
-            if let Ok(mut index) = serde_json::from_str::<Vec<Value>>(&index_json) {
-                let before = index.len();
-                index.retain(|e| {
-                    e.get("conversationId")
-                        .and_then(|v| v.as_str())
-                        != Some(conv_id)
-                });
-                if index.len() != before {
-                    if let Ok(new_json) = serde_json::to_string(&index) {
-                        let _ = conn.execute(
-                            "UPDATE ItemTable SET value = ? WHERE key = 'conversationClassificationScoredConversations'",
-                            rusqlite::params![&new_json],
-                        );
-                    }
-                }
+        ) && let Ok(mut index) = serde_json::from_str::<Vec<Value>>(&index_json)
+        {
+            let before = index.len();
+            index.retain(|e| e.get("conversationId").and_then(|v| v.as_str()) != Some(conv_id));
+            if index.len() != before
+                && let Ok(new_json) = serde_json::to_string(&index)
+            {
+                let _ = conn.execute(
+                    "UPDATE ItemTable SET value = ? WHERE key = 'conversationClassificationScoredConversations'",
+                    rusqlite::params![&new_json],
+                );
             }
         }
 
@@ -1406,10 +1397,10 @@ fn bubble_text(bubble: &Bubble) -> String {
         return bubble.text.clone();
     }
     // Fallback to richText for user messages
-    if let Some(ref rt) = bubble.rich_text {
-        if let Some(text) = extract_text_from_richtext(rt) {
-            return text;
-        }
+    if let Some(ref rt) = bubble.rich_text
+        && let Some(text) = extract_text_from_richtext(rt)
+    {
+        return text;
     }
     String::new()
 }

@@ -680,8 +680,6 @@ fn process_assistant_message<F: OutputFormatter>(
     }
 }
 
-/// Get a truncated agent ID for display (max 7 characters)
-
 /// Process an agent progress message using the provided formatter
 fn process_agent_message<F: OutputFormatter>(
     formatter: &mut F,

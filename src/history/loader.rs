@@ -335,6 +335,10 @@ pub fn load_conversations(
     Ok(conversations)
 }
 
+/// Conversations loaded from one project, paired with the freshly parsed
+/// (cache-miss) ones the caller should persist in a single batch.
+type ProjectLoad = (Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>);
+
 /// Load one project directory. Returns the conversations plus clones of the
 /// freshly parsed ones (cache misses) so the caller can persist them in a
 /// single batch — per-project writes would race for the SQLite write lock.
@@ -343,7 +347,7 @@ fn load_conversations_with_cache(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
-) -> Result<(Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>)> {
+) -> Result<ProjectLoad> {
     // Find all JSONL files and capture metadata in one pass
     let mut files_with_meta = Vec::new();
     let mut skipped_agent_files = 0;

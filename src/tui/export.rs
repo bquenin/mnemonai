@@ -136,7 +136,11 @@ fn generate_content(
     }
 }
 
-/// Read log entries from a JSONL file for export
+/// Read log entries from a JSONL file for export.
+///
+/// Unreadable lines are skipped rather than aborting the read, so a single
+/// corrupt line doesn't truncate an otherwise-parseable transcript.
+#[allow(clippy::lines_filter_map_ok)]
 fn read_entries_from_file(path: &Path) -> std::io::Result<Vec<LogEntry>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -175,13 +179,13 @@ fn generate_plain_from_entries(entries: &[LogEntry], options: ExportOptions) -> 
                 if let Some(text) = extract_user_text(message) {
                     output.push_str(&format!("You: {}\n\n", text));
                 }
-                if options.show_tools {
-                    if let UserContent::Blocks(blocks) = &message.content {
-                        for block in blocks {
-                            if let ContentBlock::ToolResult { content, .. } = block {
-                                let content_str = format_tool_result_for_export(content.as_ref());
-                                output.push_str(&format!("Tool Result: {}\n\n", content_str));
-                            }
+                if options.show_tools
+                    && let UserContent::Blocks(blocks) = &message.content
+                {
+                    for block in blocks {
+                        if let ContentBlock::ToolResult { content, .. } = block {
+                            let content_str = format_tool_result_for_export(content.as_ref());
+                            output.push_str(&format!("Tool Result: {}\n\n", content_str));
                         }
                     }
                 }
@@ -220,14 +224,14 @@ fn generate_markdown_from_entries(entries: &[LogEntry], options: ExportOptions) 
                 if let Some(text) = extract_user_text(message) {
                     output.push_str(&format!("## You\n\n{}\n\n", text));
                 }
-                if options.show_tools {
-                    if let UserContent::Blocks(blocks) = &message.content {
-                        for block in blocks {
-                            if let ContentBlock::ToolResult { content, .. } = block {
-                                let content_str = format_tool_result_for_export(content.as_ref());
-                                let fenced = markdown_code_fence(&content_str);
-                                output.push_str(&format!("### Tool Result\n\n{}\n\n", fenced));
-                            }
+                if options.show_tools
+                    && let UserContent::Blocks(blocks) = &message.content
+                {
+                    for block in blocks {
+                        if let ContentBlock::ToolResult { content, .. } = block {
+                            let content_str = format_tool_result_for_export(content.as_ref());
+                            let fenced = markdown_code_fence(&content_str);
+                            output.push_str(&format!("### Tool Result\n\n{}\n\n", fenced));
                         }
                     }
                 }
@@ -272,19 +276,14 @@ fn generate_ledger_from_entries(entries: &[LogEntry], options: ExportOptions) ->
                     append_ledger_block(&mut output, "You", &text, NAME_WIDTH);
                     output.push('\n');
                 }
-                if options.show_tools {
-                    if let UserContent::Blocks(blocks) = &message.content {
-                        for block in blocks {
-                            if let ContentBlock::ToolResult { content, .. } = block {
-                                let content_str = format_tool_result_for_export(content.as_ref());
-                                append_ledger_block(
-                                    &mut output,
-                                    "↳ Result",
-                                    &content_str,
-                                    NAME_WIDTH,
-                                );
-                                output.push('\n');
-                            }
+                if options.show_tools
+                    && let UserContent::Blocks(blocks) = &message.content
+                {
+                    for block in blocks {
+                        if let ContentBlock::ToolResult { content, .. } = block {
+                            let content_str = format_tool_result_for_export(content.as_ref());
+                            append_ledger_block(&mut output, "↳ Result", &content_str, NAME_WIDTH);
+                            output.push('\n');
                         }
                     }
                 }

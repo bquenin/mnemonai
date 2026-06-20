@@ -437,12 +437,12 @@ impl super::Provider for CursorAgentProvider {
     }
 
     fn delete(&self, conversation: &Conversation) -> Result<()> {
-        if let Some(transcript_dir) = transcript_parent_dir(&conversation.path, &conversation.id) {
-            if transcript_dir.exists() {
-                fs::remove_dir_all(transcript_dir)?;
-                delete_conversation(ProviderKind::CursorAgent, &conversation.path);
-                return Ok(());
-            }
+        if let Some(transcript_dir) = transcript_parent_dir(&conversation.path, &conversation.id)
+            && transcript_dir.exists()
+        {
+            fs::remove_dir_all(transcript_dir)?;
+            delete_conversation(ProviderKind::CursorAgent, &conversation.path);
+            return Ok(());
         }
 
         fs::remove_file(&conversation.path)?;
@@ -816,7 +816,7 @@ fn resolve_workspace_path(encoded_dir_name: &str, chats_dir: Option<&Path>) -> O
                 }
             }
             // Fall back to the longest path (most specific)
-            candidates.sort_by(|a, b| b.len().cmp(&a.len()));
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.len()));
             Some(PathBuf::from(candidates.into_iter().next().unwrap()))
         }
     }
