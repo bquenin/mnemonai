@@ -33,6 +33,11 @@ fn main() {
                 // User cancelled, exit silently
                 std::process::exit(0);
             }
+            // A consumer closing the pipe early (e.g. `mnemonai list | head`) is
+            // normal; exit quietly instead of printing a misleading error.
+            AppError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => {
+                std::process::exit(0);
+            }
             _ => {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -154,9 +159,23 @@ fn run() -> Result<()> {
     // Handle direct file input mode
     if let Some(ref input_file) = args.input_file {
         if !input_file.exists() {
+            // A bare word with no path separator or extension (e.g. `dump`,
+            // `search`, or a misspelled `list`) was likely meant as a
+            // subcommand, which clap routed to the legacy file positional.
+            let looks_like_subcommand = input_file
+                .to_str()
+                .is_some_and(|name| !name.contains(['/', '\\', '.']));
+            let message = if looks_like_subcommand {
+                format!(
+                    "File not found: {} (if you meant a subcommand, see `mnemonai --help`)",
+                    input_file.display()
+                )
+            } else {
+                format!("File not found: {}", input_file.display())
+            };
             return Err(AppError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("File not found: {}", input_file.display()),
+                message,
             )));
         }
         if !input_file.is_file() {

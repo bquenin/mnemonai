@@ -38,6 +38,19 @@ pub enum ProviderKind {
     CursorAgent,
 }
 
+impl ProviderKind {
+    /// Stable lowercase key used in the cache schema and the headless JSON
+    /// output. Keep these strings stable; consumers depend on them.
+    pub fn key(&self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "claude",
+            ProviderKind::Codex => "codex",
+            ProviderKind::Cursor => "cursor",
+            ProviderKind::CursorAgent => "cursor-agent",
+        }
+    }
+}
+
 /// Represents a JSONL parsing error with context for debugging
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ParseError {

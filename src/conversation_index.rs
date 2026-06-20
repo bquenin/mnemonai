@@ -100,7 +100,7 @@ where
             )",
         )?;
 
-        let provider_key = provider_key(&provider);
+        let provider_key = provider.key();
         let show_last = i64::from(show_last);
 
         for (conversation, fingerprint) in entries {
@@ -164,7 +164,7 @@ pub fn prune_conversations(provider: ProviderKind, paths: &[PathBuf]) {
     for path in paths {
         let _ = tx.execute(
             "DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2",
-            params![provider_key(&provider), path.to_string_lossy()],
+            params![provider.key(), path.to_string_lossy()],
         );
     }
     let _ = tx.commit();
@@ -177,7 +177,7 @@ fn delete_conversation_from_conn(
 ) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2",
-        params![provider_key(&provider), path.to_string_lossy()],
+        params![provider.key(), path.to_string_lossy()],
     )?;
     Ok(())
 }
@@ -197,11 +197,7 @@ fn load_provider_cache_from_conn(
     )?;
 
     let rows = stmt.query_map(
-        params![
-            SCHEMA_VERSION,
-            provider_key(&provider),
-            i64::from(show_last)
-        ],
+        params![SCHEMA_VERSION, provider.key(), i64::from(show_last)],
         |row| {
             let source_path: String = row.get(0)?;
             let timestamp: String = row.get(4)?;
@@ -362,15 +358,6 @@ fn table_matches_expected_columns(conn: &Connection) -> rusqlite::Result<bool> {
             .iter()
             .map(String::as_str)
             .eq(expected.iter().copied()))
-}
-
-fn provider_key(provider: &ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Claude => "claude",
-        ProviderKind::Codex => "codex",
-        ProviderKind::Cursor => "cursor",
-        ProviderKind::CursorAgent => "cursor-agent",
-    }
 }
 
 fn system_time_to_millis(time: SystemTime) -> i64 {

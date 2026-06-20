@@ -1,3 +1,4 @@
+use crate::history::ProviderKind;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt;
 use std::path::PathBuf;
@@ -178,6 +179,18 @@ pub enum ProviderFilter {
     Codex,
     Cursor,
     CursorAgent,
+}
+
+impl ProviderFilter {
+    /// The provider kind this filter selects.
+    pub fn kind(self) -> ProviderKind {
+        match self {
+            ProviderFilter::Claude => ProviderKind::Claude,
+            ProviderFilter::Codex => ProviderKind::Codex,
+            ProviderFilter::Cursor => ProviderKind::Cursor,
+            ProviderFilter::CursorAgent => ProviderKind::CursorAgent,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]

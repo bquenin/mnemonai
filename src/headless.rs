@@ -62,6 +62,8 @@ struct MessageDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     subtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<Value>,
@@ -80,6 +82,7 @@ impl MessageDto {
             model: None,
             agent_id: None,
             subtype: None,
+            level: None,
             duration_ms: None,
             source: None,
         }
@@ -144,7 +147,7 @@ fn run_show(
         .ok_or_else(|| {
             AppError::CommandError(format!(
                 "No provider found for {} conversation",
-                provider_key(&conversation.provider)
+                conversation.provider.key()
             ))
         })?;
     let entries = provider.read_entries(conversation)?;
@@ -298,7 +301,7 @@ fn resolve_conversation<'a>(
                 .map(|conversation| {
                     format!(
                         "{}:{} ({})",
-                        provider_key(&conversation.provider),
+                        conversation.provider.key(),
                         conversation.id,
                         conversation.path.display()
                     )
@@ -306,7 +309,8 @@ fn resolve_conversation<'a>(
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(AppError::CommandError(format!(
-                "Ambiguous conversation target '{}'; matches: {}",
+                "Ambiguous conversation target '{}'; matches: {}. \
+                 Pass --provider <name> to disambiguate.",
                 target, rendered
             )))
         }
@@ -325,7 +329,7 @@ fn path_matches(path: &Path, target: &Path, target_canonical: Option<&Path>) -> 
 impl ConversationSummary {
     fn from_conversation(conversation: &Conversation) -> Self {
         Self {
-            provider: provider_key(&conversation.provider),
+            provider: conversation.provider.key(),
             id: conversation.id.clone(),
             path: conversation.path.to_string_lossy().to_string(),
             timestamp: conversation.timestamp.to_rfc3339(),
@@ -385,7 +389,9 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
             } => {
                 let mut message = MessageDto::new("system", None);
                 message.subtype = Some(subtype.clone());
-                message.text = level.clone();
+                // `level` is a log severity ("info"/"warning"/...), not chat
+                // content, so keep it out of the `text` field consumers read.
+                message.level = level.clone();
                 message.duration_ms = *duration_ms;
                 messages.push(message);
             }
@@ -505,40 +511,46 @@ fn tool_result_text(content: Option<&Value>) -> Option<String> {
     }
 }
 
+fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut buf = serde_json::to_vec_pretty(value)?;
+    buf.push(b'\n');
+    Ok(buf)
+}
+
+/// Serialize each value as a compact JSON object on its own line (JSONL).
+fn jsonl_bytes<T: Serialize>(values: &[T]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    for value in values {
+        serde_json::to_writer(&mut buf, value)?;
+        buf.push(b'\n');
+    }
+    Ok(buf)
+}
+
 fn write_json<T: Serialize>(value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    serde_json::to_writer_pretty(&mut handle, value)?;
-    writeln!(handle)?;
-    Ok(())
+    write_stdout(&json_bytes(value)?)
 }
 
 fn write_jsonl<T: Serialize>(values: &[T]) -> Result<()> {
+    write_stdout(&jsonl_bytes(values)?)
+}
+
+/// Write a fully-serialized buffer to stdout in a single call.
+///
+/// Serializing into memory first means a closed downstream pipe (e.g.
+/// `mnemonai list | head`) surfaces as a plain `io::ErrorKind::BrokenPipe` from
+/// this one `write_all` rather than a misleading "JSON parsing error", letting
+/// `main` exit cleanly.
+fn write_stdout(buf: &[u8]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    for value in values {
-        serde_json::to_writer(&mut handle, value)?;
-        writeln!(handle)?;
-    }
+    handle.write_all(buf)?;
+    handle.flush()?;
     Ok(())
 }
 
 fn provider_filter_matches(filter: Option<ProviderFilter>, kind: &ProviderKind) -> bool {
-    filter.is_none_or(|filter| match filter {
-        ProviderFilter::Claude => kind == &ProviderKind::Claude,
-        ProviderFilter::Codex => kind == &ProviderKind::Codex,
-        ProviderFilter::Cursor => kind == &ProviderKind::Cursor,
-        ProviderFilter::CursorAgent => kind == &ProviderKind::CursorAgent,
-    })
-}
-
-fn provider_key(kind: &ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Claude => "claude",
-        ProviderKind::Codex => "codex",
-        ProviderKind::Cursor => "cursor",
-        ProviderKind::CursorAgent => "cursor-agent",
-    }
+    filter.is_none_or(|filter| &filter.kind() == kind)
 }
 
 fn optional_path_to_string(path: Option<&PathBuf>) -> Option<String> {
@@ -659,5 +671,197 @@ mod tests {
         };
 
         assert!(err.to_string().contains("Ambiguous conversation target"));
+    }
+
+    #[test]
+    fn ambiguity_error_suggests_provider() {
+        let conversations = vec![
+            conversation("same", "/tmp/a.jsonl", ProviderKind::Claude),
+            conversation("same", "/tmp/b.jsonl", ProviderKind::Codex),
+        ];
+
+        let err = match resolve_conversation(&conversations, "same") {
+            Ok(_) => panic!("expected ambiguous conversation error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("--provider"));
+    }
+
+    #[test]
+    fn resolves_by_path_and_file_stem() {
+        let conversations = vec![
+            conversation("id-a", "/tmp/sess-a.jsonl", ProviderKind::Claude),
+            conversation("id-b", "/tmp/sess-b.jsonl", ProviderKind::Codex),
+        ];
+
+        let by_path = resolve_conversation(&conversations, "/tmp/sess-b.jsonl").unwrap();
+        assert_eq!(by_path.id, "id-b");
+
+        let by_stem = resolve_conversation(&conversations, "sess-a").unwrap();
+        assert_eq!(by_stem.id, "id-a");
+    }
+
+    #[test]
+    fn rejects_unknown_target() {
+        let conversations = vec![conversation(
+            "id-a",
+            "/tmp/sess-a.jsonl",
+            ProviderKind::Claude,
+        )];
+
+        let err = match resolve_conversation(&conversations, "does-not-exist") {
+            Ok(_) => panic!("expected no-conversation error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("No conversation found"));
+    }
+
+    #[test]
+    fn normalizes_system_image_tool_result_and_summary_entries() {
+        let entries = vec![
+            LogEntry::Summary {
+                summary: "Session title".to_string(),
+            },
+            // Blank user text is dropped rather than emitted as an empty message.
+            LogEntry::User {
+                message: UserMessage {
+                    role: "user".to_string(),
+                    content: UserContent::String("   ".to_string()),
+                },
+                timestamp: "2026-06-19T10:00:00-07:00".to_string(),
+                uuid: None,
+                cwd: None,
+            },
+            LogEntry::Assistant {
+                message: AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "t1".to_string(),
+                            content: Some(serde_json::json!([
+                                {"type": "text", "text": "line one"},
+                                {"type": "text", "text": "line two"},
+                            ])),
+                        },
+                        ContentBlock::Image {
+                            source: serde_json::json!({"type": "base64", "media_type": "image/png"}),
+                        },
+                    ],
+                    model: Some("claude-test".to_string()),
+                    usage: None,
+                    id: None,
+                },
+                timestamp: "2026-06-19T10:00:01-07:00".to_string(),
+                uuid: None,
+            },
+            LogEntry::System {
+                subtype: "turn_duration".to_string(),
+                level: Some("warning".to_string()),
+                duration_ms: Some(1234),
+                parent_uuid: None,
+                extra: serde_json::Value::Null,
+            },
+        ];
+
+        let messages = messages_from_entries(&entries);
+
+        let roles: Vec<_> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["summary", "tool_result", "image", "system"]);
+
+        assert_eq!(messages[0].text.as_deref(), Some("Session title"));
+
+        assert_eq!(messages[1].text.as_deref(), Some("line one\n\nline two"));
+        assert!(messages[1].tool_result.is_some());
+
+        assert!(messages[2].source.is_some());
+
+        let system = &messages[3];
+        assert_eq!(system.subtype.as_deref(), Some("turn_duration"));
+        assert_eq!(system.level.as_deref(), Some("warning"));
+        assert_eq!(system.duration_ms, Some(1234));
+        assert!(
+            system.text.is_none(),
+            "system log level must not leak into the text field"
+        );
+    }
+
+    #[test]
+    fn jsonl_bytes_emit_one_compact_object_per_line() {
+        let summaries = vec![
+            ConversationSummary::from_conversation(&conversation(
+                "a",
+                "/tmp/a.jsonl",
+                ProviderKind::Claude,
+            )),
+            ConversationSummary::from_conversation(&conversation(
+                "b",
+                "/tmp/b.jsonl",
+                ProviderKind::Codex,
+            )),
+        ];
+
+        let text = String::from_utf8(jsonl_bytes(&summaries).unwrap()).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            !text.trim_start().starts_with('['),
+            "JSONL must not be an array"
+        );
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["id"], "a");
+        assert_eq!(second["id"], "b");
+    }
+
+    #[test]
+    fn provider_filter_matches_expected_kinds() {
+        assert!(provider_filter_matches(None, &ProviderKind::Cursor));
+        assert!(provider_filter_matches(
+            Some(ProviderFilter::Codex),
+            &ProviderKind::Codex
+        ));
+        assert!(!provider_filter_matches(
+            Some(ProviderFilter::Codex),
+            &ProviderKind::Claude
+        ));
+        assert!(provider_filter_matches(
+            Some(ProviderFilter::CursorAgent),
+            &ProviderKind::CursorAgent
+        ));
+    }
+
+    #[test]
+    fn show_reads_and_normalizes_a_claude_jsonl_file() {
+        use crate::providers::Provider;
+        use crate::providers::claude::ClaudeProvider;
+
+        let path = std::env::temp_dir().join(format!(
+            "mnemonai-headless-show-{}.jsonl",
+            std::process::id()
+        ));
+        let contents = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hello there"},"timestamp":"2026-06-19T10:00:00-07:00"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"model":"claude-test"},"timestamp":"2026-06-19T10:00:01-07:00"}"#,
+            "\n",
+        );
+        std::fs::write(&path, contents).unwrap();
+
+        let conversation = conversation("rt-id", path.to_str().unwrap(), ProviderKind::Claude);
+        let provider = ClaudeProvider::new(vec![]);
+        let entries = provider.read_entries(&conversation).unwrap();
+        let messages = messages_from_entries(&entries);
+
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].text.as_deref(), Some("hello there"));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].text.as_deref(), Some("hi back"));
+        assert_eq!(messages[1].model.as_deref(), Some("claude-test"));
     }
 }
