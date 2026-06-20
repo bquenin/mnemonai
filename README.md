@@ -73,6 +73,11 @@ whose recorded `cwd` or `project_path` is at or under the path. Output is JSON b
 default; on errors (no match, ambiguous target) the command prints a message to
 stderr and exits non-zero.
 
+Headless output depends only on these flags, never on the config file: unlike the
+interactive TUI, `list`/`show` ignore the config's `local`, `exclude`, and
+`show_deleted_projects` settings so scripts and skills get the same result on any
+machine. Pass `--local` / `--show-deleted-projects` explicitly when you want them.
+
 ### `list` output — conversation summary
 
 Each conversation is an object with these fields (nullable fields are omitted
