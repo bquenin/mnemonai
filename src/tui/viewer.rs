@@ -4,7 +4,9 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent};
+use crate::claude::{
+    AssistantMessage, ContentBlock, LogEntry, UserContent, extract_tool_result_text,
+};
 use crate::text_processing::{process_command_message, short_agent_id};
 use crate::tool_format;
 use crate::tui::app::{LineStyle, RenderedLine};
@@ -238,28 +240,6 @@ fn render_user_message(
 
     if printed {
         lines.push(RenderedLine { spans: vec![] }); // Empty line after message
-    }
-}
-
-/// Extract text content from tool result for markdown rendering.
-/// Returns Some(text) if content is a string or array of text blocks.
-/// Returns None for JSON structures that should be pretty-printed instead.
-fn extract_tool_result_text(content: Option<&serde_json::Value>) -> Option<String> {
-    match content {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Array(arr)) => {
-            // Handle array of content blocks (e.g., [{type: "text", text: "..."}])
-            let texts: Vec<&str> = arr
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                Some(texts.join("\n\n"))
-            } else {
-                None // Array without text blocks - render as JSON
-            }
-        }
-        _ => None, // Objects, null, etc. - render as JSON
     }
 }
 

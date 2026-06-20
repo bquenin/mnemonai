@@ -3,7 +3,7 @@
 //! File-backed providers use this sidecar database to skip reparsing unchanged
 //! JSONL transcripts and to reuse lowercased search text on warm starts.
 
-use crate::history::{Conversation, ProviderKind};
+use crate::history::{Conversation, ProviderKind, path_to_string};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -119,8 +119,8 @@ where
                 conversation.preview,
                 conversation.full_text,
                 conversation.project_name.as_deref(),
-                path_to_string(conversation.project_path.as_ref()),
-                path_to_string(conversation.cwd.as_ref()),
+                path_to_string(conversation.project_path.as_deref()),
+                path_to_string(conversation.cwd.as_deref()),
                 conversation.message_count as i64,
                 parse_errors_json,
                 conversation.summary.as_deref(),
@@ -364,10 +364,6 @@ fn system_time_to_millis(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
-}
-
-fn path_to_string(path: Option<&PathBuf>) -> Option<String> {
-    path.map(|path| path.to_string_lossy().to_string())
 }
 
 fn optional_path(path: Option<String>) -> Option<PathBuf> {

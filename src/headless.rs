@@ -1,12 +1,17 @@
-use crate::claude::{AgentContent, ContentBlock, LogEntry, UserContent, parse_agent_progress};
+use crate::claude::{
+    AgentContent, ContentBlock, LogEntry, UserContent, extract_tool_result_text,
+    parse_agent_progress,
+};
 use crate::cli::{Command, DebugLevel, ListCommand, ProviderFilter, ShowCommand};
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, LoaderMessage, ParseError, ProviderKind, project_path_is_live};
+use crate::history::{
+    Conversation, LoaderMessage, ParseError, path_to_string, project_path_is_live,
+};
 use crate::providers::Provider;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct HeadlessSettings {
     pub cli_local: bool,
@@ -169,7 +174,7 @@ fn load_conversations(
     let local = command_local || settings.cli_local || settings.config_local;
     let show_deleted_projects = command_show_deleted || settings.show_deleted_projects;
     let mut conversations = if local {
-        load_local_conversations(
+        crate::loader::load_local(
             providers,
             settings.show_last,
             settings.debug,
@@ -210,7 +215,7 @@ fn load_global_conversations(
     let mut conversations = Vec::new();
 
     for provider in providers {
-        if !provider_filter_matches(provider_filter, &provider.kind()) {
+        if !crate::loader::provider_filter_matches(provider_filter, &provider.kind()) {
             continue;
         }
 
@@ -227,41 +232,6 @@ fn load_global_conversations(
                     break;
                 }
             }
-        }
-    }
-
-    Ok(conversations)
-}
-
-fn load_local_conversations(
-    providers: &[Box<dyn Provider>],
-    show_last: bool,
-    debug: Option<DebugLevel>,
-    provider_filter: Option<ProviderFilter>,
-) -> Result<Vec<Conversation>> {
-    let current_dir = std::env::current_dir().map_err(|err| {
-        AppError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Failed to get current directory: {}", err),
-        ))
-    })?;
-
-    let mut conversations = Vec::new();
-    for provider in providers {
-        if !provider_filter_matches(provider_filter, &provider.kind()) {
-            continue;
-        }
-
-        if let Ok(mut provider_conversations) = provider.load_conversations(show_last, debug) {
-            if provider.kind() != ProviderKind::Claude {
-                provider_conversations.retain(|conversation| {
-                    conversation
-                        .project_path
-                        .as_ref()
-                        .is_some_and(|path| path == &current_dir)
-                });
-            }
-            conversations.extend(provider_conversations);
         }
     }
 
@@ -334,8 +304,8 @@ impl ConversationSummary {
             path: conversation.path.to_string_lossy().to_string(),
             timestamp: conversation.timestamp.to_rfc3339(),
             project_name: conversation.project_name.clone(),
-            project_path: optional_path_to_string(conversation.project_path.as_ref()),
-            cwd: optional_path_to_string(conversation.cwd.as_ref()),
+            project_path: path_to_string(conversation.project_path.as_deref()),
+            cwd: path_to_string(conversation.cwd.as_deref()),
             preview: conversation.preview.clone(),
             summary: conversation.summary.clone(),
             model: conversation.model.clone(),
@@ -457,7 +427,7 @@ fn push_content_block(
         }
         ContentBlock::ToolResult { content, .. } => {
             let mut message = MessageDto::new("tool_result", timestamp);
-            message.text = tool_result_text(content.as_ref());
+            message.text = extract_tool_result_text(content.as_ref());
             message.tool_result = content.clone();
             message.agent_id = agent_id.map(ToString::to_string);
             messages.push(message);
@@ -495,20 +465,6 @@ fn push_text_message(
     message.model = model.map(ToString::to_string);
     message.agent_id = agent_id.map(ToString::to_string);
     messages.push(message);
-}
-
-fn tool_result_text(content: Option<&Value>) -> Option<String> {
-    match content {
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Array(items)) => {
-            let texts: Vec<_> = items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .collect();
-            (!texts.is_empty()).then(|| texts.join("\n\n"))
-        }
-        _ => None,
-    }
 }
 
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -549,19 +505,13 @@ fn write_stdout(buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn provider_filter_matches(filter: Option<ProviderFilter>, kind: &ProviderKind) -> bool {
-    filter.is_none_or(|filter| &filter.kind() == kind)
-}
-
-fn optional_path_to_string(path: Option<&PathBuf>) -> Option<String> {
-    path.map(|path| path.to_string_lossy().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::claude::{AssistantMessage, TokenUsage, UserMessage};
+    use crate::history::ProviderKind;
     use chrono::{Local, TimeZone};
+    use std::path::PathBuf;
 
     fn conversation(id: &str, path: &str, provider: ProviderKind) -> Conversation {
         Conversation {
@@ -814,23 +764,6 @@ mod tests {
         let second: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["id"], "a");
         assert_eq!(second["id"], "b");
-    }
-
-    #[test]
-    fn provider_filter_matches_expected_kinds() {
-        assert!(provider_filter_matches(None, &ProviderKind::Cursor));
-        assert!(provider_filter_matches(
-            Some(ProviderFilter::Codex),
-            &ProviderKind::Codex
-        ));
-        assert!(!provider_filter_matches(
-            Some(ProviderFilter::Codex),
-            &ProviderKind::Claude
-        ));
-        assert!(provider_filter_matches(
-            Some(ProviderFilter::CursorAgent),
-            &ProviderKind::CursorAgent
-        ));
     }
 
     #[test]

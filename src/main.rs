@@ -8,6 +8,7 @@ mod display;
 mod error;
 mod headless;
 mod history;
+mod loader;
 mod markdown;
 mod pager;
 mod providers;
@@ -231,28 +232,7 @@ fn run() -> Result<()> {
         }
     } else {
         // Local mode - load from all providers for current directory
-        let current_dir = std::env::current_dir().map_err(|e| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Failed to get current directory: {}", e),
-            ))
-        })?;
-
-        let mut conversations = Vec::new();
-
-        for provider in &providers {
-            match provider.load_conversations(show_last, args.debug) {
-                Ok(mut convs) => {
-                    // For non-Claude providers, filter to current directory
-                    if provider.kind() != history::ProviderKind::Claude {
-                        convs
-                            .retain(|c| c.project_path.as_ref().is_some_and(|p| p == &current_dir));
-                    }
-                    conversations.extend(convs);
-                }
-                Err(_) => {} // Silently skip providers that fail in local mode
-            }
-        }
+        let mut conversations = loader::load_local(&providers, show_last, args.debug, None)?;
 
         // Sort merged conversations by timestamp (newest first) and re-index
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));

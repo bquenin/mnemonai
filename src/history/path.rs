@@ -6,6 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Lossily render an optional path as an optional string.
+pub fn path_to_string(path: Option<&Path>) -> Option<String> {
+    path.map(|path| path.to_string_lossy().to_string())
+}
+
 /// Convert the current working directory into Claude's project directory name.
 pub fn convert_path_to_project_dir_name(path: &Path) -> String {
     path.to_string_lossy()
