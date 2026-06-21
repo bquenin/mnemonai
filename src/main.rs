@@ -120,8 +120,14 @@ fn run() -> Result<()> {
     let show_deleted_projects =
         args.show_deleted_projects || display_config.show_deleted_projects.unwrap_or(false);
 
-    // Build provider registry
-    let exclude_paths = config.exclude.unwrap_or_default();
+    // Build provider registry. Headless output must depend only on CLI flags,
+    // never the config file, so scripts/skills get stable results regardless of
+    // the user's interactive `exclude` setting.
+    let exclude_paths = if args.command.is_some() {
+        Vec::new()
+    } else {
+        config.exclude.unwrap_or_default()
+    };
     let providers: Vec<Box<dyn Provider>> = vec![
         Box::new(providers::claude::ClaudeProvider::new(exclude_paths)),
         Box::new(providers::codex::CodexProvider::new()),
@@ -130,11 +136,12 @@ fn run() -> Result<()> {
     ];
 
     if let Some(ref command) = args.command {
+        // Flags only — ignore config-derived show_last / show_deleted_projects so
+        // headless output is reproducible across differently-configured machines.
         let settings = headless::HeadlessSettings {
             cli_local: args.local,
-            config_local: config.local.unwrap_or(false),
-            show_last,
-            show_deleted_projects,
+            show_last: resolve_bool_setting(args.last, args.first, None, false),
+            show_deleted_projects: args.show_deleted_projects,
             debug: args.debug,
         };
         return headless::run_command(command, &providers, &settings);

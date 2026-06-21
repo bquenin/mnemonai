@@ -27,7 +27,7 @@ Use subcommands for new machine-readable behavior while keeping existing flags
 working for interactive usage.
 
 ```text
-mnemonai list [--json|--jsonl] [--local] [--provider <name>] [--limit <n>] [--show-deleted-projects]
+mnemonai list [--json|--jsonl] [--local|--cwd <path>] [--provider <name>] [--since <duration>] [--after <timestamp>] [--before <timestamp>] [--limit <n>] [--show-deleted-projects]
 mnemonai show <id-or-path> [--json|--jsonl|--plain|--ledger] [--show-tools] [--show-thinking]
 mnemonai dump [--jsonl] [--local] [--provider <name>] [--since <duration>] [--limit <n>]
 mnemonai search <query> [--json|--jsonl] [--local] [--provider <name>] [--limit <n>]
@@ -77,13 +77,31 @@ Used by `show` and `dump --include-messages` if added.
   "conversation": { "provider": "claude", "id": "session-id" },
   "messages": [
     {
+      "index": 0,
+      "entry_index": 1,
       "role": "user",
       "timestamp": "2026-06-19T10:12:33-07:00",
-      "text": "message text",
-      "tool_name": null,
-      "tool_input": null,
-      "tool_result": null,
-      "thinking": null
+      "text": "message text"
+    },
+    {
+      "index": 1,
+      "entry_index": 2,
+      "block_index": 0,
+      "role": "tool_call",
+      "tool_call_id": "toolu_123",
+      "tool_name": "Bash",
+      "tool_input": { "command": "cargo test --all" }
+    },
+    {
+      "index": 2,
+      "entry_index": 3,
+      "block_index": 0,
+      "role": "tool_result",
+      "tool_call_id": "toolu_123",
+      "text": "test output",
+      "tool_result_status": "failed",
+      "tool_result_exit_code": 1,
+      "tool_result_error": true
     }
   ]
 }
@@ -91,6 +109,9 @@ Used by `show` and `dump --include-messages` if added.
 
 Keep the schema intentionally simple for skill consumption. Include raw source
 path and provider ID so a caller can re-open or resume with existing tools.
+For tool analysis, pair `tool_call` and `tool_result` messages by
+`tool_call_id` and use `index`, `entry_index`, and `block_index` to reconstruct
+the execution trace.
 
 ## Implementation Phases
 

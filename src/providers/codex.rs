@@ -623,6 +623,11 @@ fn process_tool_output_item(
         .or_else(|| item.get("result"))
         .cloned()
         .or(Some(Value::Null));
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let is_error = item.get("is_error").and_then(Value::as_bool);
     let timestamp = timestamp_string(timestamp, state.metadata_timestamp);
 
     state.entries.push(LogEntry::User {
@@ -631,6 +636,8 @@ fn process_tool_output_item(
             content: UserContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                is_error,
+                status,
             }]),
         },
         timestamp,
