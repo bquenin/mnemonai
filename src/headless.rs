@@ -706,11 +706,14 @@ fn status_is_error(status: &str) -> Option<bool> {
 }
 
 fn tool_result_exit_code(text: &str) -> Option<i32> {
-    const MARKER: &str = "Process exited with code ";
+    const MARKERS: &[&str] = &["Process exited with code ", "Exit code "];
 
     text.lines().take(8).find_map(|line| {
-        let rest = line.trim().strip_prefix(MARKER)?;
-        rest.split_whitespace().next()?.parse().ok()
+        let line = line.trim();
+        MARKERS.iter().find_map(|marker| {
+            let rest = line.strip_prefix(marker)?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
     })
 }
 
@@ -1296,6 +1299,23 @@ mod tests {
         );
         assert_eq!(
             tool_result_exit_code("Output:\n1\n2\n3\n4\n5\n6\n7\n8\nProcess exited with code 1"),
+            None,
+            "only provider metadata near the top of the result should be parsed"
+        );
+    }
+
+    #[test]
+    fn extracts_tool_result_exit_code_from_claude_output() {
+        assert_eq!(
+            tool_result_exit_code("Exit code 3\njq: syntax error"),
+            Some(3)
+        );
+        assert_eq!(
+            tool_result_exit_code("header\nExit code 1\nTraceback"),
+            Some(1)
+        );
+        assert_eq!(
+            tool_result_exit_code("Output:\n1\n2\n3\n4\n5\n6\n7\n8\nExit code 1"),
             None,
             "only provider metadata near the top of the result should be parsed"
         );
