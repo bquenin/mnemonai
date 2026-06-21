@@ -712,7 +712,12 @@ fn tool_result_exit_code(text: &str) -> Option<i32> {
         let line = line.trim();
         MARKERS.iter().find_map(|marker| {
             let rest = line.strip_prefix(marker)?;
-            rest.split_whitespace().next()?.parse().ok()
+            // Require the marker line to be exactly "<marker><integer>" with no
+            // trailing text, so prose like "Exit code 2 indicates a syntax error"
+            // is not misread as a real exit code.
+            let mut tokens = rest.split_whitespace();
+            let code = tokens.next()?.parse().ok()?;
+            tokens.next().is_none().then_some(code)
         })
     })
 }
@@ -1319,6 +1324,19 @@ mod tests {
             None,
             "only provider metadata near the top of the result should be parsed"
         );
+        assert_eq!(
+            tool_result_exit_code("Exit code 2 indicates a syntax error in the input file."),
+            None,
+            "prose that merely starts with the marker phrase must not parse as an exit code"
+        );
+        assert_eq!(
+            tool_result_exit_code("Exit code 1 (SIGHUP)"),
+            None,
+            "trailing annotations are not Claude's bare-marker format"
+        );
+        // Claude does not emit an "Exit code 0" success marker; when it does
+        // appear as a bare line it still parses (downstream treats 0 as success).
+        assert_eq!(tool_result_exit_code("Exit code 0"), Some(0));
     }
 
     #[test]
