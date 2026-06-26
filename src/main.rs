@@ -148,6 +148,7 @@ fn run() -> Result<()> {
         // headless output is reproducible across differently-configured machines.
         let settings = headless::HeadlessSettings {
             cli_local: args.local,
+            cli_global: args.global,
             show_last: resolve_bool_setting(args.last, args.first, None, false),
             show_deleted_projects: args.show_deleted_projects,
             debug: args.debug,

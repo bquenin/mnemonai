@@ -16,6 +16,7 @@ use std::path::Path;
 
 pub struct HeadlessSettings {
     pub cli_local: bool,
+    pub cli_global: bool,
     pub show_last: bool,
     pub show_deleted_projects: bool,
     pub debug: Option<DebugLevel>,
@@ -273,7 +274,11 @@ fn use_local_scope(settings: &HeadlessSettings, command_local: bool, force_globa
     // Headless commands default to global output even when the interactive TUI
     // config has `local = true`; scripts and skills need stable scope unless the
     // caller explicitly passes --local.
-    !force_global && (command_local || settings.cli_local)
+    //
+    // An explicit `--global` (cli_global) — like `--cwd`'s force_global, which
+    // loads everything before filtering by path — overrides any --local request,
+    // so `mnemonai --global list --local` returns global results as the flag promises.
+    !force_global && !settings.cli_global && (command_local || settings.cli_local)
 }
 
 fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListCommand) -> Result<()> {
@@ -1210,6 +1215,7 @@ mod tests {
     fn headless_scope_is_global_without_explicit_local_flag() {
         let settings = HeadlessSettings {
             cli_local: false,
+            cli_global: false,
             show_last: false,
             show_deleted_projects: false,
             debug: None,
@@ -1223,6 +1229,7 @@ mod tests {
 
         let cli_settings = HeadlessSettings {
             cli_local: true,
+            cli_global: false,
             show_last: false,
             show_deleted_projects: false,
             debug: None,
@@ -1232,6 +1239,25 @@ mod tests {
             !use_local_scope(&cli_settings, true, true),
             "--cwd must force global loading before cwd filtering"
         );
+    }
+
+    #[test]
+    fn global_flag_forces_global_scope_over_local() {
+        // `--global` must override a subcommand `--local` so the flag's promise to
+        // ignore directory scoping holds for `mnemonai --global list --local`.
+        let settings = HeadlessSettings {
+            cli_local: false,
+            cli_global: true,
+            show_last: false,
+            show_deleted_projects: false,
+            debug: None,
+        };
+
+        assert!(
+            !use_local_scope(&settings, true, false),
+            "--global must win over a subcommand --local"
+        );
+        assert!(!use_local_scope(&settings, false, false));
     }
 
     #[test]
