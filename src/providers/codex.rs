@@ -182,10 +182,6 @@ impl super::Provider for CodexProvider {
         "Codex"
     }
 
-    fn detect(&self) -> bool {
-        self.sessions_root().is_some_and(|root| root.exists())
-    }
-
     fn load_conversations(
         &self,
         show_last: bool,
@@ -401,7 +397,7 @@ fn process_codex_record(state: &mut CodexParseState, record: &Value, line_idx: u
         Some("function_call_output") | Some("custom_tool_call_output") => {
             process_tool_output_item(state, item, timestamp, line_idx)
         }
-        Some("reasoning") => process_reasoning_item(state, item, timestamp, line_idx),
+        Some("reasoning") => process_reasoning_item(state, item, timestamp),
         Some("token_count") => parse_token_count(state, item),
         _ => {}
     }
@@ -496,11 +492,9 @@ fn process_message_item(
     match role {
         "user" => state.entries.push(LogEntry::User {
             message: UserMessage {
-                role: "user".to_string(),
                 content: UserContent::Blocks(blocks),
             },
             timestamp,
-            uuid,
             cwd: state
                 .cwd
                 .as_ref()
@@ -508,14 +502,12 @@ fn process_message_item(
         }),
         "assistant" => state.entries.push(LogEntry::Assistant {
             message: AssistantMessage {
-                role: "assistant".to_string(),
                 content: blocks,
                 model: state.model.clone(),
                 usage: None,
                 id: uuid,
             },
             timestamp,
-            uuid: None,
         }),
         _ => {}
     }
@@ -595,14 +587,12 @@ fn push_tool_call_entry(
 
     state.entries.push(LogEntry::Assistant {
         message: AssistantMessage {
-            role: "assistant".to_string(),
             content: vec![ContentBlock::ToolUse { id, name, input }],
             model: state.model.clone(),
             usage: None,
             id: None,
         },
         timestamp,
-        uuid: None,
     });
 }
 
@@ -632,7 +622,6 @@ fn process_tool_output_item(
 
     state.entries.push(LogEntry::User {
         message: UserMessage {
-            role: "user".to_string(),
             content: UserContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -641,7 +630,6 @@ fn process_tool_output_item(
             }]),
         },
         timestamp,
-        uuid: None,
         cwd: state
             .cwd
             .as_ref()
@@ -653,7 +641,6 @@ fn process_reasoning_item(
     state: &mut CodexParseState,
     item: &Value,
     timestamp: Option<DateTime<FixedOffset>>,
-    line_idx: usize,
 ) {
     let Some(summary) = item
         .get("summary")
@@ -666,17 +653,12 @@ fn process_reasoning_item(
 
     state.entries.push(LogEntry::Assistant {
         message: AssistantMessage {
-            role: "assistant".to_string(),
-            content: vec![ContentBlock::Thinking {
-                thinking: summary,
-                signature: format!("codex-thinking-{}", line_idx),
-            }],
+            content: vec![ContentBlock::Thinking { thinking: summary }],
             model: state.model.clone(),
             usage: None,
             id: None,
         },
         timestamp,
-        uuid: None,
     });
 }
 

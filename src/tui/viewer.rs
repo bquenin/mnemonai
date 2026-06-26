@@ -133,7 +133,7 @@ pub fn render_conversation(
 fn render_entry(lines: &mut Vec<RenderedLine>, entry: &LogEntry, options: &RenderOptions) {
     match entry {
         LogEntry::Summary { .. }
-        | LogEntry::FileHistorySnapshot { .. }
+        | LogEntry::FileHistorySnapshot
         | LogEntry::System { .. }
         | LogEntry::Unknown => {}
         LogEntry::Progress { data, .. } => {

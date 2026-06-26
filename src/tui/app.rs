@@ -175,48 +175,6 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new app with all conversations pre-loaded (existing behavior)
-    #[allow(dead_code)]
-    pub fn new(
-        mut conversations: Vec<Conversation>,
-        use_relative_time: bool,
-        tool_display: ToolDisplayMode,
-        show_thinking: bool,
-        show_deleted_projects: bool,
-    ) -> Self {
-        if !show_deleted_projects {
-            conversations.retain(|c| {
-                c.project_path
-                    .as_ref()
-                    .is_none_or(|p| project_path_is_live(p))
-            });
-        }
-        let searchable = search::precompute_search_text(&mut conversations);
-        let filtered: Vec<usize> = (0..conversations.len()).collect();
-        let selected = if filtered.is_empty() { None } else { Some(0) };
-
-        Self {
-            conversations,
-            searchable,
-            filtered,
-            selected,
-            query: String::new(),
-            query_words: Vec::new(),
-            cursor_pos: 0,
-            use_relative_time,
-            loading_state: LoadingState::Ready,
-            dialog_mode: DialogMode::None,
-            app_mode: AppMode::List,
-            status_message: None,
-            tool_display,
-            show_thinking,
-            show_timing: false,
-            single_file_mode: false,
-            previous_query: String::new(),
-            show_deleted_projects,
-        }
-    }
-
     /// Create a new app in loading state
     pub fn new_loading(
         use_relative_time: bool,
@@ -1878,6 +1836,33 @@ mod tests {
         }
     }
 
+    fn app_with_conversations(mut conversations: Vec<Conversation>) -> App {
+        let searchable = search::precompute_search_text(&mut conversations);
+        let filtered: Vec<usize> = (0..conversations.len()).collect();
+        let selected = if filtered.is_empty() { None } else { Some(0) };
+
+        App {
+            conversations,
+            searchable,
+            filtered,
+            selected,
+            query: String::new(),
+            query_words: Vec::new(),
+            cursor_pos: 0,
+            use_relative_time: false,
+            loading_state: LoadingState::Ready,
+            dialog_mode: DialogMode::None,
+            app_mode: AppMode::List,
+            status_message: None,
+            tool_display: ToolDisplayMode::Hidden,
+            show_thinking: false,
+            show_timing: false,
+            single_file_mode: false,
+            previous_query: String::new(),
+            show_deleted_projects: true,
+        }
+    }
+
     /// Typing a query one keystroke at a time must find the same conversations
     /// as entering it at once. The narrow-on-extend optimization used to narrow
     /// from the `"auth "` state, whose trailing term is whole-word constrained —
@@ -1889,7 +1874,7 @@ mod tests {
             make_conv("authentication flow setup", 0),
             make_conv("auth flow setup", 1),
         ];
-        let mut app = App::new(convs, false, ToolDisplayMode::Hidden, false, true);
+        let mut app = app_with_conversations(convs);
 
         type_query(&mut app, "auth flow");
 
@@ -1910,7 +1895,7 @@ mod tests {
             make_conv("authentication flow setup", 0),
             make_conv("auth flow setup", 1),
         ];
-        let mut app = App::new(convs, false, ToolDisplayMode::Hidden, false, true);
+        let mut app = app_with_conversations(convs);
 
         type_query(&mut app, "auth ");
 

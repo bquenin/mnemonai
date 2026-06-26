@@ -539,7 +539,7 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
                 message.duration_ms = *duration_ms;
                 push_message(&mut messages, message);
             }
-            LogEntry::FileHistorySnapshot { .. } | LogEntry::Unknown => {}
+            LogEntry::FileHistorySnapshot | LogEntry::Unknown => {}
         }
     }
     messages
@@ -782,16 +782,13 @@ mod tests {
         let entries = vec![
             LogEntry::User {
                 message: UserMessage {
-                    role: "user".to_string(),
                     content: UserContent::String("run tests".to_string()),
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
-                uuid: None,
                 cwd: None,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
-                    role: "assistant".to_string(),
                     content: vec![
                         ContentBlock::Text {
                             text: "I'll run them.".to_string(),
@@ -803,7 +800,6 @@ mod tests {
                         },
                         ContentBlock::Thinking {
                             thinking: "Need to verify failures.".to_string(),
-                            signature: "sig".to_string(),
                         },
                     ],
                     model: Some("claude-test".to_string()),
@@ -811,7 +807,6 @@ mod tests {
                     id: None,
                 },
                 timestamp: "2026-06-19T10:00:01-07:00".to_string(),
-                uuid: None,
             },
         ];
 
@@ -915,16 +910,13 @@ mod tests {
             // Blank user text is dropped rather than emitted as an empty message.
             LogEntry::User {
                 message: UserMessage {
-                    role: "user".to_string(),
                     content: UserContent::String("   ".to_string()),
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
-                uuid: None,
                 cwd: None,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
-                    role: "assistant".to_string(),
                     content: vec![
                         ContentBlock::ToolResult {
                             tool_use_id: "t1".to_string(),
@@ -944,14 +936,11 @@ mod tests {
                     id: None,
                 },
                 timestamp: "2026-06-19T10:00:01-07:00".to_string(),
-                uuid: None,
             },
             LogEntry::System {
                 subtype: "turn_duration".to_string(),
                 level: Some("warning".to_string()),
                 duration_ms: Some(1234),
-                parent_uuid: None,
-                extra: serde_json::Value::Null,
             },
         ];
 
@@ -1128,7 +1117,6 @@ mod tests {
     fn user_block_messages_get_block_index() {
         let entries = vec![LogEntry::User {
             message: UserMessage {
-                role: "user".to_string(),
                 content: UserContent::Blocks(vec![
                     ContentBlock::Text {
                         text: "look at this".to_string(),
@@ -1139,7 +1127,6 @@ mod tests {
                 ]),
             },
             timestamp: "2026-06-19T10:00:00-07:00".to_string(),
-            uuid: None,
             cwd: None,
         }];
 
@@ -1315,7 +1302,6 @@ mod tests {
     fn infers_tool_result_error_from_exit_code() {
         let entries = vec![LogEntry::Assistant {
             message: AssistantMessage {
-                role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::ToolResult {
                         tool_use_id: "fail".to_string(),
@@ -1341,7 +1327,6 @@ mod tests {
                 id: None,
             },
             timestamp: "2026-06-19T10:00:01-07:00".to_string(),
-            uuid: None,
         }];
 
         let messages = messages_from_entries(&entries);

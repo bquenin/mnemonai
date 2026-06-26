@@ -317,24 +317,6 @@ pub fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Projec
     Ok(projects)
 }
 
-/// Find and process all conversation files in one pass
-#[allow(dead_code)]
-pub fn load_conversations(
-    projects_dir: &Path,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
-    let (conversations, fresh) =
-        load_conversations_with_cache(projects_dir, show_last, debug_level, &cache)?;
-    save_conversations(
-        ProviderKind::Claude,
-        show_last,
-        fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
-    );
-    Ok(conversations)
-}
-
 /// Conversations loaded from one project, paired with the freshly parsed
 /// (cache-miss) ones the caller should persist in a single batch.
 type ProjectLoad = (Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>);

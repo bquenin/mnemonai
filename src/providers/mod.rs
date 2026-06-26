@@ -8,11 +8,9 @@ use crate::error::Result;
 use crate::history::{Conversation, LoaderMessage, ProviderKind};
 use std::sync::mpsc::Receiver;
 
-#[allow(dead_code)]
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn name(&self) -> &str;
-    fn detect(&self) -> bool;
 
     /// Load conversations (synchronous, for single-project mode)
     fn load_conversations(

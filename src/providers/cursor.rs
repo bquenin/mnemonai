@@ -874,10 +874,6 @@ impl super::Provider for CursorProvider {
         "Cursor (IDE)"
     }
 
-    fn detect(&self) -> bool {
-        self.global_db_path.exists()
-    }
-
     fn load_conversations(
         &self,
         show_last: bool,

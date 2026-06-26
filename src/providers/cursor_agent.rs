@@ -63,8 +63,6 @@ struct CursorAgentTranscriptBlock {
     #[serde(default)]
     thinking: Option<String>,
     #[serde(default)]
-    signature: Option<String>,
-    #[serde(default)]
     source: Option<Value>,
     #[serde(default)]
     content: Option<Value>,
@@ -270,10 +268,6 @@ impl super::Provider for CursorAgentProvider {
 
     fn name(&self) -> &str {
         "Cursor Agent CLI"
-    }
-
-    fn detect(&self) -> bool {
-        self.projects_root.exists()
     }
 
     fn load_conversations(
@@ -639,23 +633,19 @@ fn parse_transcript_line(
     let entry = match role.as_str() {
         "user" => LogEntry::User {
             message: UserMessage {
-                role: "user".to_string(),
                 content: UserContent::Blocks(blocks),
             },
             timestamp: timestamp_str,
-            uuid: None,
             cwd: workspace_path.map(|path| path.to_string_lossy().to_string()),
         },
         "assistant" => LogEntry::Assistant {
             message: AssistantMessage {
-                role: "assistant".to_string(),
                 content: blocks,
                 model: None,
                 usage: None,
                 id: None,
             },
             timestamp: timestamp_str,
-            uuid: None,
         },
         _ => return Ok(None),
     };
@@ -706,10 +696,6 @@ fn block_to_content_block(
         }),
         "thinking" => Some(ContentBlock::Thinking {
             thinking: block.thinking.clone().unwrap_or_default(),
-            signature: block
-                .signature
-                .clone()
-                .unwrap_or_else(|| format!("cursor-agent-thinking-{}-{}", line_idx, block_idx)),
         }),
         "image" => block.source.as_ref().map(|source| ContentBlock::Image {
             source: source.clone(),

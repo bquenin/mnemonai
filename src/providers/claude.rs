@@ -25,13 +25,6 @@ impl super::Provider for ClaudeProvider {
         "Claude Code"
     }
 
-    fn detect(&self) -> bool {
-        // Claude is always available if ~/.claude/projects exists
-        history::get_claude_projects_root()
-            .map(|p| p.exists())
-            .unwrap_or(false)
-    }
-
     fn load_conversations(
         &self,
         show_last: bool,
