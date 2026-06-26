@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct HeadlessSettings {
     pub cli_local: bool,
@@ -283,14 +283,18 @@ fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListComma
         .as_deref()
         .map(|value| parse_timestamp_filter(value, "--before"))
         .transpose()?;
-    let cwd_roots = command.cwd.as_deref().map(filter_path_roots).transpose()?;
+    let cwd_roots = command
+        .cwd
+        .as_deref()
+        .map(crate::loader::filter_path_roots)
+        .transpose()?;
 
     conversations.retain(|conversation| {
         after.is_none_or(|after| conversation.timestamp >= after)
             && before.is_none_or(|before| conversation.timestamp < before)
             && cwd_roots
                 .as_ref()
-                .is_none_or(|roots| conversation_matches_cwd(conversation, roots))
+                .is_none_or(|roots| crate::loader::conversation_matches_scope(conversation, roots))
     });
 
     Ok(())
@@ -372,45 +376,6 @@ fn invalid_timestamp(value: &str, flag: &str) -> AppError {
         "Invalid {} value '{}'; expected RFC 3339 or YYYY-MM-DD",
         flag, value
     ))
-}
-
-/// Candidate root forms for a `--cwd` filter: the absolutized literal path and,
-/// when it resolves, its canonical (symlink-resolved) form. A conversation path
-/// is matched against both because a recorded cwd that no longer exists on disk
-/// can't be canonicalized, so it would otherwise fail to match a canonical root
-/// even when it is genuinely under the path (e.g. `/tmp` vs `/private/tmp`).
-fn filter_path_roots(path: &Path) -> Result<Vec<PathBuf>> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    let mut roots = Vec::with_capacity(2);
-    if let Ok(canonical) = absolute.canonicalize()
-        && canonical != absolute
-    {
-        roots.push(canonical);
-    }
-    roots.push(absolute);
-    Ok(roots)
-}
-
-fn conversation_matches_cwd(conversation: &Conversation, roots: &[PathBuf]) -> bool {
-    conversation
-        .cwd
-        .as_ref()
-        .into_iter()
-        .chain(conversation.project_path.as_ref())
-        .any(|path| path_at_or_under(path, roots))
-}
-
-fn path_at_or_under(path: &Path, roots: &[PathBuf]) -> bool {
-    let canonical = path.canonicalize();
-    let candidates = canonical.iter().map(PathBuf::as_path).chain([path]);
-    candidates
-        .into_iter()
-        .any(|candidate| roots.iter().any(|root| candidate.starts_with(root)))
 }
 
 fn reindex_conversations(conversations: &mut [Conversation]) {

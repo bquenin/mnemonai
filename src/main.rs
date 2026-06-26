@@ -116,7 +116,15 @@ fn run() -> Result<()> {
         display_config.pager,
         std::io::stdout().is_terminal(),
     );
-    let use_global = !args.local && !config.local.unwrap_or(false);
+    let use_global = if args.global {
+        true
+    } else if args.local {
+        false
+    } else {
+        // New interactive default: scope to the current directory tree. An
+        // explicit `local = false` config keeps the previous global startup.
+        config.local == Some(false)
+    };
     let show_deleted_projects =
         args.show_deleted_projects || display_config.show_deleted_projects.unwrap_or(false);
 
@@ -238,34 +246,31 @@ fn run() -> Result<()> {
             (tui::Action::Delete(_), _) => unreachable!("Delete is handled internally"),
         }
     } else {
-        // Local mode - load from all providers for current directory
-        let mut conversations = loader::load_local(&providers, show_last, args.debug, None)?;
+        // Current-directory-tree mode - merge streaming loaders, then filter
+        // batches before they enter the TUI.
+        let current_dir = std::env::current_dir()?;
+        let scope_roots = loader::filter_path_roots(&current_dir)?;
+        let receivers: Vec<_> = providers
+            .iter()
+            .map(|p| p.load_conversations_streaming(show_last, args.debug))
+            .collect();
+        let rx = loader::filter_loader_messages(merge_streaming_loaders(receivers), scope_roots);
 
-        // Sort merged conversations by timestamp (newest first) and re-index
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        for (idx, conv) in conversations.iter_mut().enumerate() {
-            conv.index = idx;
-        }
-
-        if conversations.is_empty() {
-            return Err(AppError::NoHistoryFound("selected scope".to_string()));
-        }
-
-        match tui::run(
-            conversations.clone(),
+        match tui::run_with_loader(
+            rx,
             use_relative_time,
             tool_display,
             show_thinking,
             show_deleted_projects,
             &providers,
         )? {
-            tui::Action::Select(path) => (conversations, path),
-            tui::Action::Resume(path) => {
-                resume_conversation(&conversations, &path, &providers, default_args)?;
+            (tui::Action::Select(path), convs) => (convs, path),
+            (tui::Action::Resume(path), convs) => {
+                resume_conversation(&convs, &path, &providers, default_args)?;
                 return Ok(());
             }
-            tui::Action::Quit => return Err(AppError::SelectionCancelled),
-            tui::Action::Delete(_) => unreachable!("Delete is handled internally"),
+            (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
+            (tui::Action::Delete(_), _) => unreachable!("Delete is handled internally"),
         }
     };
 

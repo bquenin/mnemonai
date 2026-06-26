@@ -33,10 +33,13 @@ curl -fsSL https://raw.githubusercontent.com/bquenin/mnemonai/main/scripts/insta
 ## Usage
 
 ```bash
-# Launch the TUI (shows all conversations across all providers)
+# Launch the TUI scoped to the current directory tree
 mnemonai
 
-# Only show conversations from the current project directory
+# Show all conversations across all providers
+mnemonai --global
+
+# Force current-directory-tree scope even when config sets local = false
 mnemonai --local
 ```
 
@@ -64,7 +67,7 @@ mnemonai list --jsonl --limit 500 | jq -r 'select(.message_count > 50) | .id'
 ```
 
 `list` and `show` accept `--provider <claude|codex|cursor|cursor-agent>`,
-`--local` (current directory only), and `--show-deleted-projects`. `list` also
+`--local` (current directory tree), and `--show-deleted-projects`. `list` also
 takes `--limit <n>`, `--since <duration>` (for example `7d`, `24h`, `2w`),
 `--after <timestamp>`, `--before <timestamp>`, and `--cwd <path>`.
 `--after`/`--before` accept RFC 3339 timestamps or `YYYY-MM-DD`; the lower bound
@@ -179,8 +182,9 @@ Press `?` at any time to open the help overlay.
 Create `~/.config/mnemonai/config.toml`:
 
 ```toml
-# Only show conversations from the current project directory
-local = false
+# Scope interactive startup to the current directory tree.
+# Unset defaults to true; set false to start globally.
+local = true
 
 # Hide projects whose name contains any of these strings
 exclude = ["some-project", "another-project"]

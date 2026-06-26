@@ -39,7 +39,6 @@ impl ConversationLoad {
 }
 
 /// Load conversations from ALL projects globally
-#[allow(dead_code)]
 pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
@@ -319,6 +318,7 @@ pub fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Projec
 }
 
 /// Find and process all conversation files in one pass
+#[allow(dead_code)]
 pub fn load_conversations(
     projects_dir: &Path,
     show_last: bool,
