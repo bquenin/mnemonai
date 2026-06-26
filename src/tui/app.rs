@@ -175,47 +175,6 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new app with all conversations pre-loaded (existing behavior)
-    pub fn new(
-        mut conversations: Vec<Conversation>,
-        use_relative_time: bool,
-        tool_display: ToolDisplayMode,
-        show_thinking: bool,
-        show_deleted_projects: bool,
-    ) -> Self {
-        if !show_deleted_projects {
-            conversations.retain(|c| {
-                c.project_path
-                    .as_ref()
-                    .is_none_or(|p| project_path_is_live(p))
-            });
-        }
-        let searchable = search::precompute_search_text(&mut conversations);
-        let filtered: Vec<usize> = (0..conversations.len()).collect();
-        let selected = if filtered.is_empty() { None } else { Some(0) };
-
-        Self {
-            conversations,
-            searchable,
-            filtered,
-            selected,
-            query: String::new(),
-            query_words: Vec::new(),
-            cursor_pos: 0,
-            use_relative_time,
-            loading_state: LoadingState::Ready,
-            dialog_mode: DialogMode::None,
-            app_mode: AppMode::List,
-            status_message: None,
-            tool_display,
-            show_thinking,
-            show_timing: false,
-            single_file_mode: false,
-            previous_query: String::new(),
-            show_deleted_projects,
-        }
-    }
-
     /// Create a new app in loading state
     pub fn new_loading(
         use_relative_time: bool,
@@ -1669,104 +1628,6 @@ impl Drop for TerminalGuard {
 /// Name column width for ledger-style display
 const NAME_WIDTH: usize = 9;
 
-/// Run the TUI and return the selected conversation path or None if cancelled
-pub fn run(
-    conversations: Vec<Conversation>,
-    use_relative_time: bool,
-    tool_display: ToolDisplayMode,
-    show_thinking: bool,
-    show_deleted_projects: bool,
-    providers: &[Box<dyn Provider>],
-) -> Result<Action> {
-    // Set up panic hook to restore terminal
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(panic_info);
-    }));
-
-    let mut guard = TerminalGuard::new()?;
-    let mut app = App::new(
-        conversations,
-        use_relative_time,
-        tool_display,
-        show_thinking,
-        show_deleted_projects,
-    );
-
-    loop {
-        let frame_area = guard.terminal.get_frame().area();
-        let viewport_height = frame_area.height.saturating_sub(3) as usize; // Subtract header/status
-        let content_width = (frame_area.width as usize).saturating_sub(NAME_WIDTH + 3);
-
-        // Check for resize in view mode
-        app.check_view_resize(content_width, viewport_height, providers);
-
-        guard.terminal.draw(|frame| ui::render(frame, &app))?;
-
-        if let Event::Key(key) = event::read().map_err(|e| AppError::Io(io::Error::other(e)))? {
-            // Only handle key press events (not release)
-            if key.kind == KeyEventKind::Press {
-                // Check for Enter in list mode - enter view mode (but not during dialogs)
-                if matches!(app.app_mode(), AppMode::List)
-                    && *app.dialog_mode() == DialogMode::None
-                    && key.code == KeyCode::Enter
-                    && !app.is_loading()
-                    && app.selected().is_some()
-                {
-                    app.enter_view_mode(content_width, providers);
-                    continue;
-                }
-
-                if let Some(action) =
-                    app.handle_key(key.code, key.modifiers, viewport_height, providers)
-                {
-                    match action {
-                        Action::Delete(ref path) => {
-                            // Delete through provider dispatch
-                            let conv = app
-                                .conversations()
-                                .iter()
-                                .find(|c| &c.path == path)
-                                .cloned();
-                            let deleted = if let Some(ref conv) = conv {
-                                if let Some(provider) =
-                                    providers.iter().find(|p| p.kind() == conv.provider)
-                                {
-                                    provider.delete(conv).is_ok()
-                                } else {
-                                    std::fs::remove_file(path).is_ok()
-                                }
-                            } else {
-                                std::fs::remove_file(path).is_ok()
-                            };
-                            if deleted {
-                                app.remove_selected_from_list();
-                                app.exit_view_mode();
-                            } else {
-                                let _ = debug_log::log_debug(&format!(
-                                    "Failed to delete {}",
-                                    path.display(),
-                                ));
-                            }
-                        }
-                        Action::Select(ref path) => {
-                            let _ = debug_log::log_selected_path(path);
-                            return Ok(action);
-                        }
-                        Action::Resume(ref path) => {
-                            let _ = debug_log::log_selected_path(path);
-                            return Ok(action);
-                        }
-                        Action::Quit => return Ok(action),
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Run the TUI with background loading
 /// Returns the action and the final list of conversations
 pub fn run_with_loader(
@@ -1889,7 +1750,11 @@ pub fn run_with_loader(
                             ));
                         }
                     }
-                    _ => return Ok((action, app.into_conversations())),
+                    Action::Select(ref path) | Action::Resume(ref path) => {
+                        let _ = debug_log::log_selected_path(path);
+                        return Ok((action, app.into_conversations()));
+                    }
+                    Action::Quit => return Ok((action, app.into_conversations())),
                 }
             }
         }
@@ -1971,6 +1836,33 @@ mod tests {
         }
     }
 
+    fn app_with_conversations(mut conversations: Vec<Conversation>) -> App {
+        let searchable = search::precompute_search_text(&mut conversations);
+        let filtered: Vec<usize> = (0..conversations.len()).collect();
+        let selected = if filtered.is_empty() { None } else { Some(0) };
+
+        App {
+            conversations,
+            searchable,
+            filtered,
+            selected,
+            query: String::new(),
+            query_words: Vec::new(),
+            cursor_pos: 0,
+            use_relative_time: false,
+            loading_state: LoadingState::Ready,
+            dialog_mode: DialogMode::None,
+            app_mode: AppMode::List,
+            status_message: None,
+            tool_display: ToolDisplayMode::Hidden,
+            show_thinking: false,
+            show_timing: false,
+            single_file_mode: false,
+            previous_query: String::new(),
+            show_deleted_projects: true,
+        }
+    }
+
     /// Typing a query one keystroke at a time must find the same conversations
     /// as entering it at once. The narrow-on-extend optimization used to narrow
     /// from the `"auth "` state, whose trailing term is whole-word constrained —
@@ -1982,7 +1874,7 @@ mod tests {
             make_conv("authentication flow setup", 0),
             make_conv("auth flow setup", 1),
         ];
-        let mut app = App::new(convs, false, ToolDisplayMode::Hidden, false, true);
+        let mut app = app_with_conversations(convs);
 
         type_query(&mut app, "auth flow");
 
@@ -2003,7 +1895,7 @@ mod tests {
             make_conv("authentication flow setup", 0),
             make_conv("auth flow setup", 1),
         ];
-        let mut app = App::new(convs, false, ToolDisplayMode::Hidden, false, true);
+        let mut app = app_with_conversations(convs);
 
         type_query(&mut app, "auth ");
 

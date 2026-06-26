@@ -119,13 +119,21 @@ pub struct Args {
     )]
     pub debug: Option<DebugLevel>,
 
-    /// Only show conversations from the current project directory
+    /// Only show conversations from the current directory tree
     #[arg(
         long,
         short = 'L',
-        help = "Only show conversations from the current project directory"
+        help = "Only show conversations from the current directory tree"
     )]
     pub local: bool,
+
+    /// Show all conversations, ignoring the current directory tree scope
+    #[arg(
+        long,
+        conflicts_with = "local",
+        help = "Show all conversations, ignoring the current directory tree scope"
+    )]
+    pub global: bool,
 
     /// Include conversations from deleted project directories
     #[arg(long, help = "Include conversations from deleted project directories")]
@@ -159,7 +167,7 @@ pub struct Args {
     #[arg(
         value_name = "FILE",
         help = "JSONL conversation file to view directly",
-        conflicts_with_all = ["local", "show_dir", "resume", "show_path", "show_id", "plain", "render"]
+        conflicts_with_all = ["local", "global", "show_dir", "resume", "show_path", "show_id", "plain", "render"]
     )]
     pub input_file: Option<PathBuf>,
 }
@@ -207,7 +215,7 @@ pub struct ListCommand {
     #[arg(long, value_enum)]
     pub provider: Option<ProviderFilter>,
 
-    /// Only include conversations from the current project directory
+    /// Only include conversations from the current directory tree
     #[arg(long)]
     pub local: bool,
 
@@ -249,7 +257,7 @@ pub struct ShowCommand {
     #[arg(long, value_enum)]
     pub provider: Option<ProviderFilter>,
 
-    /// Only search conversations from the current project directory
+    /// Only search conversations from the current directory tree
     #[arg(long)]
     pub local: bool,
 
@@ -297,5 +305,20 @@ mod tests {
 
         assert!(args.command.is_none());
         assert_eq!(args.input_file, Some(PathBuf::from("session.jsonl")));
+    }
+
+    #[test]
+    fn parses_global_interactive_flag() {
+        let args = Args::try_parse_from(["mnemonai", "--global"]).unwrap();
+
+        assert!(args.global);
+        assert!(!args.local);
+    }
+
+    #[test]
+    fn global_conflicts_with_local() {
+        let result = Args::try_parse_from(["mnemonai", "--global", "--local"]);
+
+        assert!(result.is_err());
     }
 }

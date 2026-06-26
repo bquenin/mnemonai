@@ -11,9 +11,6 @@ pub enum LogEntry {
         message: UserMessage,
         /// ISO 8601 timestamp when this message was sent
         timestamp: String,
-        /// UUID for linking with turn_duration entries
-        #[allow(dead_code)]
-        uuid: Option<String>,
         /// The working directory when this message was sent
         cwd: Option<String>,
     },
@@ -21,37 +18,18 @@ pub enum LogEntry {
         message: AssistantMessage,
         /// ISO 8601 timestamp when this message was sent
         timestamp: String,
-        /// UUID for linking with turn_duration entries
-        #[allow(dead_code)]
-        uuid: Option<String>,
     },
     #[serde(rename = "file-history-snapshot")]
-    #[allow(dead_code)]
-    FileHistorySnapshot {
-        #[serde(rename = "messageId")]
-        message_id: String,
-        snapshot: serde_json::Value,
-        #[serde(rename = "isSnapshotUpdate")]
-        is_snapshot_update: bool,
-    },
+    FileHistorySnapshot,
     Progress {
         data: serde_json::Value,
-        #[allow(dead_code)]
-        #[serde(flatten)]
-        extra: serde_json::Value,
     },
-    #[allow(dead_code)]
     System {
         subtype: String,
         level: Option<String>,
         /// Duration in milliseconds for turn_duration entries
         #[serde(rename = "durationMs")]
         duration_ms: Option<u64>,
-        /// Parent UUID for linking turn_duration to preceding message
-        #[serde(rename = "parentUuid")]
-        parent_uuid: Option<String>,
-        #[serde(flatten)]
-        extra: serde_json::Value,
     },
     /// Entry types this version doesn't understand (attachment, ai-title,
     /// queue-operation, ...). Newer Claude Code builds keep introducing types;
@@ -63,8 +41,6 @@ pub enum LogEntry {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct UserMessage {
-    #[allow(dead_code)]
-    pub role: String,
     pub content: UserContent,
 }
 
@@ -77,8 +53,6 @@ pub enum UserContent {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AssistantMessage {
-    #[allow(dead_code)]
-    pub role: String,
     pub content: Vec<ContentBlock>,
     pub model: Option<String>,
     pub usage: Option<TokenUsage>,
@@ -106,7 +80,6 @@ pub enum ContentBlock {
         text: String,
     },
     ToolUse {
-        #[allow(dead_code)]
         id: String,
         name: String,
         input: serde_json::Value,
@@ -122,10 +95,7 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
-        #[allow(dead_code)]
-        signature: String,
     },
-    #[allow(dead_code)]
     Image {
         source: serde_json::Value,
     },
@@ -176,14 +146,9 @@ pub fn extract_tool_result_text(content: Option<&serde_json::Value>) -> Option<S
 /// Agent progress data from subagent conversations
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentProgressData {
-    #[allow(dead_code)]
-    #[serde(rename = "type")]
-    pub progress_type: String,
     #[serde(rename = "agentId")]
     pub agent_id: String,
     pub message: AgentMessage,
-    #[allow(dead_code)]
-    pub prompt: Option<String>,
 }
 
 /// Individual message within an agent conversation
@@ -197,8 +162,6 @@ pub struct AgentMessage {
 /// Content of an agent message (mirrors UserMessage/AssistantMessage structure)
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentMessageContent {
-    #[allow(dead_code)]
-    pub role: String,
     pub content: AgentContent,
 }
 

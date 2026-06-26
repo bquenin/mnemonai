@@ -12,10 +12,11 @@ use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct HeadlessSettings {
     pub cli_local: bool,
+    pub cli_global: bool,
     pub show_last: bool,
     pub show_deleted_projects: bool,
     pub debug: Option<DebugLevel>,
@@ -273,7 +274,11 @@ fn use_local_scope(settings: &HeadlessSettings, command_local: bool, force_globa
     // Headless commands default to global output even when the interactive TUI
     // config has `local = true`; scripts and skills need stable scope unless the
     // caller explicitly passes --local.
-    !force_global && (command_local || settings.cli_local)
+    //
+    // An explicit `--global` (cli_global) — like `--cwd`'s force_global, which
+    // loads everything before filtering by path — overrides any --local request,
+    // so `mnemonai --global list --local` returns global results as the flag promises.
+    !force_global && !settings.cli_global && (command_local || settings.cli_local)
 }
 
 fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListCommand) -> Result<()> {
@@ -283,14 +288,18 @@ fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListComma
         .as_deref()
         .map(|value| parse_timestamp_filter(value, "--before"))
         .transpose()?;
-    let cwd_roots = command.cwd.as_deref().map(filter_path_roots).transpose()?;
+    let cwd_roots = command
+        .cwd
+        .as_deref()
+        .map(crate::loader::filter_path_roots)
+        .transpose()?;
 
     conversations.retain(|conversation| {
         after.is_none_or(|after| conversation.timestamp >= after)
             && before.is_none_or(|before| conversation.timestamp < before)
             && cwd_roots
                 .as_ref()
-                .is_none_or(|roots| conversation_matches_cwd(conversation, roots))
+                .is_none_or(|roots| crate::loader::conversation_matches_scope(conversation, roots))
     });
 
     Ok(())
@@ -372,45 +381,6 @@ fn invalid_timestamp(value: &str, flag: &str) -> AppError {
         "Invalid {} value '{}'; expected RFC 3339 or YYYY-MM-DD",
         flag, value
     ))
-}
-
-/// Candidate root forms for a `--cwd` filter: the absolutized literal path and,
-/// when it resolves, its canonical (symlink-resolved) form. A conversation path
-/// is matched against both because a recorded cwd that no longer exists on disk
-/// can't be canonicalized, so it would otherwise fail to match a canonical root
-/// even when it is genuinely under the path (e.g. `/tmp` vs `/private/tmp`).
-fn filter_path_roots(path: &Path) -> Result<Vec<PathBuf>> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    let mut roots = Vec::with_capacity(2);
-    if let Ok(canonical) = absolute.canonicalize()
-        && canonical != absolute
-    {
-        roots.push(canonical);
-    }
-    roots.push(absolute);
-    Ok(roots)
-}
-
-fn conversation_matches_cwd(conversation: &Conversation, roots: &[PathBuf]) -> bool {
-    conversation
-        .cwd
-        .as_ref()
-        .into_iter()
-        .chain(conversation.project_path.as_ref())
-        .any(|path| path_at_or_under(path, roots))
-}
-
-fn path_at_or_under(path: &Path, roots: &[PathBuf]) -> bool {
-    let canonical = path.canonicalize();
-    let candidates = canonical.iter().map(PathBuf::as_path).chain([path]);
-    candidates
-        .into_iter()
-        .any(|candidate| roots.iter().any(|root| candidate.starts_with(root)))
 }
 
 fn reindex_conversations(conversations: &mut [Conversation]) {
@@ -574,7 +544,7 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
                 message.duration_ms = *duration_ms;
                 push_message(&mut messages, message);
             }
-            LogEntry::FileHistorySnapshot { .. } | LogEntry::Unknown => {}
+            LogEntry::FileHistorySnapshot | LogEntry::Unknown => {}
         }
     }
     messages
@@ -817,16 +787,13 @@ mod tests {
         let entries = vec![
             LogEntry::User {
                 message: UserMessage {
-                    role: "user".to_string(),
                     content: UserContent::String("run tests".to_string()),
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
-                uuid: None,
                 cwd: None,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
-                    role: "assistant".to_string(),
                     content: vec![
                         ContentBlock::Text {
                             text: "I'll run them.".to_string(),
@@ -838,7 +805,6 @@ mod tests {
                         },
                         ContentBlock::Thinking {
                             thinking: "Need to verify failures.".to_string(),
-                            signature: "sig".to_string(),
                         },
                     ],
                     model: Some("claude-test".to_string()),
@@ -846,7 +812,6 @@ mod tests {
                     id: None,
                 },
                 timestamp: "2026-06-19T10:00:01-07:00".to_string(),
-                uuid: None,
             },
         ];
 
@@ -950,16 +915,13 @@ mod tests {
             // Blank user text is dropped rather than emitted as an empty message.
             LogEntry::User {
                 message: UserMessage {
-                    role: "user".to_string(),
                     content: UserContent::String("   ".to_string()),
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
-                uuid: None,
                 cwd: None,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
-                    role: "assistant".to_string(),
                     content: vec![
                         ContentBlock::ToolResult {
                             tool_use_id: "t1".to_string(),
@@ -979,14 +941,11 @@ mod tests {
                     id: None,
                 },
                 timestamp: "2026-06-19T10:00:01-07:00".to_string(),
-                uuid: None,
             },
             LogEntry::System {
                 subtype: "turn_duration".to_string(),
                 level: Some("warning".to_string()),
                 duration_ms: Some(1234),
-                parent_uuid: None,
-                extra: serde_json::Value::Null,
             },
         ];
 
@@ -1163,7 +1122,6 @@ mod tests {
     fn user_block_messages_get_block_index() {
         let entries = vec![LogEntry::User {
             message: UserMessage {
-                role: "user".to_string(),
                 content: UserContent::Blocks(vec![
                     ContentBlock::Text {
                         text: "look at this".to_string(),
@@ -1174,7 +1132,6 @@ mod tests {
                 ]),
             },
             timestamp: "2026-06-19T10:00:00-07:00".to_string(),
-            uuid: None,
             cwd: None,
         }];
 
@@ -1258,6 +1215,7 @@ mod tests {
     fn headless_scope_is_global_without_explicit_local_flag() {
         let settings = HeadlessSettings {
             cli_local: false,
+            cli_global: false,
             show_last: false,
             show_deleted_projects: false,
             debug: None,
@@ -1271,6 +1229,7 @@ mod tests {
 
         let cli_settings = HeadlessSettings {
             cli_local: true,
+            cli_global: false,
             show_last: false,
             show_deleted_projects: false,
             debug: None,
@@ -1280,6 +1239,25 @@ mod tests {
             !use_local_scope(&cli_settings, true, true),
             "--cwd must force global loading before cwd filtering"
         );
+    }
+
+    #[test]
+    fn global_flag_forces_global_scope_over_local() {
+        // `--global` must override a subcommand `--local` so the flag's promise to
+        // ignore directory scoping holds for `mnemonai --global list --local`.
+        let settings = HeadlessSettings {
+            cli_local: false,
+            cli_global: true,
+            show_last: false,
+            show_deleted_projects: false,
+            debug: None,
+        };
+
+        assert!(
+            !use_local_scope(&settings, true, false),
+            "--global must win over a subcommand --local"
+        );
+        assert!(!use_local_scope(&settings, false, false));
     }
 
     #[test]
@@ -1350,7 +1328,6 @@ mod tests {
     fn infers_tool_result_error_from_exit_code() {
         let entries = vec![LogEntry::Assistant {
             message: AssistantMessage {
-                role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::ToolResult {
                         tool_use_id: "fail".to_string(),
@@ -1376,7 +1353,6 @@ mod tests {
                 id: None,
             },
             timestamp: "2026-06-19T10:00:01-07:00".to_string(),
-            uuid: None,
         }];
 
         let messages = messages_from_entries(&entries);

@@ -7,16 +7,12 @@ use std::process::Command;
 use std::sync::mpsc::Receiver;
 
 pub struct ClaudeProvider {
-    current_dir: Option<std::path::PathBuf>,
     exclude_paths: Vec<String>,
 }
 
 impl ClaudeProvider {
     pub fn new(exclude_paths: Vec<String>) -> Self {
-        Self {
-            current_dir: std::env::current_dir().ok(),
-            exclude_paths,
-        }
+        Self { exclude_paths }
     }
 }
 
@@ -29,29 +25,12 @@ impl super::Provider for ClaudeProvider {
         "Claude Code"
     }
 
-    fn detect(&self) -> bool {
-        // Claude is always available if ~/.claude/projects exists
-        history::get_claude_projects_root()
-            .map(|p| p.exists())
-            .unwrap_or(false)
-    }
-
     fn load_conversations(
         &self,
         show_last: bool,
         debug: Option<crate::cli::DebugLevel>,
     ) -> Result<Vec<Conversation>> {
-        let current_dir = self.current_dir.as_ref().ok_or_else(|| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Failed to get current directory",
-            ))
-        })?;
-        let projects_dir = history::get_claude_projects_dir(current_dir)?;
-        if !projects_dir.exists() {
-            return Ok(Vec::new());
-        }
-        history::load_conversations(&projects_dir, show_last, debug)
+        history::load_all_conversations(show_last, debug, &self.exclude_paths)
     }
 
     fn load_conversations_streaming(
