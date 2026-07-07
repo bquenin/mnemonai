@@ -121,13 +121,44 @@ pub fn resolve_project_dir(path: &Path) -> Option<PathBuf> {
                 return Some(repo);
             }
         }
-        // Nested layout: an ancestor is itself the repo.
-        if is_git_repo(ancestor) {
-            return Some(ancestor.to_path_buf());
+    }
+
+    nested_worktree_repo_candidates(path)
+        .into_iter()
+        .find(|candidate| is_git_repo(candidate))
+}
+
+fn nested_worktree_repo_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for ancestor in path.ancestors().skip(1) {
+        let Some(name) = ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_ascii_lowercase())
+        else {
+            continue;
+        };
+
+        match name.as_str() {
+            ".worktrees" => {
+                if let Some(repo) = ancestor.parent() {
+                    candidates.push(repo.to_path_buf());
+                }
+            }
+            "worktrees" => {
+                if let Some(parent) = ancestor.parent() {
+                    candidates.push(parent.to_path_buf());
+                    if let Some(grandparent) = parent.parent() {
+                        candidates.push(grandparent.to_path_buf());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    None
+    candidates
 }
 
 /// Detect the worktree-container path components: an exact `worktrees` or
@@ -485,6 +516,19 @@ mod tests {
         assert!(!project_path_is_live(&orphan));
 
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn deleted_worktree_does_not_resolve_to_unrelated_ancestor_repo() {
+        let base = std::env::temp_dir().join("mnemonai_wt_unrelated_ancestor");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+
+        let orphan = base.join("missing/.agent-pr-review/worktrees/pr-4");
+
+        assert!(!project_path_is_live(&orphan));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
