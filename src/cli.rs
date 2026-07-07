@@ -179,6 +179,12 @@ pub enum Command {
 
     /// Show one conversation without opening the TUI
     Show(ShowCommand),
+
+    /// Search conversations without opening the TUI
+    Search(SearchCommand),
+
+    /// Extract deterministic message windows from one conversation
+    Excerpt(ExcerptCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -245,6 +251,52 @@ pub struct ListCommand {
 }
 
 #[derive(Parser, Debug)]
+pub struct SearchCommand {
+    /// Query text to search for
+    pub query: String,
+
+    /// Output a JSON array (default)
+    #[arg(long, group = "headless_search_output")]
+    pub json: bool,
+
+    /// Output one JSON object per line
+    #[arg(long, group = "headless_search_output")]
+    pub jsonl: bool,
+
+    /// Only include conversations from this provider
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderFilter>,
+
+    /// Only include conversations from the current directory tree
+    #[arg(long)]
+    pub local: bool,
+
+    /// Only include conversations whose cwd or project path is at or under this path
+    #[arg(long, value_name = "PATH", conflicts_with = "local")]
+    pub cwd: Option<PathBuf>,
+
+    /// Only include conversations from the last duration (for example: 7d, 24h, 2w)
+    #[arg(long, value_name = "DURATION", conflicts_with = "after")]
+    pub since: Option<String>,
+
+    /// Only include conversations at or after this timestamp (RFC 3339 or YYYY-MM-DD)
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub after: Option<String>,
+
+    /// Only include conversations before this timestamp (RFC 3339 or YYYY-MM-DD)
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub before: Option<String>,
+
+    /// Include conversations from deleted project directories
+    #[arg(long)]
+    pub show_deleted_projects: bool,
+
+    /// Limit the number of search results returned
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Parser, Debug)]
 pub struct ShowCommand {
     /// Conversation ID or source path
     pub target: String,
@@ -252,6 +304,56 @@ pub struct ShowCommand {
     /// Output structured JSON (default)
     #[arg(long)]
     pub json: bool,
+
+    /// Only search conversations from this provider
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderFilter>,
+
+    /// Only search conversations from the current directory tree
+    #[arg(long)]
+    pub local: bool,
+
+    /// Include conversations from deleted project directories
+    #[arg(long)]
+    pub show_deleted_projects: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ExcerptCommand {
+    /// Conversation ID or source path
+    pub target: String,
+
+    /// Query text used to find relevant message windows
+    #[arg(long, conflicts_with = "from_index")]
+    pub query: Option<String>,
+
+    /// First message index to include
+    #[arg(long = "from", value_name = "INDEX")]
+    pub from_index: Option<usize>,
+
+    /// Last message index to include
+    #[arg(long = "to", value_name = "INDEX", requires = "from_index")]
+    pub to_index: Option<usize>,
+
+    /// Number of nearby messages to include around query matches
+    #[arg(long, default_value_t = 3)]
+    pub context: usize,
+
+    /// Comma-separated roles that can trigger query matches (for example: user,assistant,summary)
+    #[arg(long, value_name = "ROLES", requires = "query")]
+    pub match_roles: Option<String>,
+
+    /// Limit the number of query excerpt windows returned
+    #[arg(long, value_name = "N", requires = "query")]
+    pub max_windows: Option<usize>,
+
+    /// Output structured JSON (default)
+    #[arg(long, group = "headless_excerpt_output")]
+    pub json: bool,
+
+    /// Output deterministic markdown
+    #[arg(long, group = "headless_excerpt_output")]
+    pub markdown: bool,
 
     /// Only search conversations from this provider
     #[arg(long, value_enum)]
@@ -296,6 +398,68 @@ mod tests {
                 assert_eq!(command.limit, Some(10));
             }
             other => panic!("expected list command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_search_subcommand() {
+        let args = Args::try_parse_from([
+            "mnemonai",
+            "search",
+            "emp tower SP",
+            "--jsonl",
+            "--provider",
+            "codex",
+            "--since",
+            "30d",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Search(command)) => {
+                assert_eq!(command.query, "emp tower SP");
+                assert!(command.jsonl);
+                assert_eq!(command.provider, Some(ProviderFilter::Codex));
+                assert_eq!(command.since.as_deref(), Some("30d"));
+                assert_eq!(command.limit, Some(5));
+            }
+            other => panic!("expected search command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_excerpt_subcommand() {
+        let args = Args::try_parse_from([
+            "mnemonai",
+            "excerpt",
+            "session-id",
+            "--query",
+            "emp tower SP",
+            "--context",
+            "4",
+            "--match-roles",
+            "user,assistant,summary",
+            "--max-windows",
+            "3",
+            "--markdown",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Excerpt(command)) => {
+                assert_eq!(command.target, "session-id");
+                assert_eq!(command.query.as_deref(), Some("emp tower SP"));
+                assert_eq!(command.context, 4);
+                assert_eq!(
+                    command.match_roles.as_deref(),
+                    Some("user,assistant,summary")
+                );
+                assert_eq!(command.max_windows, Some(3));
+                assert!(command.markdown);
+            }
+            other => panic!("expected excerpt command, got {:?}", other),
         }
     }
 

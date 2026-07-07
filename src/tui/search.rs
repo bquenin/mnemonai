@@ -22,6 +22,12 @@ pub struct SearchableConversation {
     pub index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RankedSearchResult {
+    pub index: usize,
+    pub score: f64,
+}
+
 /// Normalize text for search: lowercase only.
 /// Query terms are split on whitespace and matched as substrings,
 /// so URLs, paths, and other structured strings stay intact as single terms.
@@ -117,9 +123,24 @@ pub fn search(
     now: DateTime<Local>,
     narrow_from: Option<&[usize]>,
 ) -> Vec<usize> {
+    search_with_scores(conversations, searchable, query, now, narrow_from)
+        .into_iter()
+        .map(|result| result.index)
+        .collect()
+}
+
+pub fn search_with_scores(
+    conversations: &[Conversation],
+    searchable: &[SearchableConversation],
+    query: &str,
+    now: DateTime<Local>,
+    narrow_from: Option<&[usize]>,
+) -> Vec<RankedSearchResult> {
     if query.trim().is_empty() {
         // Return all indices sorted by timestamp (already sorted in history.rs)
-        return (0..conversations.len()).collect();
+        return (0..conversations.len())
+            .map(|index| RankedSearchResult { index, score: 0.0 })
+            .collect();
     }
 
     let query_lower = normalize_for_search(query);
@@ -127,7 +148,9 @@ pub fn search(
     // Score conversations in parallel, optionally narrowing to a subset
     let query_terms = parse_query_terms(&query_lower);
     if query_terms.is_empty() {
-        return (0..conversations.len()).collect();
+        return (0..conversations.len())
+            .map(|index| RankedSearchResult { index, score: 0.0 })
+            .collect();
     }
 
     let mut scored: Vec<(usize, f64, DateTime<Local>)> = if let Some(indices) = narrow_from {
@@ -177,7 +200,10 @@ pub fn search(
             .then_with(|| b.2.cmp(&a.2))
     });
 
-    scored.into_iter().map(|(idx, _, _)| idx).collect()
+    scored
+        .into_iter()
+        .map(|(index, score, _)| RankedSearchResult { index, score })
+        .collect()
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.

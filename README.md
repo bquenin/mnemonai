@@ -62,24 +62,34 @@ mnemonai list --json --cwd ~/code/my-repo --after 2026-06-01 --before 2026-06-20
 # Show one conversation by session ID or source path
 mnemonai show <session-id-or-path> --json
 
+# Search conversations with the same ranking used by the TUI
+mnemonai search "emp tower SP cnc3" --json --limit 20 --since 180d
+
+# Extract deterministic message windows for a session
+mnemonai excerpt <session-id-or-path> --query "emp tower SP" --context 3 --json
+mnemonai excerpt <session-id-or-path> --query "emp tower SP" --match-roles user,assistant,summary --max-windows 3 --json
+mnemonai excerpt <session-id-or-path> --from 24 --to 39 --markdown
+
 # Skill-style pipeline
-mnemonai list --jsonl --limit 500 | jq -r 'select(.message_count > 50) | .id'
+mnemonai search "failed tests" --jsonl --limit 20 | jq -r '.id'
 ```
 
-`list` and `show` accept `--provider <claude|codex|cursor|cursor-agent>`,
-`--local` (current directory tree), and `--show-deleted-projects`. `list` also
-takes `--limit <n>`, `--since <duration>` (for example `7d`, `24h`, `2w`),
+`list`, `show`, `search`, and `excerpt` accept
+`--provider <claude|codex|cursor|cursor-agent>`, `--local` (current directory
+tree), and `--show-deleted-projects`. `list` and `search` also take
+`--limit <n>`, `--since <duration>` (for example `7d`, `24h`, `2w`),
 `--after <timestamp>`, `--before <timestamp>`, and `--cwd <path>`.
 `--after`/`--before` accept RFC 3339 timestamps or `YYYY-MM-DD`; the lower bound
 is inclusive and the upper bound is exclusive. `--cwd` matches conversations
 whose recorded `cwd` or `project_path` is at or under the path. Output is JSON by
-default; on errors (no match, ambiguous target) the command prints a message to
-stderr and exits non-zero.
+default except for `excerpt --markdown`; on errors (no match, ambiguous target,
+invalid range) the command prints a message to stderr and exits non-zero.
 
 Headless output depends only on these flags, never on the config file: unlike the
-interactive TUI, `list`/`show` ignore the config's `local`, `exclude`, and
-`show_deleted_projects` settings so scripts and skills get the same result on any
-machine. Pass `--local` / `--show-deleted-projects` explicitly when you want them.
+interactive TUI, headless commands ignore the config's `local`, `exclude`, and
+`show_deleted_projects` settings so scripts and skills get the same result on
+any machine. Pass `--local` / `--show-deleted-projects` explicitly when you want
+them.
 
 ### `list` output — conversation summary
 
@@ -102,6 +112,14 @@ when empty):
 | `total_tokens` | number | |
 | `duration_minutes` | number? | |
 | `parse_errors` | array | diagnostics; entries can include raw transcript lines, so this may be large for broken transcripts |
+
+### `search` output — ranked conversation summary
+
+`search` returns the same conversation summary fields as `list`, plus:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `score` | number | TUI-derived relevance score; compare only within one search result set |
 
 ### `show` output — conversation detail
 
@@ -133,6 +151,46 @@ carries `role` plus whichever of these apply (absent fields are omitted):
 tool-trace analysis. `tool_input`, `tool_result`, and `source` are passed
 through verbatim from the underlying transcript; treat their inner shape as
 opaque rather than a stable contract.
+
+### `excerpt` output — conversation windows
+
+`excerpt` returns:
+
+```json
+{
+  "conversation": "<summary object>",
+  "windows": [
+    {
+      "start_index": 24,
+      "end_index": 39,
+      "messages": ["<message objects from show output>"]
+    }
+  ]
+}
+```
+
+Use `--query <text>` to find message windows around matching terms, or
+`--from <index> [--to <index>]` to select an explicit inclusive range. Query
+excerpting searches normalized message text, thinking text, tool names, and tool
+inputs, then merges overlapping windows. Use `--match-roles <roles>` to limit
+which message roles can trigger query matches while still returning surrounding
+context messages, and `--max-windows <n>` to cap the number of returned windows.
+
+### Agent memory retrieval
+
+For skills and agent harnesses, keep `mnemonai` as the deterministic retrieval
+backend and let the current agent do the reasoning:
+
+```bash
+mnemonai search "topic words" --json --cwd . --limit 10
+mnemonai excerpt "$session_id" --query "topic words" --context 3 --match-roles user,assistant,summary --max-windows 3 --json
+```
+
+Agents should summarize only the retrieved excerpts that matter to the current
+task and cite provider, session ID/path, and message ranges.
+
+This repository includes a starter skill at `skills/mnemonai-memory` with the
+recommended agent workflow for searching, excerpting, and citing prior sessions.
 
 ## Keyboard Shortcuts
 

@@ -2,12 +2,15 @@ use crate::claude::{
     AgentContent, ContentBlock, LogEntry, UserContent, extract_tool_result_text,
     parse_agent_progress,
 };
-use crate::cli::{Command, DebugLevel, ListCommand, ProviderFilter, ShowCommand};
+use crate::cli::{
+    Command, DebugLevel, ExcerptCommand, ListCommand, ProviderFilter, SearchCommand, ShowCommand,
+};
 use crate::error::{AppError, Result};
 use crate::history::{
     Conversation, LoaderMessage, ParseError, path_to_string, project_path_is_live,
 };
 use crate::providers::Provider;
+use crate::tui::search::{normalize_for_search, precompute_search_text, search_with_scores};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
@@ -47,6 +50,26 @@ struct ConversationDetail {
 }
 
 #[derive(Serialize)]
+struct SearchConversationSummary {
+    score: f64,
+    #[serde(flatten)]
+    conversation: ConversationSummary,
+}
+
+#[derive(Serialize)]
+struct ConversationExcerpt {
+    conversation: ConversationSummary,
+    windows: Vec<ExcerptWindow>,
+}
+
+#[derive(Serialize)]
+struct ExcerptWindow {
+    start_index: usize,
+    end_index: usize,
+    messages: Vec<MessageDto>,
+}
+
+#[derive(Clone, Serialize)]
 struct MessageDto {
     index: usize,
     entry_index: usize,
@@ -163,6 +186,8 @@ pub fn run_command(
     match command {
         Command::List(command) => run_list(command, providers, settings),
         Command::Show(command) => run_show(command, providers, settings),
+        Command::Search(command) => run_search(command, providers, settings),
+        Command::Excerpt(command) => run_excerpt(command, providers, settings),
     }
 }
 
@@ -227,6 +252,74 @@ fn run_show(
     };
 
     write_json(&detail)
+}
+
+fn run_search(
+    command: &SearchCommand,
+    providers: &[Box<dyn Provider>],
+    settings: &HeadlessSettings,
+) -> Result<()> {
+    if command.query.trim().is_empty() {
+        return Err(AppError::CommandError(
+            "Search query must not be empty".to_string(),
+        ));
+    }
+
+    let mut conversations = load_conversations(
+        providers,
+        settings,
+        command.provider,
+        command.local,
+        command.show_deleted_projects,
+        command.cwd.is_some(),
+    )?;
+    apply_search_filters(&mut conversations, command)?;
+    let results = search_conversations(conversations, &command.query, command.limit);
+
+    if command.jsonl {
+        write_jsonl(&results)
+    } else {
+        write_json(&results)
+    }
+}
+
+fn run_excerpt(
+    command: &ExcerptCommand,
+    providers: &[Box<dyn Provider>],
+    settings: &HeadlessSettings,
+) -> Result<()> {
+    let conversations = load_conversations(
+        providers,
+        settings,
+        command.provider,
+        command.local,
+        command.show_deleted_projects,
+        false,
+    )?;
+    let conversation = resolve_conversation(&conversations, &command.target)?;
+    let provider = providers
+        .iter()
+        .find(|provider| provider.kind() == conversation.provider)
+        .ok_or_else(|| {
+            AppError::CommandError(format!(
+                "No provider found for {} conversation",
+                conversation.provider.key()
+            ))
+        })?;
+    let entries = provider.read_entries(conversation)?;
+    let messages = messages_from_entries(&entries);
+    let windows = excerpt_windows_from_messages(&messages, command)?;
+    let excerpt = ConversationExcerpt {
+        conversation: ConversationSummary::from_conversation(conversation),
+        windows,
+    };
+
+    if command.markdown {
+        let rendered = render_excerpt_markdown(&excerpt);
+        write_stdout(rendered.as_bytes())
+    } else {
+        write_json(&excerpt)
+    }
 }
 
 fn load_conversations(
@@ -303,6 +396,45 @@ fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListComma
     });
 
     Ok(())
+}
+
+fn apply_search_filters(
+    conversations: &mut Vec<Conversation>,
+    command: &SearchCommand,
+) -> Result<()> {
+    let list_command = ListCommand {
+        json: false,
+        jsonl: false,
+        provider: command.provider,
+        local: command.local,
+        cwd: command.cwd.clone(),
+        since: command.since.clone(),
+        after: command.after.clone(),
+        before: command.before.clone(),
+        show_deleted_projects: command.show_deleted_projects,
+        limit: command.limit,
+    };
+    apply_list_filters(conversations, &list_command)
+}
+
+fn search_conversations(
+    mut conversations: Vec<Conversation>,
+    query: &str,
+    limit: Option<usize>,
+) -> Vec<SearchConversationSummary> {
+    let searchable = precompute_search_text(&mut conversations);
+    let mut ranked = search_with_scores(&conversations, &searchable, query, Local::now(), None);
+    if let Some(limit) = limit {
+        ranked.truncate(limit);
+    }
+
+    ranked
+        .into_iter()
+        .map(|result| SearchConversationSummary {
+            score: result.score,
+            conversation: ConversationSummary::from_conversation(&conversations[result.index]),
+        })
+        .collect()
 }
 
 fn list_after_cutoff(command: &ListCommand) -> Result<Option<DateTime<Local>>> {
@@ -550,6 +682,232 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
     messages
 }
 
+fn excerpt_windows_from_messages(
+    messages: &[MessageDto],
+    command: &ExcerptCommand,
+) -> Result<Vec<ExcerptWindow>> {
+    if let Some(query) = command.query.as_deref() {
+        if query.trim().is_empty() {
+            return Err(AppError::CommandError(
+                "Excerpt query must not be empty".to_string(),
+            ));
+        }
+        let match_roles = parse_match_roles(command.match_roles.as_deref())?;
+        let mut ranges =
+            query_excerpt_ranges(messages, query, command.context, match_roles.as_deref());
+        if let Some(max_windows) = command.max_windows {
+            ranges.truncate(max_windows);
+        }
+        return Ok(ranges
+            .into_iter()
+            .map(|(start, end)| excerpt_window(messages, start, end))
+            .collect());
+    }
+
+    let Some(start) = command.from_index else {
+        return Err(AppError::CommandError(
+            "Pass --query <text> or --from <index> to select excerpt messages".to_string(),
+        ));
+    };
+    let end = command.to_index.unwrap_or(start);
+    validate_message_range(messages, start, end)?;
+    Ok(vec![excerpt_window(messages, start, end)])
+}
+
+fn validate_message_range(messages: &[MessageDto], start: usize, end: usize) -> Result<()> {
+    if start > end {
+        return Err(AppError::CommandError(format!(
+            "Invalid excerpt range: --from {start} is greater than --to {end}"
+        )));
+    }
+    if messages.is_empty() {
+        return Err(AppError::CommandError(
+            "Cannot excerpt an empty conversation".to_string(),
+        ));
+    }
+    if end >= messages.len() {
+        return Err(AppError::CommandError(format!(
+            "Excerpt range {start}-{end} is outside message index range 0-{}",
+            messages.len() - 1
+        )));
+    }
+    Ok(())
+}
+
+fn excerpt_window(messages: &[MessageDto], start: usize, end: usize) -> ExcerptWindow {
+    ExcerptWindow {
+        start_index: start,
+        end_index: end,
+        messages: messages[start..=end].to_vec(),
+    }
+}
+
+fn query_excerpt_ranges(
+    messages: &[MessageDto],
+    query: &str,
+    context: usize,
+    match_roles: Option<&[String]>,
+) -> Vec<(usize, usize)> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let terms: Vec<_> = normalize_for_search(query)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let message_texts: Vec<_> = messages
+        .iter()
+        .map(|message| normalize_for_search(&message_search_text(message)))
+        .collect();
+    let hits_by_term: Vec<Vec<usize>> = terms
+        .iter()
+        .map(|term| {
+            message_texts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, text)| {
+                    (message_role_matches(match_roles, &messages[idx].role) && text.contains(term))
+                        .then_some(idx)
+                })
+                .collect()
+        })
+        .collect();
+
+    if hits_by_term.iter().any(Vec::is_empty) {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    for center in 0..messages.len() {
+        let search_start = center.saturating_sub(context);
+        let search_end = center.saturating_add(context).min(messages.len() - 1);
+        let mut min_hit = usize::MAX;
+        let mut max_hit = 0;
+        let mut matched_all_terms = true;
+
+        for hits in &hits_by_term {
+            let Some(hit) = hits
+                .iter()
+                .copied()
+                .find(|idx| *idx >= search_start && *idx <= search_end)
+            else {
+                matched_all_terms = false;
+                break;
+            };
+            min_hit = min_hit.min(hit);
+            max_hit = max_hit.max(hit);
+        }
+
+        if matched_all_terms {
+            ranges.push((
+                min_hit.saturating_sub(context),
+                max_hit.saturating_add(context).min(messages.len() - 1),
+            ));
+        }
+    }
+
+    merge_ranges(ranges)
+}
+
+fn parse_match_roles(value: Option<&str>) -> Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let roles: Vec<_> = value
+        .split(',')
+        .map(normalize_match_role)
+        .filter(|role| !role.is_empty())
+        .collect();
+
+    if roles.is_empty() {
+        return Err(AppError::CommandError(
+            "Invalid --match-roles value; expected comma-separated roles like user,assistant"
+                .to_string(),
+        ));
+    }
+
+    Ok(Some(roles))
+}
+
+fn normalize_match_role(role: &str) -> String {
+    role.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn message_role_matches(match_roles: Option<&[String]>, role: &str) -> bool {
+    let Some(match_roles) = match_roles else {
+        return true;
+    };
+    let role = normalize_match_role(role);
+    match_roles.iter().any(|candidate| {
+        candidate == "*"
+            || candidate == &role
+            || (candidate == "agent_*" && role.starts_with("agent_"))
+    })
+}
+
+fn message_search_text(message: &MessageDto) -> String {
+    let mut text = String::new();
+    push_search_part(&mut text, &message.role);
+    if let Some(value) = message.text.as_deref() {
+        push_search_part(&mut text, value);
+    }
+    if let Some(value) = message.thinking.as_deref() {
+        push_search_part(&mut text, value);
+    }
+    if let Some(value) = message.tool_name.as_deref() {
+        push_search_part(&mut text, value);
+    }
+    if let Some(value) = message.tool_input.as_ref() {
+        push_search_part(&mut text, &value.to_string());
+    }
+    if let Some(value) = message.tool_result_status.as_deref() {
+        push_search_part(&mut text, value);
+    }
+    if let Some(value) = message.tool_result_exit_code {
+        push_search_part(&mut text, &value.to_string());
+    }
+    if let Some(value) = message.subtype.as_deref() {
+        push_search_part(&mut text, value);
+    }
+    if let Some(value) = message.level.as_deref() {
+        push_search_part(&mut text, value);
+    }
+    text
+}
+
+fn push_search_part(text: &mut String, value: &str) {
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(value);
+}
+
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    ranges.sort_unstable();
+    let mut merged = Vec::new();
+    let mut current = ranges[0];
+    for range in ranges.into_iter().skip(1) {
+        if range.0 <= current.1.saturating_add(1) {
+            current.1 = current.1.max(range.1);
+        } else {
+            merged.push(current);
+            current = range;
+        }
+    }
+    merged.push(current);
+    merged
+}
+
 fn push_message(messages: &mut Vec<MessageDto>, mut message: MessageDto) {
     message.index = messages.len();
     messages.push(message);
@@ -702,6 +1060,108 @@ fn merge_error_markers(markers: &[Option<bool>]) -> Option<bool> {
     }
 }
 
+fn render_excerpt_markdown(excerpt: &ConversationExcerpt) -> String {
+    let conversation = &excerpt.conversation;
+    let mut output = String::new();
+    output.push_str("# mnemonai excerpt\n\n");
+    output.push_str(&format!("- Provider: {}\n", conversation.provider));
+    output.push_str(&format!("- Session: {}\n", conversation.id));
+    output.push_str(&format!("- Path: {}\n", conversation.path));
+    output.push_str(&format!("- Timestamp: {}\n", conversation.timestamp));
+    if let Some(project_name) = conversation.project_name.as_deref() {
+        output.push_str(&format!("- Project: {project_name}\n"));
+    }
+    if let Some(project_path) = conversation.project_path.as_deref() {
+        output.push_str(&format!("- Project path: {project_path}\n"));
+    }
+    if let Some(cwd) = conversation.cwd.as_deref() {
+        output.push_str(&format!("- Cwd: {cwd}\n"));
+    }
+    if let Some(summary) = conversation.summary.as_deref() {
+        output.push_str(&format!("- Summary: {summary}\n"));
+    }
+    output.push('\n');
+
+    if excerpt.windows.is_empty() {
+        output.push_str("No matching excerpts.\n");
+        return output;
+    }
+
+    for window in &excerpt.windows {
+        output.push_str(&format!(
+            "## Messages {}-{}\n\n",
+            window.start_index, window.end_index
+        ));
+        for message in &window.messages {
+            render_message_markdown(&mut output, message);
+        }
+    }
+
+    output
+}
+
+fn render_message_markdown(output: &mut String, message: &MessageDto) {
+    output.push_str(&format!("### [{}] {}", message.index, message.role));
+    if let Some(timestamp) = message.timestamp.as_deref() {
+        output.push_str(&format!(" ({timestamp})"));
+    }
+    output.push_str("\n\n");
+
+    if let Some(text) = message.text.as_deref() {
+        push_fenced_block(output, "text", text);
+    }
+    if let Some(thinking) = message.thinking.as_deref() {
+        push_fenced_block(output, "thinking", thinking);
+    }
+    if let Some(tool_name) = message.tool_name.as_deref() {
+        output.push_str(&format!("- Tool: {tool_name}\n"));
+    }
+    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+        output.push_str(&format!("- Tool call ID: {tool_call_id}\n"));
+    }
+    if let Some(tool_input) = message.tool_input.as_ref() {
+        push_json_block(output, "tool_input", tool_input);
+    }
+    if let Some(tool_result_status) = message.tool_result_status.as_deref() {
+        output.push_str(&format!("- Tool result status: {tool_result_status}\n"));
+    }
+    if let Some(tool_result_exit_code) = message.tool_result_exit_code {
+        output.push_str(&format!(
+            "- Tool result exit code: {tool_result_exit_code}\n"
+        ));
+    }
+    if let Some(tool_result_error) = message.tool_result_error {
+        output.push_str(&format!("- Tool result error: {tool_result_error}\n"));
+    }
+    if let Some(tool_result) = message.tool_result.as_ref() {
+        push_json_block(output, "tool_result", tool_result);
+    }
+    if let Some(agent_id) = message.agent_id.as_deref() {
+        output.push_str(&format!("- Agent ID: {agent_id}\n"));
+    }
+    if let Some(subtype) = message.subtype.as_deref() {
+        output.push_str(&format!("- Subtype: {subtype}\n"));
+    }
+    if let Some(level) = message.level.as_deref() {
+        output.push_str(&format!("- Level: {level}\n"));
+    }
+    if let Some(duration_ms) = message.duration_ms {
+        output.push_str(&format!("- Duration ms: {duration_ms}\n"));
+    }
+    output.push('\n');
+}
+
+fn push_json_block(output: &mut String, label: &str, value: &Value) {
+    let rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    output.push_str(&format!("{label}:\n\n"));
+    push_fenced_block(output, "json", &rendered);
+}
+
+fn push_fenced_block(output: &mut String, language: &str, text: &str) {
+    let fence = if text.contains("```") { "````" } else { "```" };
+    output.push_str(&format!("{fence}{language}\n{text}\n{fence}\n\n"));
+}
+
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut buf = serde_json::to_vec_pretty(value)?;
     buf.push(b'\n');
@@ -771,6 +1231,35 @@ mod tests {
         }
     }
 
+    fn text_message(index: usize, role: &str, text: &str) -> MessageDto {
+        let mut message = MessageDto::new(role, MessageContext::new(index));
+        message.index = index;
+        message.text = Some(text.to_string());
+        message
+    }
+
+    fn excerpt_command(
+        query: Option<&str>,
+        from_index: Option<usize>,
+        to_index: Option<usize>,
+        context: usize,
+    ) -> ExcerptCommand {
+        ExcerptCommand {
+            target: "session".to_string(),
+            query: query.map(ToString::to_string),
+            from_index,
+            to_index,
+            context,
+            match_roles: None,
+            max_windows: None,
+            json: false,
+            markdown: false,
+            provider: None,
+            local: false,
+            show_deleted_projects: false,
+        }
+    }
+
     #[test]
     fn summary_uses_stable_provider_key() {
         let conversation = conversation("abc", "/tmp/abc.jsonl", ProviderKind::CursorAgent);
@@ -780,6 +1269,149 @@ mod tests {
         assert_eq!(json["provider"], "cursor-agent");
         assert_eq!(json["id"], "abc");
         assert_eq!(json["path"], "/tmp/abc.jsonl");
+    }
+
+    #[test]
+    fn search_conversations_returns_ranked_summaries() {
+        let mut sparse = conversation("sparse", "/tmp/sparse.jsonl", ProviderKind::Claude);
+        sparse.full_text = format!("we might deploy once {}", "filler ".repeat(200));
+
+        let mut dense = conversation("dense", "/tmp/dense.jsonl", ProviderKind::Codex);
+        dense.full_text = "deploy deploy deploy release deploy".to_string();
+
+        let results = search_conversations(vec![sparse, dense], "deploy", Some(1));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].conversation.id, "dense");
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn explicit_excerpt_range_keeps_message_indices() {
+        let messages = vec![
+            text_message(0, "user", "zero"),
+            text_message(1, "assistant", "one"),
+            text_message(2, "user", "two"),
+        ];
+        let command = excerpt_command(None, Some(1), Some(2), 3);
+
+        let windows = excerpt_windows_from_messages(&messages, &command).unwrap();
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].start_index, 1);
+        assert_eq!(windows[0].end_index, 2);
+        assert_eq!(windows[0].messages[0].index, 1);
+        assert_eq!(windows[0].messages[1].index, 2);
+    }
+
+    #[test]
+    fn query_excerpt_matches_terms_across_nearby_messages() {
+        let messages = vec![
+            text_message(0, "user", "notes about emp tower"),
+            text_message(1, "assistant", "intermediate detail"),
+            text_message(2, "user", "SP work in cnc3"),
+            text_message(3, "assistant", "follow-up"),
+        ];
+        let command = excerpt_command(Some("emp tower SP cnc3"), None, None, 1);
+
+        let windows = excerpt_windows_from_messages(&messages, &command).unwrap();
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].start_index, 0);
+        assert_eq!(windows[0].end_index, 3);
+    }
+
+    #[test]
+    fn query_excerpt_match_roles_ignore_tool_result_noise() {
+        let messages = vec![
+            text_message(
+                0,
+                "tool_result",
+                "emp tower SP cnc3 appears in noisy output",
+            ),
+            text_message(1, "assistant", "unrelated narrative"),
+            text_message(2, "user", "still unrelated"),
+        ];
+        let mut command = excerpt_command(Some("emp tower SP cnc3"), None, None, 1);
+        command.match_roles = Some("user,assistant,summary".to_string());
+
+        let windows = excerpt_windows_from_messages(&messages, &command).unwrap();
+
+        assert!(
+            windows.is_empty(),
+            "tool_result text should not trigger excerpts when role matching excludes it"
+        );
+    }
+
+    #[test]
+    fn query_excerpt_match_roles_allow_hyphenated_role_aliases() {
+        let messages = vec![
+            text_message(0, "tool_result", "emp tower"),
+            text_message(1, "assistant", "SP in cnc3"),
+        ];
+        let mut command = excerpt_command(Some("emp tower"), None, None, 1);
+        command.match_roles = Some("tool-result".to_string());
+
+        let windows = excerpt_windows_from_messages(&messages, &command).unwrap();
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].start_index, 0);
+        assert_eq!(windows[0].end_index, 1);
+    }
+
+    #[test]
+    fn query_excerpt_max_windows_caps_merged_ranges() {
+        let messages = vec![
+            text_message(0, "user", "first match"),
+            text_message(1, "assistant", "gap"),
+            text_message(2, "assistant", "gap"),
+            text_message(3, "user", "second match"),
+            text_message(4, "assistant", "gap"),
+            text_message(5, "assistant", "gap"),
+            text_message(6, "user", "third match"),
+        ];
+        let mut command = excerpt_command(Some("match"), None, None, 0);
+        command.max_windows = Some(2);
+
+        let windows = excerpt_windows_from_messages(&messages, &command).unwrap();
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].start_index, 0);
+        assert_eq!(windows[1].start_index, 3);
+    }
+
+    #[test]
+    fn query_excerpt_returns_empty_windows_when_no_match() {
+        let messages = vec![text_message(0, "user", "unrelated")];
+        let command = excerpt_command(Some("emp tower SP"), None, None, 2);
+
+        let windows = excerpt_windows_from_messages(&messages, &command).unwrap();
+
+        assert!(windows.is_empty());
+    }
+
+    #[test]
+    fn markdown_excerpt_renders_source_and_message_range() {
+        let conversation = ConversationSummary::from_conversation(&conversation(
+            "abc",
+            "/tmp/abc.jsonl",
+            ProviderKind::Codex,
+        ));
+        let excerpt = ConversationExcerpt {
+            conversation,
+            windows: vec![ExcerptWindow {
+                start_index: 0,
+                end_index: 0,
+                messages: vec![text_message(0, "user", "hello")],
+            }],
+        };
+
+        let rendered = render_excerpt_markdown(&excerpt);
+
+        assert!(rendered.contains("- Provider: codex"));
+        assert!(rendered.contains("- Session: abc"));
+        assert!(rendered.contains("## Messages 0-0"));
+        assert!(rendered.contains("```text\nhello\n```"));
     }
 
     #[test]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mnemonai Memory"
+  short_description: "Retrieve cited context from agent sessions"
+  default_prompt: "Use $mnemonai-memory to find prior session context for this task."
