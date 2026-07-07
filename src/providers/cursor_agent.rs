@@ -796,22 +796,52 @@ fn resolve_workspace_path(encoded_dir_name: &str, chats_dir: Option<&Path>) -> O
 
     match candidates.len() {
         0 => None,
-        1 => Some(PathBuf::from(candidates.into_iter().next().unwrap())),
+        1 => Some(path_from_dfs_candidate(
+            &candidates.into_iter().next().unwrap(),
+        )),
         _ => {
             // MD5 tiebreaker: check which candidate has a matching chats directory
             if let Some(chats_dir) = chats_dir.filter(|d| d.is_dir()) {
                 for candidate in &candidates {
-                    let hash = format!("{:x}", md5::compute(candidate.as_bytes()));
-                    if chats_dir.join(&hash).is_dir() {
-                        return Some(PathBuf::from(candidate));
+                    if candidate_matches_chat_hash(candidate, chats_dir) {
+                        return Some(path_from_dfs_candidate(candidate));
                     }
                 }
             }
             // Fall back to the longest path (most specific)
             candidates.sort_by_key(|b| std::cmp::Reverse(b.len()));
-            Some(PathBuf::from(candidates.into_iter().next().unwrap()))
+            Some(path_from_dfs_candidate(
+                &candidates.into_iter().next().unwrap(),
+            ))
         }
     }
+}
+
+fn candidate_matches_chat_hash(candidate: &str, chats_dir: &Path) -> bool {
+    let path_string = path_from_dfs_candidate(candidate)
+        .to_string_lossy()
+        .to_string();
+    [candidate, path_string.as_str()].into_iter().any(|input| {
+        let hash = format!("{:x}", md5::compute(input.as_bytes()));
+        chats_dir.join(hash).is_dir()
+    })
+}
+
+fn path_from_dfs_candidate(candidate: &str) -> PathBuf {
+    let mut parts = candidate.split('/').filter(|part| !part.is_empty());
+    let Some(first) = parts.next() else {
+        return PathBuf::from(candidate);
+    };
+
+    let mut path = if candidate.starts_with('/') {
+        PathBuf::from(format!("/{first}"))
+    } else {
+        PathBuf::from(first)
+    };
+    for part in parts {
+        path.push(part);
+    }
+    path
 }
 
 /// DFS over hyphen positions, trying each `-` as either a path separator (`/`)

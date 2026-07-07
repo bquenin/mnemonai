@@ -116,18 +116,43 @@ pub enum LoaderMessage {
 
 /// Get the root Claude projects directory (~/.claude/projects)
 pub fn get_claude_projects_root() -> Result<PathBuf> {
-    let home_dir = std::env::var("HOME").map_err(|_| {
+    claude_projects_root_from_home(home::home_dir())
+}
+
+fn claude_projects_root_from_home(home_dir: Option<PathBuf>) -> Result<PathBuf> {
+    let home_dir = home_dir.ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "HOME environment variable not set",
+            "home directory not found",
         ))
     })?;
 
-    Ok(PathBuf::from(home_dir).join(".claude").join("projects"))
+    Ok(home_dir.join(".claude").join("projects"))
 }
 
 /// Get the Claude projects directory for the current working directory
 pub fn get_claude_projects_dir(current_dir: &std::path::Path) -> Result<PathBuf> {
     let converted = convert_path_to_project_dir_name(current_dir);
     Ok(get_claude_projects_root()?.join(converted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_projects_root_uses_resolved_home_dir() {
+        let home = PathBuf::from("home").join("user");
+
+        let root = claude_projects_root_from_home(Some(home.clone())).unwrap();
+
+        assert_eq!(root, home.join(".claude").join("projects"));
+    }
+
+    #[test]
+    fn claude_projects_root_errors_when_home_dir_is_unavailable() {
+        let error = claude_projects_root_from_home(None).unwrap_err();
+
+        assert!(error.to_string().contains("home directory not found"));
+    }
 }
