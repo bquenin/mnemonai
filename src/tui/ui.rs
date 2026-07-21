@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragr
 const LINES_PER_ITEM: usize = 3;
 
 /// Duration before status messages auto-clear
-const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Format model name for display (e.g., "claude-opus-4-5-20251101" → "opus-4.5")
 fn format_model_name(model: &str) -> String {

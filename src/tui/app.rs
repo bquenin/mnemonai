@@ -493,6 +493,28 @@ impl App {
         self.status_message.as_ref()
     }
 
+    /// Whether a status message is currently visible (set and not yet past its TTL).
+    /// Used by the event loop to keep polling frequently until the message expires.
+    pub fn has_visible_status_message(&self) -> bool {
+        self.status_message
+            .as_ref()
+            .is_some_and(|(_, instant)| instant.elapsed() < ui::STATUS_TTL)
+    }
+
+    /// Clear a status message whose TTL has elapsed. Returns true when one was
+    /// cleared, so the event loop draws the frame that removes it from screen —
+    /// without this the last frame drawn before expiry (still showing the
+    /// message) would stay up until the next input event.
+    pub fn clear_expired_status_message(&mut self) -> bool {
+        if let Some((_, instant)) = &self.status_message
+            && instant.elapsed() >= ui::STATUS_TTL
+        {
+            self.status_message = None;
+            return true;
+        }
+        false
+    }
+
     pub fn cursor_pos(&self) -> usize {
         self.cursor_pos
     }
@@ -1578,19 +1600,23 @@ impl App {
         }
     }
 
-    /// Check if view needs re-render due to width change
+    /// Check if view needs re-render due to width change.
+    /// Returns true when the view content was re-wrapped for a new width, so
+    /// the caller knows a redraw is needed.
     pub fn check_view_resize(
         &mut self,
         new_content_width: usize,
         viewport_height: usize,
         providers: &[Box<dyn Provider>],
-    ) {
+    ) -> bool {
         if let AppMode::View(ref mut state) = self.app_mode
             && state.content_width != new_content_width
         {
             state.content_width = new_content_width;
             self.re_render_view(viewport_height, providers);
+            return true;
         }
+        false
     }
 }
 
@@ -1666,6 +1692,11 @@ pub fn run_with_loader(
         show_deleted_projects,
     );
 
+    // Redraw only when something can have changed. Starts true so the first
+    // frame is always drawn. Set again on: loader activity, a consumed key, a
+    // terminal resize, or while a time-dependent element is still on screen.
+    let mut needs_redraw = true;
+
     loop {
         // Process all pending loader messages (non-blocking)
         loop {
@@ -1680,9 +1711,11 @@ pub fn run_with_loader(
                 }
                 Ok(LoaderMessage::Batch(convs)) => {
                     app.append_conversations(convs);
+                    needs_redraw = true;
                 }
                 Ok(LoaderMessage::Done) => {
                     app.finish_loading();
+                    needs_redraw = true;
                     // Check for empty conversations
                     if app.conversations().is_empty() {
                         drop(guard);
@@ -1694,6 +1727,7 @@ pub fn run_with_loader(
                     // Loader finished unexpectedly
                     if app.is_loading() {
                         app.finish_loading();
+                        needs_redraw = true;
                         if app.conversations().is_empty() {
                             drop(guard);
                             return Err(AppError::NoHistoryFound("selected scope".to_string()));
@@ -1708,66 +1742,106 @@ pub fn run_with_loader(
         let viewport_height = frame_area.height.saturating_sub(3) as usize;
         let content_width = (frame_area.width as usize).saturating_sub(NAME_WIDTH + 3);
 
-        // Check for resize in view mode
-        app.check_view_resize(content_width, viewport_height, providers);
+        // Check for resize in view mode (recomputes wrapped content for the new
+        // width). The frame area only reflects a terminal resize after the draw
+        // that follows the Resize event, so this re-wrap lands one iteration
+        // later — it must request its own redraw or it would sit undrawn until
+        // the next input event.
+        if app.check_view_resize(content_width, viewport_height, providers) {
+            needs_redraw = true;
+        }
 
-        // Render current state
-        guard.terminal.draw(|frame| ui::render(frame, &app))?;
+        // A status message auto-clears after STATUS_TTL: clear it here and draw
+        // the frame that removes it, after which the loop can go idle again.
+        if app.clear_expired_status_message() {
+            needs_redraw = true;
+        }
 
-        // Poll for keyboard input with timeout (allows us to check loader messages)
-        if event::poll(Duration::from_millis(50)).map_err(|e| AppError::Io(io::Error::other(e)))?
-            && let Event::Key(key) = event::read().map_err(|e| AppError::Io(io::Error::other(e)))?
-            && key.kind == KeyEventKind::Press
-        {
-            // Check for Enter in list mode - enter view mode (but not during dialogs)
-            if matches!(app.app_mode(), AppMode::List)
-                && *app.dialog_mode() == DialogMode::None
-                && key.code == KeyCode::Enter
-                && !app.is_loading()
-                && app.selected().is_some()
-            {
-                app.enter_view_mode(content_width, providers);
-                continue;
-            }
+        // Render current state only when it can have changed.
+        if needs_redraw {
+            guard.terminal.draw(|frame| ui::render(frame, &app))?;
+            needs_redraw = false;
+        }
 
-            if let Some(action) =
-                app.handle_key(key.code, key.modifiers, viewport_height, providers)
-            {
-                match action {
-                    Action::Delete(ref path) => {
-                        // Delete through provider dispatch
-                        let conv = app
-                            .conversations()
-                            .iter()
-                            .find(|c| &c.path == path)
-                            .cloned();
-                        let deleted = if let Some(ref conv) = conv {
-                            if let Some(provider) =
-                                providers.iter().find(|p| p.kind() == conv.provider)
-                            {
-                                provider.delete(conv).is_ok()
-                            } else {
-                                std::fs::remove_file(path).is_ok()
+        // Poll with a timeout so loader messages and status-message expiry are
+        // still serviced while idle. A short timeout keeps time-dependent
+        // elements (loading count, status TTL) responsive; otherwise wait
+        // longer since a poll that returns false costs nothing when we skip the
+        // draw. Relative timestamps (Accuracy::Rough) only change at coarse
+        // granularity and intentionally do not force periodic redraws here.
+        let poll_timeout = if app.is_loading() || app.has_visible_status_message() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+
+        if event::poll(poll_timeout).map_err(|e| AppError::Io(io::Error::other(e)))? {
+            match event::read().map_err(|e| AppError::Io(io::Error::other(e)))? {
+                Event::Resize(_, _) => {
+                    // Frame area is recomputed at the top of the loop; just
+                    // request a redraw so the new size is picked up.
+                    needs_redraw = true;
+                    continue;
+                }
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // A consumed key press can change state (selection, query,
+                    // status message, mode); redraw on the next iteration.
+                    needs_redraw = true;
+
+                    // Check for Enter in list mode - enter view mode (but not during dialogs)
+                    if matches!(app.app_mode(), AppMode::List)
+                        && *app.dialog_mode() == DialogMode::None
+                        && key.code == KeyCode::Enter
+                        && !app.is_loading()
+                        && app.selected().is_some()
+                    {
+                        app.enter_view_mode(content_width, providers);
+                        continue;
+                    }
+
+                    if let Some(action) =
+                        app.handle_key(key.code, key.modifiers, viewport_height, providers)
+                    {
+                        match action {
+                            Action::Delete(ref path) => {
+                                // Delete through provider dispatch
+                                let conv = app
+                                    .conversations()
+                                    .iter()
+                                    .find(|c| &c.path == path)
+                                    .cloned();
+                                let deleted = if let Some(ref conv) = conv {
+                                    if let Some(provider) =
+                                        providers.iter().find(|p| p.kind() == conv.provider)
+                                    {
+                                        provider.delete(conv).is_ok()
+                                    } else {
+                                        std::fs::remove_file(path).is_ok()
+                                    }
+                                } else {
+                                    std::fs::remove_file(path).is_ok()
+                                };
+                                if deleted {
+                                    app.remove_selected_from_list();
+                                    app.exit_view_mode();
+                                } else {
+                                    let _ = debug_log::log_debug(&format!(
+                                        "Failed to delete {}",
+                                        path.display(),
+                                    ));
+                                }
                             }
-                        } else {
-                            std::fs::remove_file(path).is_ok()
-                        };
-                        if deleted {
-                            app.remove_selected_from_list();
-                            app.exit_view_mode();
-                        } else {
-                            let _ = debug_log::log_debug(&format!(
-                                "Failed to delete {}",
-                                path.display(),
-                            ));
+                            Action::Select(ref path) | Action::Resume(ref path) => {
+                                let _ = debug_log::log_selected_path(path);
+                                return Ok((action, app.into_conversations()));
+                            }
+                            Action::Quit => return Ok((action, app.into_conversations())),
                         }
                     }
-                    Action::Select(ref path) | Action::Resume(ref path) => {
-                        let _ = debug_log::log_selected_path(path);
-                        return Ok((action, app.into_conversations()));
-                    }
-                    Action::Quit => return Ok((action, app.into_conversations())),
                 }
+                // Other events (non-press keys, mouse, focus, paste) do not
+                // change what is rendered, so no redraw is required.
+                _ => {}
             }
         }
     }
