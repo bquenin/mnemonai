@@ -299,9 +299,6 @@ impl CursorAgentProvider {
             .collect();
 
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        for (idx, conversation) in conversations.iter_mut().enumerate() {
-            conversation.index = idx;
-        }
         (conversations, fresh)
     }
 }
@@ -351,9 +348,6 @@ impl super::Provider for CursorAgentProvider {
         prune_conversations(ProviderKind::CursorAgent, &stale);
 
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        for (idx, conversation) in conversations.iter_mut().enumerate() {
-            conversation.index = idx;
-        }
 
         Ok(conversations)
     }
@@ -622,7 +616,6 @@ fn process_transcript_file(
     let workspace_path = workspace_path.map(Path::to_path_buf);
     Ok(Some(Conversation {
         path: path.clone(),
-        index: 0,
         provider: ProviderKind::CursorAgent,
         id,
         timestamp,
@@ -1279,7 +1272,6 @@ mod tests {
         };
         let conversation = Conversation {
             path: transcript_dir.join("chat-123.jsonl"),
-            index: 0,
             provider: ProviderKind::CursorAgent,
             id: "chat-123".to_string(),
             timestamp: Local::now(),
@@ -1567,7 +1559,6 @@ mod tests {
         };
         let conversation = Conversation {
             path: transcript_path,
-            index: 0,
             provider: ProviderKind::CursorAgent,
             id: "chat-entries".to_string(),
             timestamp: Local::now(),

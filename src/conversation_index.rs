@@ -230,7 +230,6 @@ fn load_provider_cache_from_conn(
                     },
                     conversation: Conversation {
                         path: PathBuf::from(source_path),
-                        index: 0,
                         provider: provider.clone(),
                         id: row.get(3)?,
                         timestamp,
@@ -403,7 +402,6 @@ mod tests {
     fn make_conversation(path: PathBuf) -> Conversation {
         Conversation {
             path,
-            index: 0,
             provider: ProviderKind::Claude,
             id: "session-1".to_string(),
             timestamp: Local::now(),

@@ -288,7 +288,6 @@ mod tests {
     fn make_conv(text: &str, timestamp: DateTime<Local>) -> Conversation {
         Conversation {
             path: PathBuf::new(),
-            index: 0,
             provider: crate::history::ProviderKind::Claude,
             id: String::new(),
             timestamp,

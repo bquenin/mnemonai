@@ -118,11 +118,6 @@ pub fn load_all_conversations(
     // Global sort by timestamp (newest first)
     all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-    // Re-index for fzf selection logic
-    for (idx, conv) in all_conversations.iter_mut().enumerate() {
-        conv.index = idx;
-    }
-
     debug::info(
         debug_level,
         &format!(
@@ -441,9 +436,7 @@ fn load_conversations_with_cache(
         .map(|n| decode_project_dir_name_to_path(&n.to_string_lossy()))
         .unwrap_or_default();
 
-    for (idx, conv) in conversations.iter_mut().enumerate() {
-        conv.index = idx;
-
+    for conv in conversations.iter_mut() {
         // Prefer the cwd extracted from the JSONL file, fall back to decoded path
         let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
         conv.project_name = Some(format_short_name_from_path(&project_path));
