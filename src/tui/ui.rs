@@ -15,60 +15,37 @@ const LINES_PER_ITEM: usize = 3;
 /// Duration before status messages auto-clear
 pub(crate) const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Known `claude-<family>-<version>-YYYYMMDD` prefixes mapped to their short
+/// display labels. Order matters: more specific prefixes (e.g. `claude-3-5-…`)
+/// must precede shorter ones (`claude-3-…`) so the right branch matches first.
+const MODEL_LABELS: &[(&str, &str)] = &[
+    ("claude-opus-4-5-", "opus-4.5"),
+    ("claude-sonnet-4-", "sonnet-4"),
+    ("claude-3-5-sonnet-", "sonnet-3.5"),
+    ("claude-3-5-haiku-", "haiku-3.5"),
+    ("claude-3-opus-", "opus-3"),
+    ("claude-3-sonnet-", "sonnet-3"),
+    ("claude-3-haiku-", "haiku-3"),
+];
+
+/// Maximum display length for an unknown model name before it is truncated.
+const MODEL_NAME_MAX_LEN: usize = 20;
+
 /// Format model name for display (e.g., "claude-opus-4-5-20251101" → "opus-4.5")
 fn format_model_name(model: &str) -> String {
-    // Handle claude-opus-4-5-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-opus-4-5-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "opus-4.5".to_string();
+    for (prefix, label) in MODEL_LABELS {
+        if let Some(rest) = model.strip_prefix(prefix)
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            return (*label).to_string();
+        }
     }
 
-    // Handle claude-sonnet-4-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-sonnet-4-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "sonnet-4".to_string();
-    }
-
-    // Handle claude-3-5-sonnet-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-3-5-sonnet-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "sonnet-3.5".to_string();
-    }
-
-    // Handle claude-3-5-haiku-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-3-5-haiku-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "haiku-3.5".to_string();
-    }
-
-    // Handle claude-3-opus-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-3-opus-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "opus-3".to_string();
-    }
-
-    // Handle claude-3-sonnet-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-3-sonnet-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "sonnet-3".to_string();
-    }
-
-    // Handle claude-3-haiku-YYYYMMDD format
-    if let Some(rest) = model.strip_prefix("claude-3-haiku-")
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return "haiku-3".to_string();
-    }
-
-    // Unknown format - truncate if too long
-    if model.len() > 20 {
-        format!("{}…", &model[..19])
+    // Unknown format - truncate if too long. Count/slice by chars (not bytes)
+    // so a non-ASCII name never panics on a mid-codepoint byte boundary.
+    if model.chars().count() > MODEL_NAME_MAX_LEN {
+        let truncated: String = model.chars().take(MODEL_NAME_MAX_LEN - 1).collect();
+        format!("{}…", truncated)
     } else {
         model.to_string()
     }
@@ -1615,6 +1592,45 @@ mod tests {
         // 19 chars + ellipsis (3 bytes in UTF-8)
         assert!(formatted.chars().count() <= 20);
         assert!(formatted.ends_with('…'));
+        // Byte-identical to the previous hand-rolled `&model[..19]` slice for ASCII.
+        assert_eq!(formatted, "very-long-unknown-m…");
+    }
+
+    #[test]
+    fn test_format_model_name_table_all_known() {
+        // Every known prefix maps to its short label for a YYYYMMDD suffix.
+        let cases = [
+            ("claude-opus-4-5-20251101", "opus-4.5"),
+            ("claude-sonnet-4-20250514", "sonnet-4"),
+            ("claude-3-5-sonnet-20241022", "sonnet-3.5"),
+            ("claude-3-5-haiku-20241022", "haiku-3.5"),
+            ("claude-3-opus-20240229", "opus-3"),
+            ("claude-3-sonnet-20240229", "sonnet-3"),
+            ("claude-3-haiku-20240307", "haiku-3"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(format_model_name(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_format_model_name_non_digit_suffix_not_matched() {
+        // A known prefix followed by a non-digit suffix is not a dated model,
+        // so it falls through to the passthrough/truncation branch.
+        assert_eq!(
+            format_model_name("claude-opus-4-5-preview"),
+            "claude-opus-4-5-pre…"
+        );
+    }
+
+    #[test]
+    fn test_format_model_name_non_ascii_does_not_panic() {
+        // Regression: the old `&model[..19]` byte slice panicked when byte 19
+        // landed mid-codepoint. A long multibyte name must truncate cleanly.
+        let name = "é".repeat(25); // 25 chars, 50 bytes; byte 19 is mid-char
+        let formatted = format_model_name(&name);
+        assert!(formatted.ends_with('…'));
+        assert_eq!(formatted.chars().count(), 20);
     }
 
     #[test]
