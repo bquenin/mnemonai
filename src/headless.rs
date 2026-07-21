@@ -395,14 +395,21 @@ fn load_global_conversations(
     debug: Option<DebugLevel>,
     provider_filter: Option<ProviderFilter>,
 ) -> Result<Vec<Conversation>> {
+    // Start every matching provider's loader before draining any receiver so
+    // the providers load in parallel: total latency is the slowest provider
+    // rather than the sum of all of them. Channels buffer, so draining them
+    // one at a time in provider order afterwards preserves the ordering and
+    // per-provider semantics of the previous sequential loop.
+    let receivers: Vec<_> = providers
+        .iter()
+        .filter(|provider| {
+            crate::loader::provider_filter_matches(provider_filter, &provider.kind())
+        })
+        .map(|provider| provider.load_conversations_streaming(show_last, debug))
+        .collect();
+
     let mut conversations = Vec::new();
-
-    for provider in providers {
-        if !crate::loader::provider_filter_matches(provider_filter, &provider.kind()) {
-            continue;
-        }
-
-        let rx = provider.load_conversations_streaming(show_last, debug);
+    for rx in receivers {
         for message in rx {
             match message {
                 LoaderMessage::Batch(mut batch) => conversations.append(&mut batch),
@@ -426,18 +433,21 @@ fn resolve_conversation<'a>(
     target: &str,
 ) -> Result<&'a Conversation> {
     let target_path = Path::new(target);
+    // Canonicalized once up front; the per-conversation canonicalization in
+    // `path_matches` is gated behind cheap comparisons so resolving a target
+    // does not pay one realpath syscall per loaded conversation.
     let target_canonical = target_path.canonicalize().ok();
 
     let matches: Vec<&Conversation> = conversations
         .iter()
         .filter(|conversation| {
-            path_matches(&conversation.path, target_path, target_canonical.as_deref())
-                || conversation.id == target
+            conversation.id == target
                 || conversation
                     .path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .is_some_and(|stem| stem == target)
+                || path_matches(&conversation.path, target_path, target_canonical.as_deref())
         })
         .collect();
 
@@ -471,12 +481,27 @@ fn resolve_conversation<'a>(
 }
 
 fn path_matches(path: &Path, target: &Path, target_canonical: Option<&Path>) -> bool {
-    path == target
-        || target_canonical.is_some_and(|canonical| {
-            path.canonicalize()
-                .map(|path| path == canonical)
-                .unwrap_or(false)
-        })
+    if path == target {
+        return true;
+    }
+    let Some(canonical) = target_canonical else {
+        return false;
+    };
+
+    // Canonicalizing costs a realpath syscall per conversation, so only pay it
+    // when a file-name prefilter passes. `canonicalize` preserves the final
+    // component's name unless that component is itself a symlink, so a
+    // canonical match implies the conversation's file name equals either the
+    // canonical target's name (regular session file) or the literal target's
+    // name (conversation path and target name the same symlink).
+    let name = path.file_name();
+    if name != canonical.file_name() && name != target.file_name() {
+        return false;
+    }
+
+    path.canonicalize()
+        .map(|path| path == canonical)
+        .unwrap_or(false)
 }
 
 impl ConversationSummary {
@@ -771,6 +796,81 @@ mod tests {
         }
     }
 
+    struct StubProvider {
+        kind: ProviderKind,
+        conversations: Vec<Conversation>,
+        fatal: bool,
+    }
+
+    impl StubProvider {
+        fn ok(kind: ProviderKind, conversations: Vec<Conversation>) -> Box<dyn Provider> {
+            Box::new(Self {
+                kind,
+                conversations,
+                fatal: false,
+            })
+        }
+
+        fn fatal(kind: ProviderKind) -> Box<dyn Provider> {
+            Box::new(Self {
+                kind,
+                conversations: Vec::new(),
+                fatal: true,
+            })
+        }
+    }
+
+    impl Provider for StubProvider {
+        fn kind(&self) -> ProviderKind {
+            self.kind.clone()
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn load_conversations(
+            &self,
+            _show_last: bool,
+            _debug: Option<DebugLevel>,
+        ) -> Result<Vec<Conversation>> {
+            if self.fatal {
+                Err(AppError::CommandError("stub failure".to_string()))
+            } else {
+                Ok(self.conversations.clone())
+            }
+        }
+
+        fn load_conversations_streaming(
+            &self,
+            _show_last: bool,
+            _debug: Option<DebugLevel>,
+        ) -> std::sync::mpsc::Receiver<LoaderMessage> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if self.fatal {
+                let _ = tx.send(LoaderMessage::Fatal(AppError::CommandError(
+                    "stub failure".to_string(),
+                )));
+            } else {
+                let _ = tx.send(LoaderMessage::Batch(self.conversations.clone()));
+                let _ = tx.send(LoaderMessage::Done);
+            }
+            rx
+        }
+
+        fn read_entries(&self, _conversation: &Conversation) -> Result<Vec<LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn resume(&self, _conversation: &Conversation, _default_args: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _conversation: &Conversation) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn summary_uses_stable_provider_key() {
         let conversation = conversation("abc", "/tmp/abc.jsonl", ProviderKind::CursorAgent);
@@ -904,6 +1004,166 @@ mod tests {
         };
 
         assert!(err.to_string().contains("No conversation found"));
+    }
+
+    #[test]
+    fn resolves_path_forms_through_canonicalization() {
+        // std::env::temp_dir() sits behind a symlink on macOS (/var ->
+        // /private/var), so the literal and canonical forms differ there; on
+        // platforms where they coincide this degenerates to literal equality.
+        let dir =
+            std::env::temp_dir().join(format!("mnemonai-headless-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let literal = dir.join("sess-canon.jsonl");
+        std::fs::write(&literal, "{}\n").unwrap();
+        let canonical = literal.canonicalize().unwrap();
+
+        // Stored canonical, target literal.
+        let conversations = vec![
+            conversation(
+                "id-canon",
+                canonical.to_str().unwrap(),
+                ProviderKind::Claude,
+            ),
+            conversation("id-other", "/tmp/other.jsonl", ProviderKind::Codex),
+        ];
+        let resolved = resolve_conversation(&conversations, literal.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.id, "id-canon");
+
+        // Stored literal, target canonical.
+        let conversations = vec![conversation(
+            "id-literal",
+            literal.to_str().unwrap(),
+            ProviderKind::Claude,
+        )];
+        let resolved = resolve_conversation(&conversations, canonical.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.id, "id-literal");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlinked_target_to_stored_real_path() {
+        // A target that is a symlink to the stored session file must still
+        // resolve even though the two paths share no literal component; the
+        // file-name prefilter must compare against the canonical target name.
+        let dir =
+            std::env::temp_dir().join(format!("mnemonai-headless-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real-session.jsonl");
+        std::fs::write(&real, "{}\n").unwrap();
+        let link = dir.join("link-session.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let stored = real.canonicalize().unwrap();
+        let conversations = vec![conversation(
+            "id-real",
+            stored.to_str().unwrap(),
+            ProviderKind::Claude,
+        )];
+
+        let resolved = resolve_conversation(&conversations, link.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.id, "id-real");
+
+        // Stored symlink path, target the same symlink through the canonical
+        // directory form: names match the literal target, not the canonical one.
+        let conversations = vec![conversation(
+            "id-link",
+            link.to_str().unwrap(),
+            ProviderKind::Claude,
+        )];
+        let target = dir.canonicalize().unwrap().join("link-session.jsonl");
+        let resolved = resolve_conversation(&conversations, target.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.id, "id-link");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn global_load_appends_providers_in_provider_order() {
+        let providers: Vec<Box<dyn Provider>> = vec![
+            StubProvider::ok(
+                ProviderKind::Claude,
+                vec![conversation(
+                    "claude-1",
+                    "/tmp/claude-1.jsonl",
+                    ProviderKind::Claude,
+                )],
+            ),
+            StubProvider::ok(
+                ProviderKind::Codex,
+                vec![conversation(
+                    "codex-1",
+                    "/tmp/codex-1.jsonl",
+                    ProviderKind::Codex,
+                )],
+            ),
+        ];
+
+        let conversations = load_global_conversations(&providers, false, None, None).unwrap();
+
+        let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["claude-1", "codex-1"]);
+    }
+
+    #[test]
+    fn global_load_skips_fatal_provider_without_filter() {
+        let providers: Vec<Box<dyn Provider>> = vec![
+            StubProvider::fatal(ProviderKind::Claude),
+            StubProvider::ok(
+                ProviderKind::Codex,
+                vec![conversation(
+                    "codex-1",
+                    "/tmp/codex-1.jsonl",
+                    ProviderKind::Codex,
+                )],
+            ),
+        ];
+
+        let conversations = load_global_conversations(&providers, false, None, None).unwrap();
+
+        let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["codex-1"]);
+    }
+
+    #[test]
+    fn global_load_fatal_is_an_error_with_provider_filter() {
+        let providers: Vec<Box<dyn Provider>> = vec![StubProvider::fatal(ProviderKind::Claude)];
+
+        let result =
+            load_global_conversations(&providers, false, None, Some(ProviderFilter::Claude));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn global_load_honors_provider_filter() {
+        let providers: Vec<Box<dyn Provider>> = vec![
+            StubProvider::ok(
+                ProviderKind::Claude,
+                vec![conversation(
+                    "claude-1",
+                    "/tmp/claude-1.jsonl",
+                    ProviderKind::Claude,
+                )],
+            ),
+            StubProvider::ok(
+                ProviderKind::Codex,
+                vec![conversation(
+                    "codex-1",
+                    "/tmp/codex-1.jsonl",
+                    ProviderKind::Codex,
+                )],
+            ),
+        ];
+
+        let conversations =
+            load_global_conversations(&providers, false, None, Some(ProviderFilter::Codex))
+                .unwrap();
+
+        let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["codex-1"]);
     }
 
     #[test]

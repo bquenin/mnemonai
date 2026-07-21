@@ -39,6 +39,11 @@ pub fn load_local(
 }
 
 /// Load conversations scoped to explicit root candidates.
+///
+/// Matching providers load in parallel (one thread each) so total latency is
+/// bounded by the slowest provider rather than the sum of all of them; the
+/// per-provider results are appended in provider order so the output matches
+/// the previous sequential implementation.
 pub fn load_scoped(
     providers: &[Box<dyn Provider>],
     show_last: bool,
@@ -46,16 +51,27 @@ pub fn load_scoped(
     provider_filter: Option<ProviderFilter>,
     roots: &[PathBuf],
 ) -> Result<Vec<Conversation>> {
-    let mut conversations = Vec::new();
-    for provider in providers {
-        if !provider_filter_matches(provider_filter, &provider.kind()) {
-            continue;
-        }
+    let results = thread::scope(|scope| {
+        let handles: Vec<_> = providers
+            .iter()
+            .filter(|provider| provider_filter_matches(provider_filter, &provider.kind()))
+            .map(|provider| scope.spawn(move || provider.load_conversations(show_last, debug)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect::<Vec<_>>()
+    });
 
-        if let Ok(mut provider_conversations) = provider.load_conversations(show_last, debug) {
-            retain_conversations_in_scope(&mut provider_conversations, roots);
-            conversations.extend(provider_conversations);
-        }
+    let mut conversations = Vec::new();
+    // Providers that fail to load are silently skipped (`flatten` drops the
+    // `Err` results), matching the previous sequential behavior.
+    for mut provider_conversations in results.into_iter().flatten() {
+        retain_conversations_in_scope(&mut provider_conversations, roots);
+        conversations.extend(provider_conversations);
     }
 
     Ok(conversations)
@@ -159,6 +175,56 @@ mod tests {
         }
     }
 
+    struct StubProvider {
+        kind: ProviderKind,
+        /// `None` simulates a provider whose load fails.
+        conversations: Option<Vec<Conversation>>,
+    }
+
+    impl Provider for StubProvider {
+        fn kind(&self) -> ProviderKind {
+            self.kind.clone()
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn load_conversations(
+            &self,
+            _show_last: bool,
+            _debug: Option<DebugLevel>,
+        ) -> Result<Vec<Conversation>> {
+            self.conversations
+                .clone()
+                .ok_or_else(|| AppError::CommandError("stub failure".to_string()))
+        }
+
+        fn load_conversations_streaming(
+            &self,
+            _show_last: bool,
+            _debug: Option<DebugLevel>,
+        ) -> Receiver<LoaderMessage> {
+            let (_tx, rx) = mpsc::channel();
+            rx
+        }
+
+        fn read_entries(
+            &self,
+            _conversation: &Conversation,
+        ) -> Result<Vec<crate::claude::LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn resume(&self, _conversation: &Conversation, _default_args: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _conversation: &Conversation) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn provider_filter_matches_expected_kinds() {
         assert!(provider_filter_matches(None, &ProviderKind::Cursor));
@@ -208,6 +274,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn load_scoped_appends_providers_in_order_and_skips_failures() {
+        let root =
+            std::env::temp_dir().join(format!("mnemonai-loader-parallel-{}", std::process::id()));
+        let outside = root.with_file_name(format!(
+            "mnemonai-loader-parallel-other-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let roots = filter_path_roots(&root).unwrap();
+
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(StubProvider {
+                kind: ProviderKind::Claude,
+                conversations: None,
+            }),
+            Box::new(StubProvider {
+                kind: ProviderKind::Codex,
+                conversations: Some(vec![
+                    conversation("codex-1", Some(root.clone()), None),
+                    conversation("codex-outside", Some(outside.clone()), None),
+                ]),
+            }),
+            Box::new(StubProvider {
+                kind: ProviderKind::Cursor,
+                conversations: Some(vec![conversation("cursor-1", Some(root.clone()), None)]),
+            }),
+        ];
+
+        // Failing providers are skipped, in-scope results keep provider order,
+        // and out-of-scope conversations are filtered.
+        let conversations = load_scoped(&providers, false, None, None, &roots).unwrap();
+        let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["codex-1", "cursor-1"]);
+
+        // The provider filter still restricts which providers load at all.
+        let conversations = load_scoped(
+            &providers,
+            false,
+            None,
+            Some(ProviderFilter::Cursor),
+            &roots,
+        )
+        .unwrap();
+        let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["cursor-1"]);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]
