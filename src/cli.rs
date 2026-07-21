@@ -1,6 +1,5 @@
 use crate::history::ProviderKind;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -26,17 +25,6 @@ impl FromStr for DebugLevel {
                 "invalid log level '{}', expected: debug, info, warn, error",
                 s
             )),
-        }
-    }
-}
-
-impl fmt::Display for DebugLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DebugLevel::Debug => write!(f, "debug"),
-            DebugLevel::Info => write!(f, "info"),
-            DebugLevel::Warn => write!(f, "warn"),
-            DebugLevel::Error => write!(f, "error"),
         }
     }
 }

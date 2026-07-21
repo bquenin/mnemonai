@@ -44,7 +44,7 @@ pub fn load_local(
 /// bounded by the slowest provider rather than the sum of all of them; the
 /// per-provider results are appended in provider order so the output matches
 /// the previous sequential implementation.
-pub fn load_scoped(
+fn load_scoped(
     providers: &[Box<dyn Provider>],
     show_last: bool,
     debug: Option<DebugLevel>,
@@ -99,7 +99,7 @@ pub fn filter_path_roots(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(roots)
 }
 
-pub fn retain_conversations_in_scope(conversations: &mut Vec<Conversation>, roots: &[PathBuf]) {
+fn retain_conversations_in_scope(conversations: &mut Vec<Conversation>, roots: &[PathBuf]) {
     conversations.retain(|conversation| conversation_matches_scope(conversation, roots));
 }
 

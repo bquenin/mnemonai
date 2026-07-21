@@ -507,20 +507,20 @@ impl TuiMarkdownRenderer {
             }
             Tag::Item => {
                 self.flush_line();
-                // Extract values from list context before calling methods
-                let (indent, bullet) = if let Some(ctx) = self.list_stack.last_mut() {
+                // Extract the bullet (indentation included) from list context before
+                // calling methods. The bullet string already embeds the indent.
+                let bullet = if let Some(ctx) = self.list_stack.last_mut() {
                     let indent = "  ".repeat(ctx.depth);
-                    let bullet = match &mut ctx.index {
-                        None => (format!("{}- ", indent), false),
+                    match &mut ctx.index {
+                        None => Some((format!("{}- ", indent), false)),
                         Some(n) => {
                             let b = format!("{}{}. ", indent, n);
                             *n += 1;
-                            (b, true)
+                            Some((b, true))
                         }
-                    };
-                    (Some(indent), Some(bullet))
+                    }
                 } else {
-                    (None, None)
+                    None
                 };
                 if let Some((text, is_numbered)) = bullet {
                     let style = if is_numbered {
@@ -533,7 +533,6 @@ impl TuiMarkdownRenderer {
                     };
                     self.push_styled_text(&text, style);
                 }
-                let _ = indent; // Mark as intentionally unused
                 self.in_list_item_start = true; // Next paragraph shouldn't add blank line
             }
             Tag::Emphasis => self.style_stack.push(MarkdownStyle::Italic),

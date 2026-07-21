@@ -849,12 +849,11 @@ fn render_export_menu(frame: &mut Frame, selected: usize, is_yank: bool) {
     } else {
         "Export to file"
     };
-    let options = [
-        "[1] Ledger (formatted)",
-        "[2] Plain text",
-        "[3] Markdown",
-        "[4] JSONL (raw)",
-    ];
+    let options: Vec<String> = crate::tui::export::ExportFormat::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, format)| format!("[{}] {}", i + 1, format.label()))
+        .collect();
 
     let area = frame.area();
     let menu_width = 35;

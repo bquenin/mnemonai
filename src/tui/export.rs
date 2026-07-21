@@ -38,14 +38,27 @@ pub enum EntryFormat {
 }
 
 impl ExportFormat {
-    /// Get format from menu option index (0-3)
+    /// All export formats in menu order. Single source of truth for the export
+    /// menu: the menu count, labels, and index mapping all derive from this.
+    pub const ALL: [ExportFormat; 4] = [
+        ExportFormat::Ledger,
+        ExportFormat::Plain,
+        ExportFormat::Markdown,
+        ExportFormat::Jsonl,
+    ];
+
+    /// Get format from menu option index (matches the order of `ALL`)
     pub fn from_index(index: usize) -> Option<Self> {
-        match index {
-            0 => Some(ExportFormat::Ledger),
-            1 => Some(ExportFormat::Plain),
-            2 => Some(ExportFormat::Markdown),
-            3 => Some(ExportFormat::Jsonl),
-            _ => None,
+        Self::ALL.get(index).copied()
+    }
+
+    /// Human-readable menu label for this format
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExportFormat::Ledger => "Ledger (formatted)",
+            ExportFormat::Plain => "Plain text",
+            ExportFormat::Markdown => "Markdown",
+            ExportFormat::Jsonl => "JSONL (raw)",
         }
     }
 

@@ -25,14 +25,14 @@ pub fn format_tool_call(name: &str, input: &Value, max_width: usize) -> Formatte
         "Grep" => format_grep(input),
         "Glob" => format_glob(input),
         "Edit" => format_edit(input),
-        "Write" => format_write(input),
+        "Write" => format_cursor_write(input),
         "WebFetch" => format_web_fetch(input),
         "WebSearch" => format_web_search(input),
         "ApplyPatch" => format_apply_patch(input),
         "SemanticSearch" => format_cursor_search(input),
         "Delete" => format_cursor_write(input),
         // Cursor tools — map to equivalent formatting
-        "run_terminal_cmd" | "run_terminal_command_v2" => format_cursor_terminal(input, max_width),
+        "run_terminal_cmd" | "run_terminal_command_v2" => format_bash(input, max_width),
         "read_file" | "read_file_v2" => format_cursor_read(input),
         "edit_file"
         | "edit_file_v2"
@@ -203,18 +203,6 @@ fn format_edit(input: &Value) -> FormattedToolCall {
     }
 }
 
-fn format_write(input: &Value) -> FormattedToolCall {
-    let file_path = input
-        .get("file_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    FormattedToolCall {
-        header: format!("Write: {}", file_path),
-        body: None,
-    }
-}
-
 fn format_web_fetch(input: &Value) -> FormattedToolCall {
     let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let prompt = input.get("prompt").and_then(|v| v.as_str());
@@ -251,37 +239,6 @@ fn format_apply_patch(input: &Value) -> FormattedToolCall {
 }
 
 // --- Cursor tool formatters ---
-
-fn format_cursor_terminal(input: &Value, max_width: usize) -> FormattedToolCall {
-    let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    let prefix = "Bash: ";
-    let prefix_len = prefix.len();
-    let available_width = max_width.saturating_sub(prefix_len);
-
-    if available_width == 0 || command.chars().count() <= available_width {
-        return FormattedToolCall {
-            header: format!("{}{}", prefix, command),
-            body: None,
-        };
-    }
-
-    let wrapped: Vec<_> = textwrap::wrap(command, available_width)
-        .into_iter()
-        .map(|cow| cow.into_owned())
-        .collect();
-    if wrapped.len() <= 1 {
-        return FormattedToolCall {
-            header: format!("{}{}", prefix, command),
-            body: None,
-        };
-    }
-    let header = format!("{}{}", prefix, wrapped[0]);
-    let body = wrapped[1..].join("\n");
-    FormattedToolCall {
-        header,
-        body: Some(body),
-    }
-}
 
 fn format_cursor_read(input: &Value) -> FormattedToolCall {
     let file_path = input

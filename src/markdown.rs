@@ -32,7 +32,6 @@ struct MarkdownRenderer {
     code_block_lang: String,
     code_block_content: String,
     pending_text: String,
-    at_line_start: bool,
     in_list_item_start: bool, // Suppress paragraph newline right after list bullet
     table_state: Option<TableState>,
 }
@@ -79,7 +78,6 @@ impl MarkdownRenderer {
             code_block_lang: String::new(),
             code_block_content: String::new(),
             pending_text: String::new(),
-            at_line_start: true,
             in_list_item_start: false,
             table_state: None,
         }
@@ -187,7 +185,6 @@ impl MarkdownRenderer {
                         }
                     }
                 }
-                self.at_line_start = false;
                 self.in_list_item_start = true; // Next paragraph shouldn't add newline
             }
             Tag::Emphasis => self.style_stack.push(TextStyle::Italic),
@@ -233,12 +230,10 @@ impl MarkdownRenderer {
             TagEnd::Paragraph => {
                 self.flush_pending();
                 self.output.push('\n');
-                self.at_line_start = true;
             }
             TagEnd::Heading(_) => {
                 self.flush_pending();
                 self.output.push('\n');
-                self.at_line_start = true;
             }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
@@ -263,7 +258,6 @@ impl MarkdownRenderer {
                 }
                 self.output.push_str(&"```".dimmed().to_string());
                 self.output.push('\n');
-                self.at_line_start = true;
             }
             TagEnd::List(_) => {
                 self.list_stack.pop();
@@ -291,7 +285,6 @@ impl MarkdownRenderer {
                     let rendered = render_table(&state.rows);
                     self.output.push_str(&rendered);
                 }
-                self.at_line_start = true;
             }
             TagEnd::TableHead | TagEnd::TableRow => {
                 if let Some(ref mut state) = self.table_state {
@@ -349,7 +342,6 @@ impl MarkdownRenderer {
     fn hard_break(&mut self) {
         self.flush_pending();
         self.output.push('\n');
-        self.at_line_start = true;
     }
 
     fn rule(&mut self) {
@@ -360,7 +352,6 @@ impl MarkdownRenderer {
         self.output
             .push_str(&"─".repeat(self.max_width.min(40)).dimmed().to_string());
         self.output.push('\n');
-        self.at_line_start = true;
     }
 
     fn flush_pending(&mut self) {
@@ -386,8 +377,6 @@ impl MarkdownRenderer {
             // Styles are already applied in text(), just output the line
             self.output.push_str(line);
         }
-
-        self.at_line_start = false;
     }
 
     fn finish(mut self) -> String {

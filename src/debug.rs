@@ -1,7 +1,7 @@
 use crate::cli::DebugLevel;
 
 /// Check if a message at `msg_level` should be printed given the configured `min_level`
-pub fn should_log(min_level: DebugLevel, msg_level: DebugLevel) -> bool {
+fn should_log(min_level: DebugLevel, msg_level: DebugLevel) -> bool {
     msg_level >= min_level
 }
 
