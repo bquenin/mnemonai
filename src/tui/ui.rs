@@ -1198,51 +1198,29 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 
             let preview = Line::from(preview_spans).style(selection_bg);
 
-            // Check for hidden matches and build context line if needed
-            let context_line = if !query_words.is_empty() {
-                // Look up full_text from searchable (ownership moved there to save memory)
-                // searchable[i].index == i is maintained by precompute and remove_selected_from_list
-                let full_text = app
-                    .searchable()
-                    .get(conv_idx)
-                    .map(|s| s.full_text.as_str())
-                    .unwrap_or("");
-                if let Some((match_pos, match_char_len)) =
-                    find_hidden_match(full_text, &truncated_preview, &query_words)
-                {
-                    let context_width = width.saturating_sub(4); // Account for indicator
-                    let context_text =
-                        extract_match_context(full_text, match_pos, match_char_len, context_width);
-
-                    // Truncate context if still too long
-                    let truncated_context = if context_text.chars().count() > context_width {
-                        let truncated: String = context_text
-                            .chars()
-                            .take(context_width.saturating_sub(1))
-                            .collect();
-                        format!("{}…", truncated)
-                    } else {
-                        context_text
-                    };
-
-                    // Build context line with highlighting (dimmer style)
-                    let context_base_style = Style::default().fg(Color::Rgb(100, 100, 100));
-                    let context_highlight_style = Style::default().fg(Color::Rgb(60, 160, 140)); // Dimmer cyan
-
-                    let mut context_spans = vec![Span::styled(indicator, indicator_style)];
-                    context_spans.extend(highlight_text(
-                        &truncated_context,
-                        &query_words,
-                        context_base_style,
-                        context_highlight_style,
-                    ));
-
-                    Some(Line::from(context_spans).style(selection_bg))
-                } else {
-                    None
-                }
-            } else {
+            // Check for hidden matches and build context line if needed.
+            // The expensive corpus scan is memoized per (query, width) inside
+            // cached_context, so per-frame work here is just re-highlighting a
+            // short cached snippet. searchable[i].index == i is maintained by
+            // precompute and remove_selected_from_list.
+            let context_line = if query_words.is_empty() {
                 None
+            } else {
+                app.cached_context(conv_idx, width, &query_words, &truncated_preview)
+                    .map(|context_text| {
+                        // Build context line with highlighting (dimmer style)
+                        let context_base_style = Style::default().fg(Color::Rgb(100, 100, 100));
+                        let context_highlight_style = Style::default().fg(Color::Rgb(60, 160, 140)); // Dimmer cyan
+
+                        let mut context_spans = vec![Span::styled(indicator, indicator_style)];
+                        context_spans.extend(highlight_text(
+                            &context_text,
+                            &query_words,
+                            context_base_style,
+                            context_highlight_style,
+                        ));
+                        Line::from(context_spans).style(selection_bg)
+                    })
             };
 
             // Separator line: dim horizontal rule (full width)
@@ -1404,101 +1382,120 @@ fn highlight_text(
     }
 }
 
-/// Find the first match in full_text that is NOT visible in the preview.
-/// Returns (byte_offset, matched_word_char_len) or None if all matches are visible.
+/// Compute the hidden-match context snippet for one list item.
+///
+/// `text_lower` is the already-lowercased conversation body (the only
+/// in-memory copy of the corpus). `truncated_preview` is the preview line as
+/// it is displayed. Returns the fully truncated context string, ready to be
+/// highlighted, or `None` when every match is already visible in the preview.
+///
+/// Because the snippet comes from the lowercased corpus, the returned context
+/// is lowercased. This is an intentional trade-off: dropping the parallel
+/// original-cased copy halves the search memory footprint, and the query
+/// highlight still lines up because matching is case-insensitive.
+pub(super) fn compute_context_snippet(
+    text_lower: &str,
+    truncated_preview: &str,
+    query_words: &[&str],
+    width: usize,
+) -> Option<String> {
+    // Lowercase the preview once (not per word) so its word-prefix matches are
+    // counted on the same footing as the already-lowercased corpus.
+    let preview_lower = truncated_preview.to_lowercase();
+    let (match_pos, match_char_len) = find_hidden_match(text_lower, &preview_lower, query_words)?;
+
+    let context_width = width.saturating_sub(4); // Account for indicator
+    let context_text = extract_match_context(text_lower, match_pos, match_char_len, context_width);
+
+    // Truncate context if still too long.
+    let truncated = if context_text.chars().count() > context_width {
+        let head: String = context_text
+            .chars()
+            .take(context_width.saturating_sub(1))
+            .collect();
+        format!("{}…", head)
+    } else {
+        context_text
+    };
+    Some(truncated)
+}
+
+/// Count words in an already-lowercased `text` whose start matches any of the
+/// (already-lowercased) `query_words` as a prefix. A "word" is a maximal run of
+/// non-separator characters. Single pass, no per-word allocations.
+fn count_prefix_matches(text_lower: &str, query_words: &[&str]) -> usize {
+    let mut count = 0;
+    let mut word_start: Option<usize> = None;
+    for (i, c) in text_lower.char_indices() {
+        if is_word_separator(c) {
+            if let Some(start) = word_start.take() {
+                let word = &text_lower[start..i];
+                if query_words.iter().any(|&qw| word.starts_with(qw)) {
+                    count += 1;
+                }
+            }
+        } else if word_start.is_none() {
+            word_start = Some(i);
+        }
+    }
+    if let Some(start) = word_start {
+        let word = &text_lower[start..];
+        if query_words.iter().any(|&qw| word.starts_with(qw)) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Find the first match in `text_lower` that is NOT visible in the preview.
+/// Returns (byte_offset, matched_prefix_char_len) or None if all matches are
+/// visible. Both `text_lower` and `query_words` are already lowercased, so no
+/// per-word lowercasing is needed. Counting the "extra" match and locating it
+/// are merged into a single early-exit pass over the corpus.
 fn find_hidden_match(
-    full_text: &str,
-    preview: &str,
+    text_lower: &str,
+    preview_lower: &str,
     query_words: &[&str],
 ) -> Option<(usize, usize)> {
     if query_words.is_empty() {
         return None;
     }
 
-    // Count word prefix matches in text using single-pass iteration
-    // Uses original text chars and lowercases words individually to avoid Unicode index issues
-    let count_word_matches = |text: &str| -> usize {
-        let chars: Vec<char> = text.chars().collect();
-        let char_to_byte: Vec<usize> = text
-            .char_indices()
-            .map(|(byte_idx, _)| byte_idx)
-            .chain(std::iter::once(text.len()))
-            .collect();
+    let preview_matches = count_prefix_matches(preview_lower, query_words);
 
-        let mut count = 0;
-        let mut prev_sep = true;
+    // Walk the corpus word by word; the (preview_matches + 1)th matching word
+    // is the first match not already shown in the preview.
+    let mut match_count = 0;
+    let mut word_start: Option<usize> = None;
 
-        for (i, &c) in chars.iter().enumerate() {
-            let is_sep = is_word_separator(c);
-            if !is_sep && prev_sep {
-                // Word start - find word end
-                let word_end = chars[i..]
-                    .iter()
-                    .position(|&c| is_word_separator(c))
-                    .map(|p| i + p)
-                    .unwrap_or(chars.len());
-
-                // Extract and lowercase word
-                let start_byte = char_to_byte[i];
-                let end_byte = char_to_byte[word_end];
-                let word = &text[start_byte..end_byte];
-                let word_lower = word.to_lowercase();
-
-                if query_words.iter().any(|&qw| word_lower.starts_with(qw)) {
-                    count += 1;
-                }
+    // Small helper so we can early-return with the byte offset from either the
+    // in-loop word ends or the trailing word.
+    let check = |start: usize, end: usize, match_count: &mut usize| -> Option<(usize, usize)> {
+        let word = &text_lower[start..end];
+        if let Some(qw) = query_words.iter().find(|&&qw| word.starts_with(qw)) {
+            *match_count += 1;
+            if *match_count > preview_matches {
+                return Some((start, qw.chars().count()));
             }
-            prev_sep = is_sep;
         }
-        count
+        None
     };
 
-    let preview_matches = count_word_matches(preview);
-    let full_matches = count_word_matches(full_text);
-
-    if full_matches <= preview_matches {
-        return None;
-    }
-
-    // Find the (preview_matches + 1)th match in full_text using single-pass
-    // Use original text chars to avoid Unicode index mismatch
-    let chars: Vec<char> = full_text.chars().collect();
-
-    // Build char-to-byte mapping from original text
-    let char_to_byte: Vec<usize> = full_text
-        .char_indices()
-        .map(|(byte_idx, _)| byte_idx)
-        .chain(std::iter::once(full_text.len()))
-        .collect();
-
-    let mut match_count = 0;
-    let mut prev_sep = true;
-
-    for (i, &c) in chars.iter().enumerate() {
-        let is_sep = is_word_separator(c);
-        if !is_sep && prev_sep {
-            // Word start
-            let word_end = chars[i..]
-                .iter()
-                .position(|&c| is_word_separator(c))
-                .map(|p| i + p)
-                .unwrap_or(chars.len());
-
-            // Extract and lowercase word
-            let start_byte = char_to_byte[i];
-            let end_byte = char_to_byte[word_end];
-            let word = &full_text[start_byte..end_byte];
-            let word_lower = word.to_lowercase();
-
-            if let Some(&qw) = query_words.iter().find(|&&qw| word_lower.starts_with(qw)) {
-                match_count += 1;
-                if match_count > preview_matches {
-                    // Return byte offset and the matched prefix length
-                    return Some((start_byte, qw.chars().count()));
-                }
+    for (i, c) in text_lower.char_indices() {
+        if is_word_separator(c) {
+            if let Some(start) = word_start.take()
+                && let Some(hit) = check(start, i, &mut match_count)
+            {
+                return Some(hit);
             }
+        } else if word_start.is_none() {
+            word_start = Some(i);
         }
-        prev_sep = is_sep;
+    }
+    if let Some(start) = word_start
+        && let Some(hit) = check(start, text_lower.len(), &mut match_count)
+    {
+        return Some(hit);
     }
 
     None
@@ -1660,5 +1657,151 @@ mod tests {
         assert_eq!(format_tokens_long(1000), "1k tokens");
         assert_eq!(format_tokens_long(926000), "926k tokens");
         assert_eq!(format_tokens_long(1_500_000), "1.5M tokens");
+    }
+
+    // --- Hidden-match context regression tests ---
+    //
+    // The single-pass matcher and lowercased-corpus context must reproduce the
+    // previous implementation's behavior (modulo the documented lowercasing).
+    // Below is a verbatim reimplementation of the old algorithm — which
+    // operated on the original-cased corpus and lowercased each word
+    // individually — used as an oracle.
+
+    /// Old `find_hidden_match`, kept as a test oracle. Operates on original-case
+    /// text and per-word lowercasing, exactly as the pre-rewrite code did.
+    fn old_find_hidden_match(
+        full_text: &str,
+        preview: &str,
+        query_words: &[&str],
+    ) -> Option<(usize, usize)> {
+        if query_words.is_empty() {
+            return None;
+        }
+        let count_word_matches = |text: &str| -> usize {
+            let chars: Vec<char> = text.chars().collect();
+            let char_to_byte: Vec<usize> = text
+                .char_indices()
+                .map(|(byte_idx, _)| byte_idx)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            let mut count = 0;
+            let mut prev_sep = true;
+            for (i, &c) in chars.iter().enumerate() {
+                let is_sep = is_word_separator(c);
+                if !is_sep && prev_sep {
+                    let word_end = chars[i..]
+                        .iter()
+                        .position(|&c| is_word_separator(c))
+                        .map(|p| i + p)
+                        .unwrap_or(chars.len());
+                    let word = &text[char_to_byte[i]..char_to_byte[word_end]];
+                    let word_lower = word.to_lowercase();
+                    if query_words.iter().any(|&qw| word_lower.starts_with(qw)) {
+                        count += 1;
+                    }
+                }
+                prev_sep = is_sep;
+            }
+            count
+        };
+        let preview_matches = count_word_matches(preview);
+        let full_matches = count_word_matches(full_text);
+        if full_matches <= preview_matches {
+            return None;
+        }
+        let chars: Vec<char> = full_text.chars().collect();
+        let char_to_byte: Vec<usize> = full_text
+            .char_indices()
+            .map(|(byte_idx, _)| byte_idx)
+            .chain(std::iter::once(full_text.len()))
+            .collect();
+        let mut match_count = 0;
+        let mut prev_sep = true;
+        for (i, &c) in chars.iter().enumerate() {
+            let is_sep = is_word_separator(c);
+            if !is_sep && prev_sep {
+                let word_end = chars[i..]
+                    .iter()
+                    .position(|&c| is_word_separator(c))
+                    .map(|p| i + p)
+                    .unwrap_or(chars.len());
+                let start_byte = char_to_byte[i];
+                let word = &full_text[start_byte..char_to_byte[word_end]];
+                let word_lower = word.to_lowercase();
+                if let Some(&qw) = query_words.iter().find(|&&qw| word_lower.starts_with(qw)) {
+                    match_count += 1;
+                    if match_count > preview_matches {
+                        return Some((start_byte, qw.chars().count()));
+                    }
+                }
+            }
+            prev_sep = is_sep;
+        }
+        None
+    }
+
+    /// ASCII fixtures: mixed case, whole-word vs prefix, trailing word, and the
+    /// "all matches visible in preview" case. For ASCII, lowercasing does not
+    /// change byte offsets, so the new matcher (fed lowercased inputs) must
+    /// return byte-identical results to the old one.
+    fn matcher_fixtures() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+        vec![
+            // Hidden match past the preview.
+            (
+                "Deploy the App and DEPLOY again later",
+                "Deploy the App",
+                vec!["deploy"],
+            ),
+            // Prefix matching: "auth" matches "authentication".
+            ("intro text Authentication flow", "intro text", vec!["auth"]),
+            // Trailing word is the hidden match (no trailing separator).
+            ("alpha beta gamma", "alpha beta", vec!["gamma"]),
+            // Every match already visible in the preview -> None.
+            ("hello world extra", "hello world extra", vec!["hello"]),
+            // Multiple query words, first-matching-word ordering.
+            ("foo bar Baz qux", "foo", vec!["baz", "bar"]),
+            // No matches at all.
+            ("nothing to see here", "nothing", vec!["zzz"]),
+        ]
+    }
+
+    #[test]
+    fn single_pass_matcher_matches_old_semantics() {
+        for (full, preview, query_words) in matcher_fixtures() {
+            let old = old_find_hidden_match(full, preview, &query_words);
+            // The rewrite feeds already-lowercased corpus + preview.
+            let new =
+                find_hidden_match(&full.to_lowercase(), &preview.to_lowercase(), &query_words);
+            assert_eq!(
+                old, new,
+                "matcher diverged for full={full:?} preview={preview:?} query={query_words:?}"
+            );
+        }
+    }
+
+    /// The rendered context line must equal the previous implementation's,
+    /// case-insensitively (the corpus is now lowercased before slicing).
+    #[test]
+    fn context_snippet_matches_old_implementation_case_insensitively() {
+        let width = 60usize;
+        for (full, preview, query_words) in matcher_fixtures() {
+            // Old path: find on original text, extract from original text.
+            let old = old_find_hidden_match(full, preview, &query_words).map(|(pos, len)| {
+                let context_width = width.saturating_sub(4);
+                let ctx = extract_match_context(full, pos, len, context_width);
+                if ctx.chars().count() > context_width {
+                    let head: String = ctx.chars().take(context_width.saturating_sub(1)).collect();
+                    format!("{}…", head)
+                } else {
+                    ctx
+                }
+            });
+            let new = compute_context_snippet(&full.to_lowercase(), preview, &query_words, width);
+            assert_eq!(
+                old.map(|s| s.to_lowercase()),
+                new,
+                "context diverged for full={full:?} preview={preview:?} query={query_words:?}"
+            );
+        }
     }
 }

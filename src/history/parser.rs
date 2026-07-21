@@ -793,8 +793,6 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
         model: extracted_model,
         total_tokens,
         duration_minutes,
-        search_text_lower: None,
-        search_topic_end: None,
     }))
 }
 

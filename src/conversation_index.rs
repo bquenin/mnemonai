@@ -235,10 +235,6 @@ fn load_provider_cache_from_conn(
                         timestamp,
                         preview: row.get(5)?,
                         full_text: row.get(6)?,
-                        // Derived in parallel by precompute_search_text at
-                        // startup; cheaper than reading them from disk.
-                        search_text_lower: None,
-                        search_topic_end: None,
                         project_name: row.get(7)?,
                         project_path: optional_path(row.get(8)?),
                         cwd: optional_path(row.get(9)?),
@@ -416,8 +412,6 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-            search_text_lower: None,
-            search_topic_end: None,
         }
     }
 
@@ -464,14 +458,12 @@ mod tests {
         assert_eq!(loaded.parse_errors.len(), 1);
         assert_eq!(loaded.parse_errors[0].line_number, 7);
         assert_eq!(loaded.full_text, "Hello Cache Body");
-        // Search text is recomputed at startup rather than persisted.
-        assert!(loaded.search_text_lower.is_none());
     }
 
     #[test]
     fn init_schema_rebuilds_drifted_table() {
         // Simulate a table created by an older build: same name, missing the
-        // full_text/search_text_lower columns the current code requires.
+        // full_text column the current code requires.
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE file_conversations (
