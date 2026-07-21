@@ -56,7 +56,7 @@ struct ConvInfo {
 
 impl CursorProvider {
     pub fn new() -> Self {
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = home::home_dir().unwrap_or_default();
         let cursor_user = home
             .join("Library")
             .join("Application Support")
@@ -289,11 +289,8 @@ fn query_user_bubble_keys(conn: &Connection, show_last: bool) -> HashMap<String,
 /// Open (or create) the sidecar cache database for user bubble keys.
 /// Returns None on any error — callers fall back to the full query.
 fn open_cache_db() -> Option<Connection> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("mnemonai");
+    let home = home::home_dir()?;
+    let dir = home.join(".local").join("state").join("mnemonai");
     std::fs::create_dir_all(&dir).ok()?;
     let db_path = dir.join("cursor_cache.db");
     let conn = Connection::open(&db_path).ok()?;
@@ -1527,7 +1524,7 @@ fn truncate_str(s: &str, max_bytes: usize) -> String {
 }
 
 fn is_extension_installed() -> bool {
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = home::home_dir().unwrap_or_default();
     let extensions_dir = home.join(".cursor").join("extensions");
     let ext_dir = extensions_dir.join("mnemonai.mnemonai-bridge-0.1.0");
 
@@ -1560,7 +1557,7 @@ fn is_extension_installed() -> bool {
 }
 
 fn install_extension() -> Result<()> {
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = home::home_dir().unwrap_or_default();
     let extensions_dir = home.join(".cursor").join("extensions");
     let ext_dir = extensions_dir.join("mnemonai.mnemonai-bridge-0.1.0");
 

@@ -248,11 +248,8 @@ fn load_provider_cache_from_conn(
 }
 
 fn open_index_db() -> Option<Connection> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("mnemonai");
+    let home = home::home_dir()?;
+    let dir = home.join(".local").join("state").join("mnemonai");
     std::fs::create_dir_all(&dir).ok()?;
     let mut conn = Connection::open(dir.join("conversation_index.db")).ok()?;
     // Providers load and save in parallel threads; wait for the write lock
