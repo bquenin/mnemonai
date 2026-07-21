@@ -1,6 +1,7 @@
 use crate::history::ProviderKind;
 use crate::tui::app::{
-    App, AppMode, DialogMode, LineStyle, LoadingState, RenderedLine, ViewSearchMode, ViewState,
+    App, AppMode, DialogMode, LineStyle, LoadingState, RenderedLine, ViewHeader, ViewSearchMode,
+    ViewState,
 };
 use crate::tui::search::is_word_separator;
 use chrono::{DateTime, Local};
@@ -184,65 +185,86 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(status, area);
 }
 
-/// Check if the header (with summary) fits on a single line given terminal width
-fn header_fits_single_line(conv: &crate::history::Conversation, terminal_width: u16) -> bool {
-    let summary = match &conv.summary {
-        Some(s) => s,
-        None => return true, // No summary means it's already single line
+/// Resolve the width-independent header metadata for a conversation once, so the
+/// render path never re-derives these strings (or re-scans `conversations`)
+/// every frame. Width-dependent decisions (fits-single-line, long/short token
+/// form) are made later at render time from the returned lengths.
+pub(crate) fn build_view_header(
+    conv: Option<&crate::history::Conversation>,
+    path: &std::path::Path,
+) -> ViewHeader {
+    let Some(conv) = conv else {
+        // Fallback when the conversation could not be parsed/resolved.
+        let project = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        return ViewHeader {
+            provider: None,
+            project,
+            model: None,
+            msg_count: String::new(),
+            duration: None,
+            timestamp: String::new(),
+            summary: None,
+            total_tokens: 0,
+            base_len: 0,
+            single_line_len: 0,
+        };
     };
 
-    let project = conv.project_name.as_deref().unwrap_or("Unknown");
-
-    // Calculate model length if present
-    let model_len = conv
-        .model
-        .as_ref()
-        .map(|m| format_model_name(m).len() + 3) // + " · "
-        .unwrap_or(0);
-
-    let msg_count_len = if conv.message_count == 1 {
-        "1 message".len()
+    let project = conv
+        .project_name
+        .as_deref()
+        .unwrap_or("Unknown")
+        .to_string();
+    let model = conv.model.as_ref().map(|m| format_model_name(m));
+    let msg_count = if conv.message_count == 1 {
+        "1 message".to_string()
     } else {
-        format!("{} messages", conv.message_count).len()
+        format!("{} messages", conv.message_count)
     };
+    let duration = conv.duration_minutes.map(|m| {
+        if m >= 60 {
+            format!("{}h {}m", m / 60, m % 60)
+        } else {
+            format!("{}m", m)
+        }
+    });
+    let timestamp = conv.timestamp.format("%Y-%m-%d %H:%M").to_string();
+    let summary = conv.summary.clone();
 
-    // Calculate tokens length if present (use long form for single-line check)
+    // Metadata length up to the timestamp, excluding tokens and summary; used to
+    // pick the long/short token form at render time.
+    let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
+    let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
+    let badge_len = provider_badge_text(conv.provider).len();
+    let base_len =
+        2 + badge_len + project.len() + 3 + model_len + msg_count.len() + duration_len + 3 + 16; // 16 = timestamp "YYYY-MM-DD HH:MM"
+
+    // Full single-line length uses the long token form and the summary, matching
+    // the historical fits-on-one-line calculation.
     let tokens_len = if conv.total_tokens > 0 {
         format_tokens_long(conv.total_tokens).len() + 3 // + " · "
     } else {
         0
     };
+    let summary_len = summary.as_ref().map(|s| s.len()).unwrap_or(0);
+    let single_line_len = base_len + tokens_len + 3 + summary_len;
 
-    // timestamp is "YYYY-MM-DD HH:MM" = 16 chars
-    let timestamp_len = 16;
-
-    // Duration length (if present): " · Xm" or " · Xh Ym" etc.
-    let duration_len = conv.duration_minutes.map_or(0, |m| {
-        let formatted = if m >= 60 {
-            format!("{}h {}m", m / 60, m % 60)
-        } else {
-            format!("{}m", m)
-        };
-        3 + formatted.len() // " · " + duration
-    });
-
-    let badge_len = provider_badge_text(conv.provider).len();
-
-    // Format: "  [Provider] project · model · msg_count · duration · tokens · timestamp · summary"
-    let total_len = 2
-        + badge_len
-        + project.len()
-        + 3
-        + model_len
-        + msg_count_len
-        + duration_len
-        + 3
-        + tokens_len
-        + timestamp_len
-        + 3
-        + summary.len();
-
-    total_len <= terminal_width as usize
+    ViewHeader {
+        provider: Some(conv.provider),
+        project,
+        model,
+        msg_count,
+        duration,
+        timestamp,
+        summary,
+        total_tokens: conv.total_tokens,
+        base_len,
+        single_line_len,
+    }
 }
 
 /// Render the view mode (conversation viewer)
@@ -256,13 +278,10 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
         1
     };
 
-    // Check if conversation has summary for header height
-    let conv = app
-        .conversations()
-        .iter()
-        .find(|c| c.path == state.conversation_path);
-    let has_summary = conv.is_some_and(|c| c.summary.is_some());
-    let fits_single_line = conv.is_some_and(|c| header_fits_single_line(c, area.width));
+    // Header metadata is precomputed on view entry; only the fits-single-line
+    // decision depends on the current terminal width.
+    let has_summary = state.header.summary.is_some();
+    let fits_single_line = state.header.fits_single_line(area.width);
     let header_height = if has_summary && !fits_single_line {
         3
     } else {
@@ -279,7 +298,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
         ])
         .split(area);
 
-    render_view_header(frame, app, state, chunks[0]);
+    render_view_header(frame, &state.header, fits_single_line, chunks[0]);
     render_view_content(frame, state, chunks[1]);
 
     if state.search_mode == ViewSearchMode::Typing {
@@ -298,96 +317,38 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
     }
 }
 
-fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
-    // Find the conversation by path (works for both list and single file mode)
-    let conv = app
-        .conversations()
-        .iter()
-        .find(|c| c.path == state.conversation_path);
+fn render_view_header(frame: &mut Frame, header: &ViewHeader, fits_single: bool, area: Rect) {
+    let ViewHeader {
+        provider,
+        project,
+        model,
+        msg_count,
+        duration,
+        timestamp,
+        summary,
+        total_tokens,
+        base_len,
+        ..
+    } = header;
 
-    let (project, model, msg_count, duration, tokens, timestamp, summary, fits_single) =
-        if let Some(conv) = conv {
-            let project = conv.project_name.as_deref().unwrap_or("Unknown");
-            let model = conv.model.as_ref().map(|m| format_model_name(m));
-            let msg_count = if conv.message_count == 1 {
-                "1 message".to_string()
-            } else {
-                format!("{} messages", conv.message_count)
-            };
-            // Format conversation duration
-            let duration = conv.duration_minutes.map(|m| {
-                if m >= 60 {
-                    format!("{}h {}m", m / 60, m % 60)
-                } else {
-                    format!("{}m", m)
-                }
-            });
-
-            // Calculate header length to determine if long token format fits
-            let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
-            let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
-            let badge_len = provider_badge_text(conv.provider).len();
-            let base_len = 2
-                + badge_len
-                + project.len()
-                + 3
-                + model_len
-                + msg_count.len()
-                + duration_len
-                + 3
-                + 16; // 16 = timestamp
-
-            let tokens = if conv.total_tokens > 0 {
-                let long_form = format_tokens_long(conv.total_tokens);
-                let short_form = format_tokens(conv.total_tokens);
-                // Use long form if it fits (base + " · " + tokens <= width)
-                if base_len + 3 + long_form.len() <= area.width as usize {
-                    Some(long_form)
-                } else {
-                    Some(short_form)
-                }
-            } else {
-                None
-            };
-
-            let timestamp = conv.timestamp.format("%Y-%m-%d %H:%M").to_string();
-            let fits = header_fits_single_line(conv, area.width);
-            (
-                project.to_string(),
-                model,
-                msg_count,
-                duration,
-                tokens,
-                timestamp,
-                conv.summary.clone(),
-                fits,
-            )
+    // Only the token form depends on width: prefer the long form when it fits.
+    let tokens = if *total_tokens > 0 {
+        let long_form = format_tokens_long(*total_tokens);
+        // Use long form if it fits (base + " · " + tokens <= width)
+        if *base_len + 3 + long_form.len() <= area.width as usize {
+            Some(long_form)
         } else {
-            // Fallback if parsing failed
-            let project = state
-                .conversation_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            (
-                project,
-                None,
-                "".to_string(),
-                None,
-                None,
-                "".to_string(),
-                None,
-                true,
-            )
-        };
+            Some(format_tokens(*total_tokens))
+        }
+    } else {
+        None
+    };
 
     // Build header spans for metadata line
-    let conv_provider = conv.map(|c| c.provider);
     let build_metadata_spans = |include_summary: bool| {
         let mut spans = vec![Span::raw("  ")];
-        if let Some(provider) = conv_provider {
-            spans.push(provider_badge(provider));
+        if let Some(p) = provider {
+            spans.push(provider_badge(*p));
         }
         spans.push(Span::styled(
             project.clone(),
@@ -395,7 +356,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
         ));
 
         // Add model if present
-        if let Some(ref m) = model {
+        if let Some(m) = model {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 m.clone(),
@@ -410,7 +371,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
         ));
 
         // Add conversation duration if present
-        if let Some(ref d) = duration {
+        if let Some(d) = duration {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 d.clone(),
@@ -419,7 +380,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
         }
 
         // Add tokens if present
-        if let Some(ref t) = tokens {
+        if let Some(t) = &tokens {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 t.clone(),
@@ -434,7 +395,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
         ));
 
         // Add summary if requested
-        if include_summary && let Some(ref s) = summary {
+        if include_summary && let Some(s) = summary {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 s.clone(),
@@ -457,7 +418,10 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
         if let Some(summary_text) = summary {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(summary_text, Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled(
+                    summary_text.clone(),
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
             ]));
         }
         lines
@@ -484,9 +448,12 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
         .take(visible_height)
         .map(|(line_idx, rendered)| {
             let is_current_match = state.search_matches.get(state.current_match) == Some(&line_idx);
-            let has_match = !query_lower.is_empty() && state.search_matches.contains(&line_idx);
+            // search_matches is built in ascending line order, so a binary
+            // search replaces the per-line linear scan.
+            let has_match =
+                !query_lower.is_empty() && state.search_matches.binary_search(&line_idx).is_ok();
 
-            let spans: Vec<Span> = if has_match && !query_lower.is_empty() {
+            let spans: Vec<Span> = if has_match {
                 highlight_line_matches(rendered, &query_lower, is_current_match)
             } else {
                 rendered
@@ -612,11 +579,11 @@ fn render_search_input(frame: &mut Frame, state: &ViewState, area: Rect) {
 /// Highlight search matches across the full line text, handling matches that span
 /// across multiple styled spans. Works by finding match positions in the concatenated
 /// line text, then rebuilding spans with highlights applied at the correct positions.
-fn highlight_line_matches(
-    rendered: &RenderedLine,
+fn highlight_line_matches<'a>(
+    rendered: &'a RenderedLine,
     query: &str,
     is_current_match: bool,
-) -> Vec<Span<'static>> {
+) -> Vec<Span<'a>> {
     // Concatenate all span texts to get the full line
     let full_text: String = rendered
         .spans
@@ -672,7 +639,7 @@ fn highlight_line_matches(
     };
 
     // Build output spans by walking through original spans and splitting at match boundaries
-    let mut result: Vec<Span<'static>> = Vec::new();
+    let mut result: Vec<Span<'a>> = Vec::new();
     let mut match_idx = 0;
     let mut global_offset: usize = 0;
 
@@ -743,8 +710,11 @@ fn build_style(style: &LineStyle) -> Style {
     s
 }
 
-fn styled_span(text: &str, style: &LineStyle) -> Span<'static> {
-    Span::styled(text.to_string(), build_style(style))
+/// Borrow the span text rather than cloning it: every visible line is rebuilt
+/// each frame, so avoiding a `to_string` per span removes an allocation per
+/// visible span per frame. The returned span borrows `text`.
+fn styled_span<'a>(text: &'a str, style: &LineStyle) -> Span<'a> {
+    Span::styled(text, build_style(style))
 }
 
 fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
