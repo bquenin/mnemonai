@@ -158,16 +158,27 @@ pub fn prune_conversations(provider: ProviderKind, paths: &[PathBuf]) {
         return;
     };
 
-    let Ok(tx) = conn.transaction() else {
-        return;
-    };
-    for path in paths {
-        let _ = tx.execute(
-            "DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2",
-            params![provider.key(), path.to_string_lossy()],
-        );
+    let _ = prune_conversations_from_conn(&mut conn, provider, paths);
+}
+
+fn prune_conversations_from_conn(
+    conn: &mut Connection,
+    provider: ProviderKind,
+    paths: &[PathBuf],
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+
+    {
+        let mut stmt =
+            tx.prepare("DELETE FROM file_conversations WHERE provider = ?1 AND source_path = ?2")?;
+        let provider_key = provider.key();
+
+        for path in paths {
+            stmt.execute(params![provider_key, path.to_string_lossy()])?;
+        }
     }
-    let _ = tx.commit();
+
+    tx.commit()
 }
 
 fn delete_conversation_from_conn(
@@ -317,29 +328,46 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     // column" — and the cache never reads or writes again. Validate the column
     // set and rebuild on drift; this is a cache, so the only cost is one
     // re-parse of changed providers.
-    if table_matches_expected_columns(conn)? {
-        return Ok(());
+    if !table_matches_expected_columns(conn)? {
+        // Re-check under the write lock: providers open this database
+        // concurrently at startup, and the check-then-rebuild must be atomic
+        // so a stale check can never drop a table another connection just
+        // rebuilt (and possibly populated). Exactly one connection rebuilds;
+        // the rest see the fresh table here and leave it alone.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let drifted = !table_matches_expected_columns(&tx)?;
+        if drifted {
+            tx.execute_batch("DROP TABLE IF EXISTS file_conversations;")?;
+            tx.execute_batch(CREATE_TABLE_SQL)?;
+        }
+        tx.commit()?;
+
+        if drifted {
+            // Return the dropped table's pages to the filesystem; without
+            // this a previously bloated database file keeps its size forever.
+            // Best-effort: VACUUM cannot run inside the transaction above.
+            let _ = conn.execute_batch("VACUUM;");
+        }
     }
 
-    // Re-check under the write lock: providers open this database concurrently
-    // at startup, and the check-then-rebuild must be atomic so a stale check
-    // can never drop a table another connection just rebuilt (and possibly
-    // populated). Exactly one connection rebuilds; the rest see the fresh
-    // table here and leave it alone.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let drifted = !table_matches_expected_columns(&tx)?;
-    if drifted {
-        tx.execute_batch("DROP TABLE IF EXISTS file_conversations;")?;
-        tx.execute_batch(CREATE_TABLE_SQL)?;
-    }
-    tx.commit()?;
+    // Prune and single-file deletes filter on provider + source_path, which
+    // is not a prefix of the primary key, so without this index each of those
+    // DELETEs scans the whole table. Dropping the table above also drops the
+    // index; recreate it after the drift check.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_file_conversations_provider_path
+             ON file_conversations (provider, source_path);",
+    )?;
 
-    if drifted {
-        // Return the dropped table's pages to the filesystem; without this a
-        // previously bloated database file keeps its size forever. Best-effort:
-        // VACUUM cannot run inside the transaction above.
-        let _ = conn.execute_batch("VACUUM;");
-    }
+    // Rows are keyed by schema_version, so a version bump that keeps the
+    // column set unchanged (no drift rebuild) strands the previous version's
+    // rows, full_text payloads included: loads filter them out, saves write
+    // new rows beside them, and prune never matches them. Purge them here; on
+    // a fresh or just-rebuilt table this deletes nothing.
+    conn.execute(
+        "DELETE FROM file_conversations WHERE schema_version != ?1",
+        params![SCHEMA_VERSION],
+    )?;
     Ok(())
 }
 
@@ -506,6 +534,45 @@ mod tests {
     }
 
     #[test]
+    fn init_schema_purges_rows_from_other_schema_versions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&mut conn).unwrap();
+        let stale = make_conversation(PathBuf::from("/tmp/stale.jsonl"));
+        let current = make_conversation(PathBuf::from("/tmp/current.jsonl"));
+        let fingerprint = SourceFingerprint {
+            modified_millis: 1,
+            size: 2,
+        };
+        save_conversations_to_conn(
+            &mut conn,
+            ProviderKind::Claude,
+            false,
+            [(&stale, fingerprint), (&current, fingerprint)],
+        )
+        .unwrap();
+        // Rewrite one row as if a previous build with the same column set (so
+        // no drift rebuild) had written it under an older SCHEMA_VERSION.
+        conn.execute(
+            "UPDATE file_conversations SET schema_version = ?1 WHERE source_path = ?2",
+            params![SCHEMA_VERSION - 1, stale.path.to_string_lossy()],
+        )
+        .unwrap();
+
+        // The next open must purge the old-version row and keep the current
+        // one; without the purge it would linger in the file forever.
+        init_schema(&mut conn).unwrap();
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_conversations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
+        let cache = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        assert!(cache.contains_key(&current.path));
+    }
+
+    #[test]
     fn delete_conversation_removes_cached_rows_for_all_preview_modes() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_schema(&mut conn).unwrap();
@@ -542,5 +609,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn prune_removes_only_the_given_paths_for_the_given_provider() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&mut conn).unwrap();
+        let pruned = make_conversation(PathBuf::from("/tmp/pruned.jsonl"));
+        let kept = make_conversation(PathBuf::from("/tmp/kept.jsonl"));
+        let fingerprint = SourceFingerprint {
+            modified_millis: 1,
+            size: 2,
+        };
+        save_conversations_to_conn(
+            &mut conn,
+            ProviderKind::Claude,
+            false,
+            [(&pruned, fingerprint), (&kept, fingerprint)],
+        )
+        .unwrap();
+        // The same source path cached for another provider must survive a
+        // Claude prune.
+        save_conversations_to_conn(
+            &mut conn,
+            ProviderKind::Codex,
+            false,
+            [(&pruned, fingerprint)],
+        )
+        .unwrap();
+
+        prune_conversations_from_conn(
+            &mut conn,
+            ProviderKind::Claude,
+            std::slice::from_ref(&pruned.path),
+        )
+        .unwrap();
+
+        let claude = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        assert!(!claude.contains_key(&pruned.path));
+        assert!(claude.contains_key(&kept.path));
+        let codex = load_provider_cache_from_conn(&conn, ProviderKind::Codex, false).unwrap();
+        assert!(codex.contains_key(&pruned.path));
     }
 }
