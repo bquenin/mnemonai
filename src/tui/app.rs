@@ -16,7 +16,13 @@ use ratatui::prelude::*;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long the terminal width must stay stable before an interactive resize
+/// triggers a full re-wrap of the viewer content. Without this, every
+/// intermediate width during a drag-resize would run the markdown + syntect
+/// render pipeline.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// Returns (label, color, dim_color) for a provider
 pub(crate) fn provider_theme(kind: &ProviderKind) -> (String, (u8, u8, u8), (u8, u8, u8)) {
@@ -52,7 +58,11 @@ pub enum AppMode {
     /// List mode - browsing conversations
     List,
     /// View mode - reading a conversation
-    View(ViewState),
+    ///
+    /// Boxed to keep `AppMode` small: `ViewState` is large relative to the
+    /// other variants (it carries precomputed header metadata and rendered
+    /// lines), so storing it inline would bloat every `AppMode` value.
+    View(Box<ViewState>),
 }
 
 /// State for the conversation viewer
@@ -84,6 +94,53 @@ pub struct ViewState {
     pub current_match: usize,
     /// Cached log entries to avoid re-reading from disk on toggle
     pub cached_entries: Vec<LogEntry>,
+    /// Width-independent header metadata, precomputed on view entry so the
+    /// render path never re-resolves the conversation or re-derives header
+    /// strings every frame.
+    pub header: ViewHeader,
+    /// Pending debounced resize: the target content width and the instant the
+    /// width last changed. `None` when no re-wrap is queued.
+    pub pending_resize: Option<(usize, Instant)>,
+}
+
+/// Width-independent header metadata for the conversation viewer.
+///
+/// Everything here is resolved once when the view is entered; only the
+/// fits-on-one-line decision and the long/short token form depend on the
+/// current terminal width and are computed at render time.
+#[derive(Clone, Debug)]
+pub struct ViewHeader {
+    /// Provider badge (None when the conversation could not be resolved).
+    pub provider: Option<ProviderKind>,
+    /// Project display name.
+    pub project: String,
+    /// Formatted model name, if known.
+    pub model: Option<String>,
+    /// "N messages" (or "1 message").
+    pub msg_count: String,
+    /// Formatted conversation duration, if known.
+    pub duration: Option<String>,
+    /// Formatted timestamp ("YYYY-MM-DD HH:MM"), empty when unresolved.
+    pub timestamp: String,
+    /// Conversation summary, if any.
+    pub summary: Option<String>,
+    /// Total token count (0 when unknown / not shown).
+    pub total_tokens: u64,
+    /// Metadata length up to and including the timestamp, excluding the token
+    /// column and the summary. Used at render time to choose the long or short
+    /// token form.
+    pub base_len: usize,
+    /// Full single-line length using the long token form and the summary,
+    /// matching the historical fits-on-one-line calculation.
+    pub single_line_len: usize,
+}
+
+impl ViewHeader {
+    /// Whether the whole header (including summary) fits on one line at the
+    /// given terminal width. A header without a summary is always single-line.
+    pub fn fits_single_line(&self, terminal_width: u16) -> bool {
+        self.summary.is_none() || self.single_line_len <= terminal_width as usize
+    }
 }
 
 /// Search mode within view
@@ -101,6 +158,26 @@ pub enum ViewSearchMode {
 #[derive(Clone, Debug)]
 pub struct RenderedLine {
     pub spans: Vec<(String, LineStyle)>,
+    /// Lowercased concatenation of every span's text, computed once at
+    /// construction. In-view `/` search matches against this cache with a
+    /// single `contains` instead of re-joining and re-lowercasing every line on
+    /// every keystroke.
+    pub full_text_lower: String,
+}
+
+impl RenderedLine {
+    /// Build a rendered line, precomputing its lowercased full-text cache.
+    pub fn new(spans: Vec<(String, LineStyle)>) -> Self {
+        let full_text_lower = spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>()
+            .to_lowercase();
+        Self {
+            spans,
+            full_text_lower,
+        }
+    }
 }
 
 /// Style information for a span
@@ -236,6 +313,8 @@ impl App {
             selected = Some(0);
         }
 
+        let header = ui::build_view_header(conversations.first(), &path);
+
         Self {
             conversations,
             searchable: Vec::new(),
@@ -247,7 +326,7 @@ impl App {
             use_relative_time,
             loading_state: LoadingState::Ready,
             dialog_mode: DialogMode::None,
-            app_mode: AppMode::View(ViewState {
+            app_mode: AppMode::View(Box::new(ViewState {
                 conversation_path: path,
                 scroll_offset: 0,
                 rendered_lines: Vec::new(),
@@ -261,7 +340,9 @@ impl App {
                 search_matches: Vec::new(),
                 current_match: 0,
                 cached_entries: Vec::new(),
-            }),
+                header,
+                pending_resize: None,
+            })),
             status_message: None,
             tool_display,
             show_thinking,
@@ -1097,17 +1178,25 @@ impl App {
     fn handle_search_typing_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
             KeyCode::Char(c) => {
+                let previous_query = match &self.app_mode {
+                    AppMode::View(state) => state.search_query.clone(),
+                    _ => String::new(),
+                };
                 if let AppMode::View(ref mut state) = self.app_mode {
                     state.search_query.push(c);
                 }
-                self.update_search_results();
+                self.update_search_results(&previous_query);
                 None
             }
             KeyCode::Backspace => {
+                let previous_query = match &self.app_mode {
+                    AppMode::View(state) => state.search_query.clone(),
+                    _ => String::new(),
+                };
                 if let AppMode::View(ref mut state) = self.app_mode {
                     state.search_query.pop();
                 }
-                self.update_search_results();
+                self.update_search_results(&previous_query);
                 None
             }
             KeyCode::Enter => {
@@ -1369,6 +1458,7 @@ impl App {
         };
         let conv = &self.conversations[conv_idx];
         let path = conv.path.clone();
+        let header = ui::build_view_header(Some(conv), &path);
 
         let (assistant_label, assistant_color, assistant_dim_color) =
             provider_theme(&conv.provider);
@@ -1397,7 +1487,7 @@ impl App {
             Ok(entries) => {
                 let rendered_lines = render_entries(&entries, &options);
                 let total_lines = rendered_lines.len();
-                self.app_mode = AppMode::View(ViewState {
+                self.app_mode = AppMode::View(Box::new(ViewState {
                     conversation_path: path,
                     scroll_offset: 0,
                     rendered_lines,
@@ -1411,7 +1501,9 @@ impl App {
                     search_matches: Vec::new(),
                     current_match: 0,
                     cached_entries: entries,
-                });
+                    header,
+                    pending_resize: None,
+                }));
             }
             Err(e) => {
                 self.status_message =
@@ -1435,8 +1527,9 @@ impl App {
         }
     }
 
-    /// Update search results based on current query
-    fn update_search_results(&mut self) {
+    /// Update search results based on current query. `previous_query` is the
+    /// query text from before this keystroke, used to narrow incrementally.
+    fn update_search_results(&mut self, previous_query: &str) {
         if let AppMode::View(ref mut state) = self.app_mode {
             let query_lower = state.search_query.to_lowercase();
             if query_lower.is_empty() {
@@ -1444,13 +1537,23 @@ impl App {
                 return;
             }
 
-            state.search_matches = state
-                .rendered_lines
-                .iter()
-                .enumerate()
-                .filter(|(_, line)| line_matches_query(line, &query_lower))
-                .map(|(i, _)| i)
-                .collect();
+            // When the new query extends the previous one, its matches are a
+            // subset of the previous matches (substring `contains` is
+            // monotonic under extension), so filter the existing set instead of
+            // rescanning every rendered line.
+            let prev_lower = previous_query.to_lowercase();
+            let extends_previous = !prev_lower.is_empty()
+                && query_lower.len() > prev_lower.len()
+                && query_lower.starts_with(&prev_lower);
+
+            state.search_matches = if extends_previous {
+                std::mem::take(&mut state.search_matches)
+                    .into_iter()
+                    .filter(|&i| line_matches_query(&state.rendered_lines[i], &query_lower))
+                    .collect()
+            } else {
+                compute_search_matches(state, &query_lower)
+            };
 
             // Jump to first match if any
             if !state.search_matches.is_empty() {
@@ -1575,16 +1678,15 @@ impl App {
                 let max_scroll = state.total_lines.saturating_sub(viewport_height);
                 state.scroll_offset = old_scroll.min(max_scroll);
 
-                // Recompute search matches for new content
-                if state.search_mode == ViewSearchMode::Active && !state.search_query.is_empty() {
+                // Recompute search matches for new content. This must cover
+                // Typing as well as Active: `update_search_results` narrows the
+                // existing match set in place when the query extends, which is
+                // only sound if the stored indices refer to the current
+                // `rendered_lines` (a debounced resize re-wrap can land while
+                // the user is still typing).
+                if state.search_mode != ViewSearchMode::Off && !state.search_query.is_empty() {
                     let query_lower = state.search_query.to_lowercase();
-                    state.search_matches = state
-                        .rendered_lines
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, line)| line_matches_query(line, &query_lower))
-                        .map(|(i, _)| i)
-                        .collect();
+                    state.search_matches = compute_search_matches(state, &query_lower);
 
                     // Clamp current_match to valid range
                     if state.search_matches.is_empty() {
@@ -1599,22 +1701,73 @@ impl App {
     }
 
     /// Check if view needs re-render due to width change.
-    /// Returns true when the view content was re-wrapped for a new width, so
-    /// the caller knows a redraw is needed.
+    ///
+    /// Re-wrapping runs the markdown + syntect pipeline, so during an
+    /// interactive drag-resize (where the width changes on many consecutive
+    /// frames) the work is debounced: the re-wrap only fires once the width has
+    /// stayed stable for [`RESIZE_DEBOUNCE`]. The very first render (initial
+    /// width not yet established) is immediate so the view appears without
+    /// delay.
+    ///
+    /// Returns true when the view content was actually re-wrapped, so the
+    /// caller knows a redraw is needed. While a re-wrap is queued,
+    /// [`App::has_pending_resize`] stays true so the event loop keeps polling
+    /// and the final wrap converges without requiring input.
     pub fn check_view_resize(
         &mut self,
         new_content_width: usize,
         viewport_height: usize,
         providers: &[Box<dyn Provider>],
     ) -> bool {
-        if let AppMode::View(ref mut state) = self.app_mode
-            && state.content_width != new_content_width
+        let AppMode::View(ref mut state) = self.app_mode else {
+            return false;
+        };
+
+        // Initial render: width not yet established. Render immediately.
+        if state.content_width == 0 {
+            if new_content_width != 0 {
+                state.content_width = new_content_width;
+                state.pending_resize = None;
+                self.re_render_view(viewport_height, providers);
+                return true;
+            }
+            return false;
+        }
+
+        if new_content_width != state.content_width {
+            // Width differs from what we last rendered: (re)arm the debounce,
+            // resetting the timer whenever the target width itself changes so we
+            // only commit once the width has settled.
+            match state.pending_resize {
+                Some((w, _)) if w == new_content_width => {}
+                _ => state.pending_resize = Some((new_content_width, Instant::now())),
+            }
+        } else if state.pending_resize.is_some() {
+            // Width bounced back to the currently-rendered value before the
+            // debounce fired; cancel the queued re-wrap.
+            state.pending_resize = None;
+            return false;
+        }
+
+        // Commit once the pending width has been stable for the debounce window.
+        if let Some((w, changed_at)) = state.pending_resize
+            && w == new_content_width
+            && changed_at.elapsed() >= RESIZE_DEBOUNCE
         {
-            state.content_width = new_content_width;
+            state.content_width = w;
+            state.pending_resize = None;
             self.re_render_view(viewport_height, providers);
             return true;
         }
+
         false
+    }
+
+    /// Whether a debounced resize re-wrap is queued but not yet committed. The
+    /// event loop uses this to keep polling so the final wrap converges without
+    /// waiting for input.
+    pub fn has_pending_resize(&self) -> bool {
+        matches!(&self.app_mode, AppMode::View(state) if state.pending_resize.is_some())
     }
 }
 
@@ -1623,11 +1776,25 @@ struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
-/// Check if a rendered line matches the search query by concatenating all span texts.
-/// This allows multi-word queries to match across span boundaries.
+/// Check if a rendered line matches the search query. Matching is done against
+/// the line's precomputed lowercased full-text cache, so a multi-word query
+/// still matches across span boundaries without re-joining or re-lowercasing.
+/// `query_lower` must already be lowercased.
 pub fn line_matches_query(line: &RenderedLine, query_lower: &str) -> bool {
-    let full_text: String = line.spans.iter().map(|(text, _)| text.as_str()).collect();
-    full_text.to_lowercase().contains(query_lower)
+    line.full_text_lower.contains(query_lower)
+}
+
+/// Ascending list of line indices whose text contains `query_lower`. Shared by
+/// the interactive `/` matcher and the post-re-render recompute so the two can
+/// never drift. `query_lower` must already be lowercased.
+fn compute_search_matches(state: &ViewState, query_lower: &str) -> Vec<usize> {
+    state
+        .rendered_lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line_matches_query(line, query_lower))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 impl TerminalGuard {
@@ -1767,11 +1934,12 @@ pub fn run_with_loader(
         // longer since a poll that returns false costs nothing when we skip the
         // draw. Relative timestamps (Accuracy::Rough) only change at coarse
         // granularity and intentionally do not force periodic redraws here.
-        let poll_timeout = if app.is_loading() || app.has_visible_status_message() {
-            Duration::from_millis(50)
-        } else {
-            Duration::from_millis(250)
-        };
+        let poll_timeout =
+            if app.is_loading() || app.has_visible_status_message() || app.has_pending_resize() {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(250)
+            };
 
         if event::poll(poll_timeout).map_err(|e| AppError::Io(io::Error::other(e)))? {
             match event::read().map_err(|e| AppError::Io(io::Error::other(e)))? {
@@ -1874,6 +2042,14 @@ pub fn run_single_file(
         app.check_view_resize(content_width, viewport_height, providers);
 
         guard.terminal.draw(|frame| ui::render(frame, &app))?;
+
+        // While a resize re-wrap is queued, poll so the debounce converges to a
+        // correctly-wrapped final frame without requiring any input.
+        if app.has_pending_resize()
+            && !event::poll(RESIZE_DEBOUNCE).map_err(|e| AppError::Io(io::Error::other(e)))?
+        {
+            continue;
+        }
 
         if let Event::Key(key) = event::read().map_err(|e| AppError::Io(io::Error::other(e)))?
             && key.kind == KeyEventKind::Press
@@ -2034,7 +2210,13 @@ mod tests {
     }
 
     fn enter_view_mode(app: &mut App, conversation_path: PathBuf) {
-        app.app_mode = AppMode::View(ViewState {
+        let header = ui::build_view_header(
+            app.conversations
+                .iter()
+                .find(|c| c.path == conversation_path),
+            &conversation_path,
+        );
+        app.app_mode = AppMode::View(Box::new(ViewState {
             conversation_path,
             scroll_offset: 0,
             rendered_lines: Vec::new(),
@@ -2048,7 +2230,9 @@ mod tests {
             search_matches: Vec::new(),
             current_match: 0,
             cached_entries: Vec::new(),
-        });
+            header,
+            pending_resize: None,
+        }));
     }
 
     /// JSONL export must write the raw transcript file even when the
@@ -2106,5 +2290,216 @@ mod tests {
             message,
             "JSONL export is not available for Cursor conversations"
         );
+    }
+
+    fn rendered_line(pieces: &[&str]) -> RenderedLine {
+        let spans = pieces
+            .iter()
+            .map(|p| (p.to_string(), LineStyle::default()))
+            .collect();
+        RenderedLine::new(spans)
+    }
+
+    fn view_state_with_lines(lines: Vec<RenderedLine>) -> ViewState {
+        let path = PathBuf::from("/tmp/conv-0.jsonl");
+        let header = ui::build_view_header(None, &path);
+        let total_lines = lines.len();
+        ViewState {
+            conversation_path: path,
+            scroll_offset: 0,
+            rendered_lines: lines,
+            total_lines,
+            tool_display: ToolDisplayMode::Hidden,
+            show_thinking: false,
+            show_timing: false,
+            content_width: 80,
+            search_mode: ViewSearchMode::Off,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match: 0,
+            cached_entries: Vec::new(),
+            header,
+            pending_resize: None,
+        }
+    }
+
+    /// The lowercased full-text cache must join every span and lowercase it, so
+    /// a query matches across span boundaries and regardless of case.
+    #[test]
+    fn rendered_line_full_text_cache_joins_and_lowercases() {
+        let line = rendered_line(&["Hello, ", "WORLD"]);
+        assert_eq!(line.full_text_lower, "hello, world");
+
+        // Match spanning the boundary between the two spans.
+        assert!(line_matches_query(&line, "o, wo"));
+        // Case-insensitive.
+        assert!(line_matches_query(&line, "world"));
+        // Non-match.
+        assert!(!line_matches_query(&line, "planet"));
+    }
+
+    /// Finding: rendering looks matches up with `binary_search` instead of a
+    /// linear scan. That is only correct if the match indices are ascending and
+    /// cover exactly the lines whose text contains the query. This pins the
+    /// equivalence render_view_content relies on.
+    #[test]
+    fn compute_search_matches_is_binary_search_equivalent() {
+        let state = view_state_with_lines(vec![
+            rendered_line(&["alpha ", "BETA"]),
+            rendered_line(&["gamma"]),
+            rendered_line(&["beta again"]),
+            rendered_line(&["delta"]),
+            rendered_line(&["Be", "Ta"]),
+        ]);
+        let query = "beta";
+        let matches = compute_search_matches(&state, query);
+
+        // Indices are ascending (the binary_search precondition).
+        assert!(matches.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(matches, vec![0, 2, 4]);
+
+        // For every line, binary_search over the match set agrees with a direct
+        // `line_matches_query` check.
+        for (idx, line) in state.rendered_lines.iter().enumerate() {
+            assert_eq!(
+                matches.binary_search(&idx).is_ok(),
+                line_matches_query(line, query),
+                "mismatch at line {idx}"
+            );
+        }
+    }
+
+    /// Extending a query narrows the previous match set (substring `contains` is
+    /// monotonic under extension): every line matching the longer query also
+    /// matched the shorter prefix. `update_search_results` filters in place on
+    /// this basis, so the narrowed set must equal a full recompute.
+    #[test]
+    fn extending_query_narrows_to_same_matches_as_recompute() {
+        let state = view_state_with_lines(vec![
+            rendered_line(&["the quick brown fox"]),
+            rendered_line(&["quilt"]),
+            rendered_line(&["quiet"]),
+            rendered_line(&["quick quick"]),
+        ]);
+
+        let short = compute_search_matches(&state, "qui");
+        assert_eq!(short, vec![0, 1, 2, 3]);
+
+        let long = compute_search_matches(&state, "quick");
+        assert_eq!(long, vec![0, 3]);
+
+        // Narrowing the short set by the longer query yields the recomputed set.
+        let narrowed: Vec<usize> = short
+            .into_iter()
+            .filter(|&i| line_matches_query(&state.rendered_lines[i], "quick"))
+            .collect();
+        assert_eq!(narrowed, long);
+    }
+
+    /// A debounced resize re-wrap can land while the user is still typing a
+    /// search query. The re-render must recompute the match set in Typing mode
+    /// too: `update_search_results` narrows the stored indices in place on the
+    /// next keystroke, which would index out of bounds if they still referred
+    /// to the previous (longer) wrap.
+    #[test]
+    fn re_render_during_typing_recomputes_matches_before_narrowing() {
+        use crate::claude::{LogEntry, UserContent, UserMessage};
+
+        let mut app = app_with_conversations(vec![make_conv("hi", 0)]);
+        enter_view_mode(&mut app, PathBuf::from("/tmp/conv-0.jsonl"));
+
+        let providers: Vec<Box<dyn Provider>> = Vec::new();
+        let text = format!("{}betamatch ending", "filler words ".repeat(40));
+        if let AppMode::View(ref mut state) = app.app_mode {
+            state.cached_entries = vec![LogEntry::User {
+                message: UserMessage {
+                    content: UserContent::String(text),
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                cwd: None,
+            }];
+            // Narrow width: the message wraps into many lines, so the match
+            // lands at a high line index.
+            state.content_width = 12;
+        }
+        app.re_render_view(20, &providers);
+
+        if let AppMode::View(ref mut state) = app.app_mode {
+            state.search_mode = ViewSearchMode::Typing;
+        }
+        for ch in "beta".chars() {
+            app.handle_search_typing_key(KeyCode::Char(ch));
+        }
+        let stale_matches = match &app.app_mode {
+            AppMode::View(state) => state.search_matches.clone(),
+            _ => unreachable!(),
+        };
+        assert!(!stale_matches.is_empty());
+
+        // Simulate the debounced resize committing a much wider wrap: far
+        // fewer rendered lines, so the previous indices no longer exist.
+        if let AppMode::View(ref mut state) = app.app_mode {
+            state.content_width = 4000;
+        }
+        app.re_render_view(20, &providers);
+
+        let AppMode::View(ref state) = app.app_mode else {
+            panic!("expected view mode");
+        };
+        assert!(
+            state.rendered_lines.len() <= *stale_matches.last().unwrap(),
+            "test precondition: the new wrap must be shorter than the stale match index \
+             (lines: {}, stale index: {})",
+            state.rendered_lines.len(),
+            stale_matches.last().unwrap()
+        );
+        assert_eq!(
+            state.search_matches,
+            compute_search_matches(state, "beta"),
+            "typing-mode matches must be recomputed against the new wrap"
+        );
+
+        // The next keystroke narrows in place; with stale indices this panics
+        // with an index out of bounds.
+        app.handle_search_typing_key(KeyCode::Char('m'));
+
+        let AppMode::View(ref state) = app.app_mode else {
+            panic!("expected view mode");
+        };
+        assert_eq!(state.search_matches, compute_search_matches(state, "betam"));
+        assert!(!state.search_matches.is_empty());
+    }
+
+    /// End-to-end: typing characters one at a time (which narrows incrementally)
+    /// must produce the same match set and current-match jump as a single full
+    /// search of the final query.
+    #[test]
+    fn incremental_typing_matches_full_search() {
+        let mut app = app_with_conversations(vec![make_conv("hi", 0)]);
+        let path = PathBuf::from("/tmp/conv-0.jsonl");
+        enter_view_mode(&mut app, path);
+        if let AppMode::View(ref mut state) = app.app_mode {
+            state.rendered_lines = vec![
+                RenderedLine::new(vec![("alpha beta".to_string(), LineStyle::default())]),
+                RenderedLine::new(vec![("beta gamma".to_string(), LineStyle::default())]),
+                RenderedLine::new(vec![("delta".to_string(), LineStyle::default())]),
+                RenderedLine::new(vec![("betamax".to_string(), LineStyle::default())]),
+            ];
+            state.total_lines = 4;
+            state.search_mode = ViewSearchMode::Typing;
+        }
+
+        // Type "beta" one char at a time through the real keystroke handler.
+        for ch in "beta".chars() {
+            app.handle_search_typing_key(KeyCode::Char(ch));
+        }
+
+        let AppMode::View(ref state) = app.app_mode else {
+            panic!("expected view mode");
+        };
+        assert_eq!(state.search_matches, vec![0, 1, 3]);
+        // Jumped to the first match.
+        assert_eq!(state.current_match, 0);
+        assert_eq!(state.scroll_offset, 0);
     }
 }
