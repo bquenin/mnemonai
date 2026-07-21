@@ -7,9 +7,8 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# Run format, clippy-fix, and build in parallel
-[parallel]
-check: format clippy-fix build
+# Run format, clippy-fix, build, and test in sequence
+check: format clippy-fix build test
 
 # Run check and fail if there are uncommitted changes (for CI)
 check-ci: check
@@ -28,15 +27,19 @@ format:
 
 # Run clippy with all warnings
 clippy:
-    cargo clippy -- -W clippy::all
+    cargo clippy --all-targets -- -W clippy::all
 
 # Auto-fix clippy warnings
 clippy-fix:
-    cargo clippy --fix --allow-dirty -- -W clippy::all
+    cargo clippy --fix --allow-dirty --all-targets -- -W clippy::all
 
 # Build the project
 build:
-    cargo build --all
+    cargo build --workspace
+
+# Run tests
+test:
+    cargo test --workspace
 
 # Install debug binary globally via symlink
 install-dev:
