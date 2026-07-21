@@ -9,12 +9,13 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
-use crate::claude::{ContentBlock, LogEntry, UserContent, UserMessage};
+use crate::claude::{ContentBlock, LogEntry, UserContent, UserMessage, extract_tool_result_text};
+use crate::text_processing::process_command_message;
 use crate::tool_format;
+use crate::tui::viewer::read_log_entries;
 use arboard::Clipboard;
 use chrono::Local;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::Path;
 
 /// Export format options
@@ -97,16 +98,43 @@ pub struct ExportOptions {
     pub assistant_label: String,
 }
 
+/// Write export content to a timestamped file in the current directory.
+///
+/// Shared by both the file-based export path and the entry-based export path
+/// so the filename scheme and status messages stay identical.
+pub fn save_to_file(content: &str, ext: &str) -> ExportResult {
+    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+    let filename = format!("conversation-{}.{}", timestamp, ext);
+
+    match fs::write(&filename, content) {
+        Ok(_) => ExportResult {
+            message: format!("Exported to {}", filename),
+        },
+        Err(e) => ExportResult {
+            message: format!("Failed to write: {}", e),
+        },
+    }
+}
+
+/// Copy text to the clipboard, returning a formatted status message on failure.
+///
+/// Shared by every clipboard action (export, path yank, session-id yank) so the
+/// clipboard mechanics and error messages stay identical.
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    match Clipboard::new() {
+        Ok(mut clipboard) => clipboard
+            .set_text(text)
+            .map_err(|e| format!("Clipboard error: {}", e)),
+        Err(e) => Err(format!("Clipboard unavailable: {}", e)),
+    }
+}
+
 /// Export conversation to file
 pub fn export_to_file(
     source_path: &Path,
     format: ExportFormat,
     options: ExportOptions,
 ) -> ExportResult {
-    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
-    let ext = format.extension();
-    let filename = format!("conversation-{}.{}", timestamp, ext);
-
     let content = match generate_content(source_path, format, options) {
         Ok(c) => c,
         Err(e) => {
@@ -116,14 +144,7 @@ pub fn export_to_file(
         }
     };
 
-    match fs::write(&filename, &content) {
-        Ok(_) => ExportResult {
-            message: format!("Exported to {}", filename),
-        },
-        Err(e) => ExportResult {
-            message: format!("Failed to write: {}", e),
-        },
-    }
+    save_to_file(&content, format.extension())
 }
 
 /// Copy conversation to clipboard
@@ -141,18 +162,11 @@ pub fn export_to_clipboard(
         }
     };
 
-    match Clipboard::new() {
-        Ok(mut clipboard) => match clipboard.set_text(&content) {
-            Ok(_) => ExportResult {
-                message: "Copied to clipboard".to_string(),
-            },
-            Err(e) => ExportResult {
-                message: format!("Clipboard error: {}", e),
-            },
+    match copy_to_clipboard(&content) {
+        Ok(()) => ExportResult {
+            message: "Copied to clipboard".to_string(),
         },
-        Err(e) => ExportResult {
-            message: format!("Clipboard unavailable: {}", e),
-        },
+        Err(message) => ExportResult { message },
     }
 }
 
@@ -165,7 +179,7 @@ fn generate_content(
     match format.entry_format() {
         None => fs::read_to_string(source_path),
         Some(entry_format) => {
-            let entries = read_entries_from_file(source_path)?;
+            let entries = read_log_entries(source_path)?;
             Ok(generate_content_from_entries(
                 &entries,
                 entry_format,
@@ -173,22 +187,6 @@ fn generate_content(
             ))
         }
     }
-}
-
-/// Read log entries from a JSONL file for export.
-///
-/// Unreadable lines are skipped rather than aborting the read, so a single
-/// corrupt line doesn't truncate an otherwise-parseable transcript.
-#[allow(clippy::lines_filter_map_ok)]
-fn read_entries_from_file(path: &Path) -> std::io::Result<Vec<LogEntry>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    Ok(reader
-        .lines()
-        .filter_map(|l| l.ok())
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(&l).ok())
-        .collect())
 }
 
 /// Generate content in the specified format from pre-parsed entries
@@ -374,11 +372,11 @@ fn append_ledger_block(output: &mut String, speaker: &str, text: &str, name_widt
 /// Extract text from a user message, handling command messages
 fn extract_user_text(message: &UserMessage) -> Option<String> {
     match &message.content {
-        UserContent::String(s) => process_command_text(s),
+        UserContent::String(s) => process_command_message(s),
         UserContent::Blocks(blocks) => {
             for block in blocks {
                 if let ContentBlock::Text { text } = block
-                    && let Some(processed) = process_command_text(text)
+                    && let Some(processed) = process_command_message(text)
                 {
                     return Some(processed);
                 }
@@ -386,49 +384,6 @@ fn extract_user_text(message: &UserMessage) -> Option<String> {
             None
         }
     }
-}
-
-/// Process command message text, extracting content from XML tags
-fn process_command_text(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-
-    // Handle <local-command-stdout> tags
-    if trimmed.starts_with("<local-command-stdout>") && trimmed.ends_with("</local-command-stdout>")
-    {
-        let inner = &trimmed
-            ["<local-command-stdout>".len()..trimmed.len() - "</local-command-stdout>".len()];
-        if inner.trim().is_empty() {
-            return None;
-        }
-        return Some(inner.trim().to_string());
-    }
-
-    // Handle <command-name> tags
-    if let Some(start) = trimmed.find("<command-name>")
-        && let Some(end) = trimmed.find("</command-name>")
-    {
-        let content_start = start + "<command-name>".len();
-        if content_start < end {
-            let command_name = &trimmed[content_start..end];
-
-            // Also extract command args if present
-            if let Some(args_start) = trimmed.find("<command-args>")
-                && let Some(args_end) = trimmed.find("</command-args>")
-            {
-                let args_content_start = args_start + "<command-args>".len();
-                if args_content_start < args_end {
-                    let args = trimmed[args_content_start..args_end].trim();
-                    if !args.is_empty() {
-                        return Some(format!("{} {}", command_name, args));
-                    }
-                }
-            }
-
-            return Some(command_name.to_string());
-        }
-    }
-
-    Some(text.to_string())
 }
 
 /// Wrap content in markdown code fence, handling nested backticks
@@ -457,26 +412,19 @@ fn format_tool_call_for_export(name: &str, input: &serde_json::Value) -> String 
     }
 }
 
-/// Format tool result content for export
+/// Format tool result content for export.
+///
+/// Text and text-block-array results share `extract_tool_result_text` with the
+/// viewer; anything else falls back to pretty-printed JSON.
 fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            // Handle array of content blocks
-            let texts: Vec<&str> = arr
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                texts.join("\n\n")
-            } else {
-                serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "<error>".to_string())
+    match extract_tool_result_text(content) {
+        Some(text) => text,
+        None => match content {
+            Some(value) => {
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| "<error>".to_string())
             }
-        }
-        Some(value) => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| "<error>".to_string())
-        }
-        None => "<no content>".to_string(),
+            None => "<no content>".to_string(),
+        },
     }
 }
 
@@ -519,5 +467,99 @@ mod tests {
             Some(EntryFormat::Markdown)
         ));
         assert!(ExportFormat::Jsonl.entry_format().is_none());
+    }
+
+    fn user_string(text: &str) -> UserMessage {
+        UserMessage {
+            content: UserContent::String(text.to_string()),
+        }
+    }
+
+    /// Export must skip `/clear` command messages, matching the viewer. Before
+    /// consolidation the export copy displayed `/clear` as a normal command.
+    #[test]
+    fn extract_user_text_skips_clear_command() {
+        assert_eq!(
+            extract_user_text(&user_string("<command-name>/clear</command-name>")),
+            None
+        );
+        assert_eq!(
+            extract_user_text(&user_string("<command-name>/clear</command-name>")),
+            process_command_message("<command-name>/clear</command-name>")
+        );
+    }
+
+    /// Export must skip `<local-command-caveat>` blocks, matching the viewer.
+    /// Before consolidation the export copy emitted the caveat text verbatim.
+    #[test]
+    fn extract_user_text_skips_local_command_caveat() {
+        let caveat = "<local-command-caveat>Caveat: system generated.</local-command-caveat>";
+        assert_eq!(extract_user_text(&user_string(caveat)), None);
+        assert_eq!(
+            extract_user_text(&user_string(caveat)),
+            process_command_message(caveat)
+        );
+    }
+
+    /// Export must unwrap Cursor-Agent `<user_query>`/`<timestamp>` tags,
+    /// matching the viewer. Before consolidation the export copy kept the tags.
+    #[test]
+    fn extract_user_text_unwraps_cursor_tags() {
+        let text = "<timestamp>Thursday, May 7, 2026, 10:12 PM (UTC-7)</timestamp>\n<user_query>\nperfect thanks\n</user_query>";
+        assert_eq!(
+            extract_user_text(&user_string(text)),
+            Some("perfect thanks".to_string())
+        );
+        assert_eq!(
+            extract_user_text(&user_string(text)),
+            process_command_message(text)
+        );
+    }
+
+    /// A non-command message still passes through unchanged.
+    #[test]
+    fn extract_user_text_preserves_normal_text() {
+        assert_eq!(
+            extract_user_text(&user_string("Hello world")),
+            Some("Hello world".to_string())
+        );
+    }
+
+    /// Text and text-block-array tool results must match `extract_tool_result_text`
+    /// so export and viewer render identical content.
+    #[test]
+    fn tool_result_export_matches_extract_for_text() {
+        let string_content = serde_json::json!("plain result");
+        assert_eq!(
+            format_tool_result_for_export(Some(&string_content)),
+            extract_tool_result_text(Some(&string_content)).unwrap()
+        );
+
+        let array_content = serde_json::json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"},
+        ]);
+        assert_eq!(
+            format_tool_result_for_export(Some(&array_content)),
+            "first\n\nsecond"
+        );
+        assert_eq!(
+            format_tool_result_for_export(Some(&array_content)),
+            extract_tool_result_text(Some(&array_content)).unwrap()
+        );
+    }
+
+    /// Non-text JSON has no extractable text, so export falls back to
+    /// pretty-printed JSON; missing content reports `<no content>`.
+    #[test]
+    fn tool_result_export_falls_back_to_pretty_json() {
+        let object_content = serde_json::json!({"exit_code": 0});
+        assert!(extract_tool_result_text(Some(&object_content)).is_none());
+        assert_eq!(
+            format_tool_result_for_export(Some(&object_content)),
+            serde_json::to_string_pretty(&object_content).unwrap()
+        );
+
+        assert_eq!(format_tool_result_for_export(None), "<no content>");
     }
 }

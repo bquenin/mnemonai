@@ -733,26 +733,14 @@ impl App {
                         export_options,
                     );
                     if to_clipboard {
-                        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&content)) {
+                        match crate::tui::export::copy_to_clipboard(&content) {
                             Ok(()) => crate::tui::export::ExportResult {
                                 message: "Copied to clipboard".to_string(),
                             },
-                            Err(e) => crate::tui::export::ExportResult {
-                                message: format!("Clipboard error: {}", e),
-                            },
+                            Err(message) => crate::tui::export::ExportResult { message },
                         }
                     } else {
-                        let timestamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S");
-                        let ext = format.extension();
-                        let filename = format!("conversation-{}.{}", timestamp, ext);
-                        match std::fs::write(&filename, &content) {
-                            Ok(_) => crate::tui::export::ExportResult {
-                                message: format!("Exported to {}", filename),
-                            },
-                            Err(e) => crate::tui::export::ExportResult {
-                                message: format!("Failed to write: {}", e),
-                            },
-                        }
+                        crate::tui::export::save_to_file(&content, format.extension())
                     }
                 }
                 Err(e) => crate::tui::export::ExportResult {
@@ -967,20 +955,11 @@ impl App {
             KeyCode::Char('Y') => {
                 if let AppMode::View(ref state) = self.app_mode {
                     let path_str = state.conversation_path.display().to_string();
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&path_str)) {
-                        Ok(()) => {
-                            self.status_message = Some((
-                                "Path copied to clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_message = Some((
-                                format!("Clipboard error: {}", e),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
+                    let message = match crate::tui::export::copy_to_clipboard(&path_str) {
+                        Ok(()) => "Path copied to clipboard".to_string(),
+                        Err(message) => message,
+                    };
+                    self.status_message = Some((message, std::time::Instant::now()));
                 }
                 None
             }
@@ -990,20 +969,11 @@ impl App {
                 if let AppMode::View(ref state) = self.app_mode
                     && let Some(id) = state.conversation_path.file_stem().and_then(|s| s.to_str())
                 {
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(id)) {
-                        Ok(()) => {
-                            self.status_message = Some((
-                                "Session ID copied to clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_message = Some((
-                                format!("Clipboard error: {}", e),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
+                    let message = match crate::tui::export::copy_to_clipboard(id) {
+                        Ok(()) => "Session ID copied to clipboard".to_string(),
+                        Err(message) => message,
+                    };
+                    self.status_message = Some((message, std::time::Instant::now()));
                 }
                 None
             }
