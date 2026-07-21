@@ -5,6 +5,15 @@
 //! between paths and their encoded forms.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Cached home directory. `home::home_dir()` shells out / hits the environment
+/// on every call; `format_short_name_from_path` runs once per conversation
+/// during the startup scan, so resolve it a single time.
+fn cached_home_dir() -> Option<&'static Path> {
+    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+    HOME.get_or_init(home::home_dir).as_deref()
+}
 
 /// Lossily render an optional path as an optional string.
 pub fn path_to_string(path: Option<&Path>) -> Option<String> {
@@ -33,7 +42,7 @@ pub fn convert_path_to_project_dir_name(path: &Path) -> String {
 /// For regular paths, returns just the folder name.
 pub fn format_short_name_from_path(path: &Path) -> String {
     // If the path is the user's home directory, display as ~
-    if let Some(home) = home::home_dir()
+    if let Some(home) = cached_home_dir()
         && path == home
     {
         return "~".to_string();

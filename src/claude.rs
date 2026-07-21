@@ -178,5 +178,7 @@ pub fn parse_agent_progress(data: &serde_json::Value) -> Option<AgentProgressDat
     if data.get("type").and_then(|t| t.as_str()) != Some("agent_progress") {
         return None;
     }
-    serde_json::from_value(data.clone()).ok()
+    // Deserialize borrowing from the existing `Value` (serde implements
+    // `Deserializer` for `&Value`) instead of cloning the whole tree first.
+    AgentProgressData::deserialize(data).ok()
 }
