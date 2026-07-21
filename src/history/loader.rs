@@ -265,22 +265,13 @@ pub fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Projec
                 return None;
             }
 
-            // Check if project has any non-agent .jsonl files
-            let has_conversations = read_dir(&path).ok()?.any(|e| {
-                e.ok()
-                    .map(|e| {
-                        let path = e.path();
-                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        path.extension().map(|s| s == "jsonl").unwrap_or(false)
-                            && !name.starts_with("agent-")
-                    })
-                    .unwrap_or(false)
-            });
-
-            if !has_conversations {
-                return None;
-            }
-
+            // Note: we intentionally do NOT read the directory here to check for
+            // conversation files. `load_conversations_with_cache` already scans
+            // each project directory once to collect its JSONL files; a project
+            // with no (non-agent) conversations simply yields zero conversations
+            // there and contributes nothing — including nothing to cache pruning,
+            // since it owns no cached entries. Pre-scanning here would read every
+            // project directory a second time during startup.
             let name = path.file_name()?.to_string_lossy().to_string();
             // Heuristic decode: convert encoded directory name back to readable path
             // The encoding replaces non-alphanumeric chars (except -) with -
@@ -396,10 +387,14 @@ fn load_conversations_with_cache(
 
             match process_conversation_file(path, show_last, modified, debug_level) {
                 Ok(Some(conversation)) => {
-                    debug::debug(
-                        debug_level,
-                        &format!("Loaded {}: {}", filename, conversation.preview),
-                    );
+                    // Only build this message (it embeds the whole preview) when
+                    // debug logging is actually enabled.
+                    if debug_level.is_some() {
+                        debug::debug(
+                            debug_level,
+                            &format!("Loaded {}: {}", filename, conversation.preview),
+                        );
+                    }
                     match fingerprint {
                         Some(fingerprint) => {
                             Some(ConversationLoad::Fresh(conversation, fingerprint))
