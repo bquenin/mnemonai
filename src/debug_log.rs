@@ -145,37 +145,3 @@ pub fn log_selected_path(path: &std::path::Path) -> std::io::Result<()> {
 
     Ok(())
 }
-
-/// Log a display-time parse error to the debug log file.
-pub fn log_display_error(
-    file_path: &std::path::Path,
-    line_number: usize,
-    error: &str,
-    line_content: &str,
-) -> std::io::Result<()> {
-    let log_path = match get_debug_log_path() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    // Create directory if needed
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-
-    writeln!(file, "=== Display Parse Error: {} ===", timestamp)?;
-    writeln!(file, "File: {}", file_path.display())?;
-    writeln!(file, "Line {}: {}", line_number, error)?;
-    writeln!(file, "Content: {}", truncate_line(line_content, 200))?;
-    writeln!(file, "---")?;
-    writeln!(file)?;
-
-    Ok(())
-}

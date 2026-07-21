@@ -9,7 +9,6 @@ mod error;
 mod headless;
 mod history;
 mod loader;
-mod markdown;
 mod pager;
 mod providers;
 mod syntax;
@@ -166,7 +165,6 @@ fn run() -> Result<()> {
         let display_options = display::DisplayOptions {
             no_tools: !show_tools,
             show_thinking,
-            debug_level: args.debug,
             use_pager,
             no_color: args.no_color,
         };
@@ -319,19 +317,30 @@ fn run() -> Result<()> {
         }
     }
 
-    // Display the selected conversation
+    // Display the selected conversation through its owning provider, so
+    // non-Claude and SQLite-backed (Cursor) transcripts get the right entries
+    // and per-provider labels. Renders via the same viewer-based ledger as the
+    // `--render` path. `--plain` maps to a colorless ledger; otherwise the
+    // colored crate auto-detects whether stdout is a terminal.
     let display_options = display::DisplayOptions {
         no_tools: !show_tools,
         show_thinking,
-        debug_level: args.debug,
         use_pager,
-        no_color: false, // Regular display uses the colored crate which handles this automatically
+        no_color: plain_mode,
     };
 
-    if plain_mode {
-        display::display_conversation_plain(&selected_path, &display_options)?;
+    if let Some(conv) = conversations.iter().find(|c| c.path == selected_path) {
+        let entries = match providers.iter().find(|p| p.kind() == conv.provider) {
+            Some(provider) => provider.read_entries(conv)?,
+            // No registered provider for this kind: fall back to reading the
+            // path directly as Claude JSONL.
+            None => tui::viewer::read_log_entries(&selected_path).map_err(AppError::Io)?,
+        };
+        display::display_conversation(&entries, &conv.provider, &display_options)?;
     } else {
-        display::display_conversation(&selected_path, &display_options)?;
+        // The selected path had no matching conversation (should not happen for
+        // a TUI selection); render the file directly as a Claude transcript.
+        display::render_to_terminal(&selected_path, &display_options)?;
     }
 
     Ok(())
