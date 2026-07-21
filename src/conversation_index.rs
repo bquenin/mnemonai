@@ -230,7 +230,7 @@ fn load_provider_cache_from_conn(
                     },
                     conversation: Conversation {
                         path: PathBuf::from(source_path),
-                        provider: provider.clone(),
+                        provider,
                         id: row.get(3)?,
                         timestamp,
                         preview: row.get(5)?,

@@ -92,23 +92,15 @@ fn format_tokens_long(tokens: u64) -> String {
 
 /// Create a colored provider badge span
 fn provider_badge_text(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Claude => "[Claude] ",
-        ProviderKind::Codex => "[Codex] ",
-        ProviderKind::Cursor => "[Cursor] ",
-        ProviderKind::CursorAgent => "[Cursor CLI] ",
-    }
+    provider.badge()
 }
 
 fn provider_badge(provider: ProviderKind) -> Span<'static> {
-    let color = match provider {
-        ProviderKind::Claude => Color::Rgb(218, 119, 86), // Claude terracotta
-        ProviderKind::Codex => Color::Rgb(78, 201, 176),  // Codex teal
-        ProviderKind::Cursor => Color::Rgb(180, 130, 230), // Cursor purple
-        ProviderKind::CursorAgent => Color::Rgb(94, 184, 255), // Cursor agent blue
-    };
-
-    Span::styled(provider_badge_text(provider), Style::default().fg(color))
+    let (r, g, b) = provider.color();
+    Span::styled(
+        provider_badge_text(provider),
+        Style::default().fg(Color::Rgb(r, g, b)),
+    )
 }
 
 /// Render the TUI
@@ -257,7 +249,7 @@ fn header_fits_single_line(conv: &crate::history::Conversation, terminal_width: 
         3 + formatted.len() // " · " + duration
     });
 
-    let badge_len = provider_badge_text(conv.provider.clone()).len();
+    let badge_len = provider_badge_text(conv.provider).len();
 
     // Format: "  [Provider] project · model · msg_count · duration · tokens · timestamp · summary"
     let total_len = 2
@@ -357,7 +349,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             // Calculate header length to determine if long token format fits
             let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
             let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
-            let badge_len = provider_badge_text(conv.provider.clone()).len();
+            let badge_len = provider_badge_text(conv.provider).len();
             let base_len = 2
                 + badge_len
                 + project.len()
@@ -414,11 +406,11 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
         };
 
     // Build header spans for metadata line
-    let conv_provider = conv.map(|c| c.provider.clone());
+    let conv_provider = conv.map(|c| c.provider);
     let build_metadata_spans = |include_summary: bool| {
         let mut spans = vec![Span::raw("  ")];
-        if let Some(ref provider) = conv_provider {
-            spans.push(provider_badge(provider.clone()));
+        if let Some(provider) = conv_provider {
+            spans.push(provider_badge(provider));
         }
         spans.push(Span::styled(
             project.clone(),
@@ -1096,7 +1088,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let right_len =
                 msg_count.chars().count() + duration_len + 3 + timestamp.chars().count(); // 3 for " · "
             let indicator_len = indicator.chars().count();
-            let badge_len = provider_badge_text(conv.provider.clone()).chars().count();
+            let badge_len = provider_badge_text(conv.provider).chars().count();
             let project_len = project_part.chars().count();
             let min_padding = 2; // Minimum padding between content and timestamp
 
@@ -1159,7 +1151,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 
             // Build header with provider badge and highlighted project name
             let mut header_spans = vec![Span::styled(indicator, indicator_style)];
-            header_spans.push(provider_badge(conv.provider.clone()));
+            header_spans.push(provider_badge(conv.provider));
             header_spans.extend(highlight_text(
                 &project_part,
                 &query_words,
