@@ -19,7 +19,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 /// Returns (label, color, dim_color) for a provider
-fn provider_theme(kind: &ProviderKind) -> (String, (u8, u8, u8), (u8, u8, u8)) {
+pub(crate) fn provider_theme(kind: &ProviderKind) -> (String, (u8, u8, u8), (u8, u8, u8)) {
     (kind.label().to_string(), kind.color(), kind.dim_color())
 }
 
