@@ -24,7 +24,7 @@ pulldown-cmark = "0.13"
 unicode-width = "0.2"
 arboard = "3.4"
 syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 md5 = "0.8"
 
 [profile.release]
