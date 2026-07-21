@@ -335,7 +335,7 @@ fn load_cached_user_keys(cache_conn: &Connection) -> HashMap<String, CachedUserK
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<usize>>(3)?,
+            row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as usize),
         ))
     }) {
         Ok(r) => r,
@@ -428,7 +428,12 @@ fn save_user_keys_to_cache(cache_conn: &Connection, entries: &[UserKeyEntry]) {
             }
         };
         for (conv_id, min_key, max_key, bubble_count) in entries {
-            let _ = stmt.execute(rusqlite::params![conv_id, min_key, max_key, bubble_count]);
+            let _ = stmt.execute(rusqlite::params![
+                conv_id,
+                min_key,
+                max_key,
+                *bubble_count as i64
+            ]);
         }
     }
     let _ = cache_conn.execute_batch("COMMIT");
@@ -447,7 +452,7 @@ fn load_cached_full_text(cache_conn: &Connection) -> HashMap<String, (String, us
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, usize>(2)?,
+            row.get::<_, i64>(2)? as usize,
         ))
     }) {
         Ok(r) => r,
@@ -493,7 +498,7 @@ fn save_full_text_to_cache(cache_conn: &Connection, entries: &[(String, String, 
             }
         };
         for (conv_id, full_text, bubble_count) in entries {
-            let _ = stmt.execute(rusqlite::params![conv_id, full_text, bubble_count]);
+            let _ = stmt.execute(rusqlite::params![conv_id, full_text, *bubble_count as i64]);
         }
     }
     let _ = cache_conn.execute_batch("COMMIT");
