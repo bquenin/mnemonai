@@ -182,7 +182,7 @@ mod tests {
 
     impl Provider for StubProvider {
         fn kind(&self) -> ProviderKind {
-            self.kind.clone()
+            self.kind
         }
 
         fn name(&self) -> &str {

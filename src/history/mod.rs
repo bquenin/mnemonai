@@ -30,7 +30,7 @@ pub use path::{
 };
 
 /// Identifies which AI tool provider a conversation originated from
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
     Claude,
     Codex,
@@ -47,6 +47,58 @@ impl ProviderKind {
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::CursorAgent => "cursor-agent",
+        }
+    }
+
+    /// Human-readable provider name shown in the transcript view header.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "Claude",
+            ProviderKind::Codex => "Codex",
+            ProviderKind::Cursor => "Cursor IDE",
+            ProviderKind::CursorAgent => "Cursor Agent",
+        }
+    }
+
+    /// Assistant name used to attribute assistant turns in exported
+    /// transcripts.
+    pub fn assistant_label(&self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "Claude",
+            ProviderKind::Codex => "Codex",
+            ProviderKind::Cursor => "Cursor",
+            ProviderKind::CursorAgent => "Cursor Agent",
+        }
+    }
+
+    /// Bracketed badge text shown in list rows and transcript headers.
+    /// Includes the trailing space.
+    pub fn badge(&self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "[Claude] ",
+            ProviderKind::Codex => "[Codex] ",
+            ProviderKind::Cursor => "[Cursor] ",
+            ProviderKind::CursorAgent => "[Cursor CLI] ",
+        }
+    }
+
+    /// Primary accent color (RGB) used for the provider badge and label.
+    pub fn color(&self) -> (u8, u8, u8) {
+        match self {
+            ProviderKind::Claude => (218, 119, 86),
+            ProviderKind::Codex => (78, 201, 176),
+            ProviderKind::Cursor => (180, 130, 230),
+            ProviderKind::CursorAgent => (94, 184, 255),
+        }
+    }
+
+    /// Dimmed accent color (RGB) used for secondary provider styling.
+    pub fn dim_color(&self) -> (u8, u8, u8) {
+        match self {
+            ProviderKind::Claude => (170, 93, 67),
+            ProviderKind::Codex => (56, 150, 132),
+            ProviderKind::Cursor => (140, 100, 180),
+            ProviderKind::CursorAgent => (72, 140, 194),
         }
     }
 }
@@ -153,5 +205,66 @@ mod tests {
         let error = claude_projects_root_from_home(None).unwrap_err();
 
         assert!(error.to_string().contains("home directory not found"));
+    }
+
+    #[test]
+    fn provider_kind_metadata_is_pinned() {
+        // Pins every user-visible provider string and color byte-for-byte.
+        // (kind, key, label, assistant_label, badge, color, dim_color)
+        let expected = [
+            (
+                ProviderKind::Claude,
+                "claude",
+                "Claude",
+                "Claude",
+                "[Claude] ",
+                (218, 119, 86),
+                (170, 93, 67),
+            ),
+            (
+                ProviderKind::Codex,
+                "codex",
+                "Codex",
+                "Codex",
+                "[Codex] ",
+                (78, 201, 176),
+                (56, 150, 132),
+            ),
+            (
+                ProviderKind::Cursor,
+                "cursor",
+                "Cursor IDE",
+                "Cursor",
+                "[Cursor] ",
+                (180, 130, 230),
+                (140, 100, 180),
+            ),
+            (
+                ProviderKind::CursorAgent,
+                "cursor-agent",
+                "Cursor Agent",
+                "Cursor Agent",
+                "[Cursor CLI] ",
+                (94, 184, 255),
+                (72, 140, 194),
+            ),
+        ];
+
+        for (kind, key, label, assistant_label, badge, color, dim_color) in expected {
+            assert_eq!(kind.key(), key, "key mismatch for {kind:?}");
+            assert_eq!(kind.label(), label, "label mismatch for {kind:?}");
+            assert_eq!(
+                kind.assistant_label(),
+                assistant_label,
+                "assistant_label mismatch for {kind:?}"
+            );
+            assert_eq!(kind.badge(), badge, "badge mismatch for {kind:?}");
+            assert_eq!(kind.color(), color, "color mismatch for {kind:?}");
+            assert_eq!(
+                kind.dim_color(),
+                dim_color,
+                "dim_color mismatch for {kind:?}"
+            );
+        }
     }
 }
