@@ -252,7 +252,7 @@ fn load_all_streaming_inner(
 }
 
 /// List all projects that contain conversation files
-pub fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Project>> {
+fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Project>> {
     let entries = read_dir(root)?;
 
     let mut projects: Vec<Project> = entries

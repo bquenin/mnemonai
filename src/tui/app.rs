@@ -51,14 +51,6 @@ pub enum DialogMode {
     Help,
 }
 
-/// Export format options for menus
-const EXPORT_OPTIONS: [&str; 4] = [
-    "Ledger (formatted)",
-    "Plain text",
-    "Markdown",
-    "JSONL (raw)",
-];
-
 /// Main application mode
 #[derive(Clone, Debug)]
 pub enum AppMode {
@@ -663,27 +655,17 @@ impl App {
             }
             // Navigate down
             KeyCode::Down | KeyCode::Char('j') => {
-                *selected = (*selected + 1).min(EXPORT_OPTIONS.len() - 1);
+                *selected = (*selected + 1).min(crate::tui::export::ExportFormat::ALL.len() - 1);
                 None
             }
-            // Number keys for direct selection
-            KeyCode::Char('1') => {
-                self.perform_export_with_providers(0, is_yank, providers);
-                self.dialog_mode = DialogMode::None;
-                None
-            }
-            KeyCode::Char('2') => {
-                self.perform_export_with_providers(1, is_yank, providers);
-                self.dialog_mode = DialogMode::None;
-                None
-            }
-            KeyCode::Char('3') => {
-                self.perform_export_with_providers(2, is_yank, providers);
-                self.dialog_mode = DialogMode::None;
-                None
-            }
-            KeyCode::Char('4') => {
-                self.perform_export_with_providers(3, is_yank, providers);
+            // Number keys for direct selection (1-based menu positions);
+            // the accepted range is derived from ExportFormat::ALL so shortcuts
+            // stay in sync with the rendered menu if formats are added.
+            KeyCode::Char(c @ '1'..='9')
+                if (c as usize - '1' as usize) < crate::tui::export::ExportFormat::ALL.len() =>
+            {
+                let index = c as usize - '1' as usize;
+                self.perform_export_with_providers(index, is_yank, providers);
                 self.dialog_mode = DialogMode::None;
                 None
             }
