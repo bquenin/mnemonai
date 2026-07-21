@@ -1,8 +1,10 @@
-use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage};
+use crate::claude::{
+    AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage, extract_text_from_blocks,
+};
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    SourceFingerprint, delete_conversation, fingerprint_from_metadata, load_provider_cache,
-    prune_conversations, save_conversations,
+    CachedFileConversation, SourceFingerprint, delete_conversation, fingerprint_from_metadata,
+    load_provider_cache, prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -11,18 +13,111 @@ use crate::history::{
 };
 use chrono::{DateTime, FixedOffset, Local};
 use rayon::prelude::*;
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::SystemTime;
 
 pub struct CodexProvider {
     codex_home: PathBuf,
+}
+
+/// What a parse pass is being run for.
+///
+/// The two consumers of a transcript need disjoint work: the startup scan wants
+/// only the [`Conversation`] summary (preview/full-text/counts/timestamps),
+/// while the viewer wants only the reconstructed [`LogEntry`] list. Building
+/// both on every pass was the bulk of the wasted work — tool outputs (the
+/// largest payloads in a transcript) were cloned into entries and immediately
+/// dropped at startup, and the full conversation text was assembled and dropped
+/// when reading entries. The mode lets each pass skip the other's output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParseMode {
+    /// Startup listing: produce a `Conversation`, skip all `LogEntry` work.
+    Scan,
+    /// Viewer: produce `LogEntry` values, skip conversation/preview text work.
+    Entries,
+}
+
+/// The cheap head of every record. Deserializing this first lets serde skip the
+/// rest of the line when scan mode only needs the record's type and timestamp:
+/// serde_json walks a multi-MB `function_call_output` payload's fields but never
+/// allocates them into a `Value` tree the way `from_str::<Value>` would.
+///
+/// The nested [`PayloadHead`] captures the inner discriminator for the wrapped
+/// (`response_item` / `event_msg`) records where the meaningful type lives under
+/// `payload.type`, again without materializing the large payload fields.
+#[derive(Deserialize)]
+struct RecordHead {
+    // Lenient, so the head matches the original `Value::get(..).and_then(as_str)`
+    // dispatch exactly: a field of the wrong JSON type is treated as absent
+    // rather than failing the whole parse (which would spuriously flag the line
+    // as a parse error the Value path never reported).
+    #[serde(rename = "type", default, deserialize_with = "lenient_string")]
+    kind: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    timestamp: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    id: Option<String>,
+    // A plain nested struct: serde_json walks the payload object and pulls only
+    // `type`, skipping (never allocating) large fields like `output`. A null
+    // payload deserializes to None; the rare non-object payload fails the head
+    // parse and is handled by the Value fallback, matching the old dispatch
+    // (which found no `type` on a non-object payload and did nothing).
+    #[serde(default)]
+    payload: Option<PayloadHead>,
+}
+
+#[derive(Deserialize)]
+struct PayloadHead {
+    #[serde(rename = "type", default, deserialize_with = "lenient_string")]
+    kind: Option<String>,
+}
+
+/// Deserialize a field as `Some(string)` only when it is a JSON string, and as
+/// `None` for null or any other type — mirroring `Value::as_str`.
+fn lenient_string<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde::Deserialize::deserialize(deserializer)? {
+        Value::String(text) => Ok(Some(text)),
+        _ => Ok(None),
+    }
+}
+
+impl RecordHead {
+    /// Legacy session-metadata records carry an `id` and `timestamp` but no
+    /// `type` (and no `payload`); mirror [`is_legacy_session_metadata`] on the
+    /// head alone so scan mode can detect them without a full parse.
+    fn is_legacy_session_metadata(&self) -> bool {
+        self.id.is_some()
+            && self.timestamp.is_some()
+            && self.kind.is_none()
+            && self.payload.is_none()
+    }
+
+    /// The record's meaningful item type, mirroring the runtime dispatch:
+    /// `session_meta` / `turn_context` are outer-typed; every other record's
+    /// discriminator lives under `payload.type` when wrapped, else at the top
+    /// level (legacy records).
+    fn item_kind(&self) -> Option<&str> {
+        match self.kind.as_deref() {
+            Some(outer @ ("session_meta" | "turn_context")) => Some(outer),
+            _ => self
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.kind.as_deref())
+                .or(self.kind.as_deref()),
+        }
+    }
 }
 
 struct ParsedCodexTranscript {
@@ -38,8 +133,17 @@ struct CodexParseState {
     model: Option<String>,
     total_tokens: u64,
     metadata_timestamp: Option<DateTime<FixedOffset>>,
+    // The first timestamp is parsed eagerly but only until the first record
+    // whose timestamp parses (usually the very first line), matching the old
+    // "first successfully parsed" semantics; once set it is never re-derived.
+    // The last timestamp is deferred: every record carrying a timestamp string
+    // overwrites `last_timestamp_raw` in place (reusing its heap allocation),
+    // and it is parsed exactly once, at EOF, in `finalize_timestamps` — instead
+    // of RFC3339-parsing every record just to keep the final one.
     first_timestamp: Option<DateTime<FixedOffset>>,
     last_timestamp: Option<DateTime<FixedOffset>>,
+    last_timestamp_raw: String,
+    has_last_timestamp: bool,
     entries: Vec<LogEntry>,
     all_parts: Vec<String>,
     message_count: usize,
@@ -55,6 +159,15 @@ impl ConversationLoad {
     fn into_conversation(self) -> Conversation {
         match self {
             Self::Cached(conversation) | Self::Fresh(conversation, _) => conversation,
+        }
+    }
+
+    /// Borrow a freshly parsed conversation and its fingerprint for saving,
+    /// letting the index be written from references without cloning.
+    fn as_fresh(&self) -> Option<(&Conversation, SourceFingerprint)> {
+        match self {
+            Self::Fresh(conversation, fingerprint) => Some((conversation, *fingerprint)),
+            Self::Cached(_) => None,
         }
     }
 }
@@ -89,69 +202,15 @@ impl CodexProvider {
         let cache = Mutex::new(load_provider_cache(ProviderKind::Codex, show_last));
         let loaded: Vec<ConversationLoad> = files
             .into_par_iter()
-            .filter_map(|path| {
-                let filename = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let metadata = fs::metadata(&path).ok();
-                let modified = metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.modified().ok());
-                let fingerprint = metadata.as_ref().map(fingerprint_from_metadata);
-
-                // Always consume the cache entry for a file we've seen: whatever
-                // remains in the map afterwards is treated as deleted and pruned,
-                // and a file that merely failed to stat or parse isn't deleted.
-                let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
-                if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
-                    && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
-                {
-                    debug::debug(
-                        debug_level,
-                        &format!("Loaded Codex transcript {} from index", filename),
-                    );
-                    return Some(ConversationLoad::Cached(conversation));
-                }
-
-                match process_codex_transcript_file(path, show_last, modified, debug_level) {
-                    Ok(Some(conversation)) => {
-                        debug::debug(
-                            debug_level,
-                            &format!(
-                                "Loaded Codex transcript {}: {}",
-                                filename, conversation.preview
-                            ),
-                        );
-                        match fingerprint {
-                            Some(fingerprint) => {
-                                Some(ConversationLoad::Fresh(conversation, fingerprint))
-                            }
-                            None => Some(ConversationLoad::Cached(conversation)),
-                        }
-                    }
-                    Ok(None) => None,
-                    Err(err) => {
-                        debug::warn(
-                            debug_level,
-                            &format!("Failed to process Codex transcript {}: {}", filename, err),
-                        );
-                        None
-                    }
-                }
-            })
+            .filter_map(|path| load_one(path, show_last, &cache, debug_level))
             .collect();
 
+        // Save the freshly parsed conversations from references, before we move
+        // them into the returned list — no per-conversation clone.
         save_conversations(
             ProviderKind::Codex,
             show_last,
-            loaded.iter().filter_map(|loaded| match loaded {
-                ConversationLoad::Fresh(conversation, fingerprint) => {
-                    Some((conversation, *fingerprint))
-                }
-                ConversationLoad::Cached(_) => None,
-            }),
+            loaded.iter().filter_map(ConversationLoad::as_fresh),
         );
 
         // Entries no session file claimed belong to files that no longer exist.
@@ -170,6 +229,124 @@ impl CodexProvider {
             conversation.index = idx;
         }
         Ok(conversations)
+    }
+
+    /// Stream conversations to the TUI in incremental batches so Codex history
+    /// paints as it loads instead of only after the whole provider finishes.
+    /// Sessions live under `sessions/YYYY/MM/DD/`, so each day directory is a
+    /// natural batch boundary. Each batch's fresh conversations are persisted
+    /// (from references) before the batch is sent — the same fingerprint the
+    /// sync path would write — and pruning of vanished files happens once at
+    /// the end, after every directory has consumed its cache entries.
+    fn stream_all_conversations(
+        &self,
+        tx: &Sender<LoaderMessage>,
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+    ) {
+        let Some(root) = self.sessions_root() else {
+            let _ = tx.send(LoaderMessage::Done);
+            return;
+        };
+        if !root.exists() {
+            let _ = tx.send(LoaderMessage::Done);
+            return;
+        }
+
+        let cache = Mutex::new(load_provider_cache(ProviderKind::Codex, show_last));
+
+        for (_dir, files) in collect_session_batch_dirs(&root) {
+            let loaded: Vec<ConversationLoad> = files
+                .into_par_iter()
+                .filter_map(|path| load_one(path, show_last, &cache, debug_level))
+                .collect();
+
+            // Persist this batch's fresh rows before sending it, from
+            // references, so nothing here is cloned.
+            save_conversations(
+                ProviderKind::Codex,
+                show_last,
+                loaded.iter().filter_map(ConversationLoad::as_fresh),
+            );
+
+            let batch: Vec<Conversation> = loaded
+                .into_iter()
+                .map(ConversationLoad::into_conversation)
+                .collect();
+            if !batch.is_empty() {
+                let _ = tx.send(LoaderMessage::Batch(batch));
+            }
+        }
+
+        // Every directory has consumed the cache entries for files it saw;
+        // whatever remains points at files that no longer exist. Pruning once
+        // at the end keeps the same semantics as the sync path.
+        let stale: Vec<PathBuf> = cache
+            .into_inner()
+            .map(|cache| cache.into_keys().collect())
+            .unwrap_or_default();
+        prune_conversations(ProviderKind::Codex, &stale);
+
+        let _ = tx.send(LoaderMessage::Done);
+    }
+}
+
+/// Load one transcript, preferring a fresh cache hit and consuming the cache
+/// entry either way (so a file that merely failed to stat or parse is never
+/// treated as deleted). Shared by the sync and streaming loaders.
+fn load_one(
+    path: PathBuf,
+    show_last: bool,
+    cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
+    debug_level: Option<DebugLevel>,
+) -> Option<ConversationLoad> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let metadata = fs::metadata(&path).ok();
+    let modified = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok());
+    let fingerprint = metadata.as_ref().map(fingerprint_from_metadata);
+
+    // Always consume the cache entry for a file we've seen: whatever remains in
+    // the map afterwards is treated as deleted and pruned, and a file that
+    // merely failed to stat or parse isn't deleted.
+    let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
+    if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
+        && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
+    {
+        debug::debug(
+            debug_level,
+            &format!("Loaded Codex transcript {} from index", filename),
+        );
+        return Some(ConversationLoad::Cached(conversation));
+    }
+
+    match process_codex_transcript_file(path, show_last, modified, debug_level) {
+        Ok(Some(conversation)) => {
+            debug::debug(
+                debug_level,
+                &format!(
+                    "Loaded Codex transcript {}: {}",
+                    filename, conversation.preview
+                ),
+            );
+            match fingerprint {
+                Some(fingerprint) => Some(ConversationLoad::Fresh(conversation, fingerprint)),
+                None => Some(ConversationLoad::Cached(conversation)),
+            }
+        }
+        Ok(None) => None,
+        Err(err) => {
+            debug::warn(
+                debug_level,
+                &format!("Failed to process Codex transcript {}: {}", filename, err),
+            );
+            None
+        }
     }
 }
 
@@ -200,24 +377,20 @@ impl super::Provider for CodexProvider {
 
         std::thread::spawn(move || {
             let provider = CodexProvider { codex_home };
-            match provider.load_all_conversations(show_last, debug_level) {
-                Ok(conversations) => {
-                    if !conversations.is_empty() {
-                        let _ = tx.send(LoaderMessage::Batch(conversations));
-                    }
-                }
-                Err(_) => {
-                    let _ = tx.send(LoaderMessage::ProjectError);
-                }
-            }
-            let _ = tx.send(LoaderMessage::Done);
+            provider.stream_all_conversations(&tx, show_last, debug_level);
         });
 
         rx
     }
 
     fn read_entries(&self, conversation: &Conversation) -> Result<Vec<LogEntry>> {
-        Ok(parse_codex_transcript_file(&conversation.path, false, None, None)?.entries)
+        // The viewer only needs the reconstructed entries; entries mode skips
+        // the preview/full-text assembly the scan produces. show_last is
+        // irrelevant here (it only steers the scan's preview direction).
+        Ok(
+            parse_codex_transcript_file(&conversation.path, ParseMode::Entries, false, None, None)?
+                .entries,
+        )
     }
 
     fn resume(&self, conversation: &Conversation, _default_args: &[String]) -> Result<()> {
@@ -282,23 +455,37 @@ fn process_codex_transcript_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    Ok(parse_codex_transcript_file(&path, show_last, modified, debug_level)?.conversation)
+    // The startup listing only needs the conversation summary; scan mode skips
+    // building the (discarded) LogEntry list entirely.
+    Ok(
+        parse_codex_transcript_file(&path, ParseMode::Scan, show_last, modified, debug_level)?
+            .conversation,
+    )
 }
 
 fn parse_codex_transcript_file(
     path: &Path,
+    mode: ParseMode,
     show_last: bool,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<ParsedCodexTranscript> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    parse_codex_transcript_reader(path.to_path_buf(), reader, show_last, modified, debug_level)
+    parse_codex_transcript_reader(
+        path.to_path_buf(),
+        reader,
+        mode,
+        show_last,
+        modified,
+        debug_level,
+    )
 }
 
 fn parse_codex_transcript_reader<R: BufRead>(
     path: PathBuf,
     reader: R,
+    mode: ParseMode,
     show_last: bool,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
@@ -329,43 +516,171 @@ fn parse_codex_transcript_reader<R: BufRead>(
             continue;
         }
 
-        match serde_json::from_str::<Value>(&line) {
-            Ok(value) => process_codex_record(&mut state, &value, line_idx + 1),
-            Err(err) => {
-                debug::warn(
-                    debug_level,
-                    &format!(
-                        "Codex parse error in {} at line {}: {}",
-                        filename,
+        // Read the cheap head first. In scan mode, records the summary never
+        // consumes (tool calls, tool outputs, reasoning) contribute only their
+        // timestamp from here, so their large payloads are never parsed into a
+        // Value. Everything the active mode does consume falls through to the
+        // full parse below.
+        match serde_json::from_str::<RecordHead>(&line) {
+            Ok(head) => {
+                if let Some(raw) = &head.timestamp {
+                    record_raw_timestamp(&mut state, raw);
+                }
+                if head_needs_full_parse(&head, mode) {
+                    process_line_body(
+                        &mut state,
+                        &line,
+                        mode,
                         line_idx + 1,
-                        err
+                        debug_level,
+                        &filename,
+                    );
+                }
+            }
+            Err(head_err) => {
+                // The head parse is lenient about field types, so a failure here
+                // means either malformed JSON or a shape the head can't model
+                // (e.g. a non-object line, or a scalar `payload`). Only the
+                // former was a parse error under the old Value path; a
+                // valid-but-unhandled line was silently ignored (its `type`
+                // lookup found nothing). Re-check with a full parse to keep that
+                // distinction exact.
+                match serde_json::from_str::<Value>(&line) {
+                    Ok(value) => {
+                        // The head never captured this line's timestamp; fold it
+                        // in here so the bounds match the old Value-only path.
+                        if let Some(raw) = value.get("timestamp").and_then(Value::as_str) {
+                            record_raw_timestamp(&mut state, raw);
+                        }
+                        process_codex_record(&mut state, &value, mode, line_idx + 1);
+                    }
+                    Err(_) => record_parse_error(
+                        &mut state,
+                        line,
+                        line_idx + 1,
+                        head_err,
+                        debug_level,
+                        &filename,
                     ),
-                );
-                state.parse_errors.push(ParseError {
-                    line_number: line_idx + 1,
-                    line_content: line,
-                    error_message: err.to_string(),
-                    context_before: Vec::new(),
-                    context_after: Vec::new(),
-                });
+                }
             }
         }
     }
 
+    finalize_timestamps(&mut state);
+
     let entries = std::mem::take(&mut state.entries);
-    let conversation = build_codex_conversation(path, show_last, modified, state);
+    let conversation = match mode {
+        ParseMode::Scan => build_codex_conversation(path, show_last, modified, state),
+        // The viewer path builds no conversation; skip preview/full-text work.
+        ParseMode::Entries => None,
+    };
     Ok(ParsedCodexTranscript {
         conversation,
         entries,
     })
 }
 
-fn process_codex_record(state: &mut CodexParseState, record: &Value, line_idx: usize) {
-    let timestamp = record_timestamp(record);
-    if let Some(timestamp) = timestamp {
-        update_timestamp_bounds(state, timestamp);
+/// Whether the active mode needs the full `Value` parse for this record.
+///
+/// Scan mode consumes only session/turn metadata, messages (preview/counts) and
+/// token counts; everything else contributes only its timestamp (already taken
+/// from the head). Entries mode reconstructs the transcript, so it parses every
+/// record that can yield a `LogEntry` — messages, tool calls, tool outputs,
+/// web-search calls and reasoning — but still skips token counts, which produce
+/// no entry.
+fn head_needs_full_parse(head: &RecordHead, mode: ParseMode) -> bool {
+    if head.is_legacy_session_metadata() {
+        // Legacy metadata feeds id/cwd/model and, crucially for the entries
+        // path, the fallback timestamp used to stamp entries, so both modes
+        // parse it.
+        return true;
     }
+    match head.item_kind() {
+        // Session/turn metadata populate id/cwd/model/metadata_timestamp, needed
+        // by the scan summary and by the entries path for per-entry cwd/model
+        // and timestamp fallback.
+        Some("session_meta" | "turn_context") => true,
+        Some("message") => true,
+        // token_count only feeds the summary's total_tokens.
+        Some("token_count") => mode == ParseMode::Scan,
+        // These only ever produce a LogEntry, so the scan skips them and pays
+        // nothing for their (often large) payloads.
+        Some(
+            "function_call"
+            | "custom_tool_call"
+            | "web_search_call"
+            | "function_call_output"
+            | "custom_tool_call_output"
+            | "reasoning",
+        ) => mode == ParseMode::Entries,
+        _ => false,
+    }
+}
 
+/// Full-parse one line and dispatch it. Only reached for records the active
+/// mode actually consumes, so materializing the `Value` here is not wasted.
+fn process_line_body(
+    state: &mut CodexParseState,
+    line: &str,
+    mode: ParseMode,
+    line_number: usize,
+    debug_level: Option<DebugLevel>,
+    filename: &str,
+) {
+    match serde_json::from_str::<Value>(line) {
+        Ok(value) => process_codex_record(state, &value, mode, line_number),
+        Err(err) => record_parse_error(
+            state,
+            line.to_string(),
+            line_number,
+            err,
+            debug_level,
+            filename,
+        ),
+    }
+}
+
+fn record_parse_error(
+    state: &mut CodexParseState,
+    line: String,
+    line_number: usize,
+    err: serde_json::Error,
+    debug_level: Option<DebugLevel>,
+    filename: &str,
+) {
+    debug::warn(
+        debug_level,
+        &format!(
+            "Codex parse error in {} at line {}: {}",
+            filename, line_number, err
+        ),
+    );
+    state.parse_errors.push(ParseError {
+        line_number,
+        line_content: line,
+        error_message: err.to_string(),
+        context_before: Vec::new(),
+        context_after: Vec::new(),
+    });
+}
+
+/// Dispatch a fully parsed record to the handler the active mode wants.
+///
+/// Timestamp bounds are owned by the read loop (recorded cheaply from the head),
+/// so this only re-derives the record's own timestamp for per-entry stamping,
+/// and only when it is needed — the scan path never stamps entries. The `record`
+/// here has already passed the mode's `head_needs_full_parse` gate (or arrived
+/// through the malformed-head fallback), so no work below is wasted.
+fn process_codex_record(
+    state: &mut CodexParseState,
+    record: &Value,
+    mode: ParseMode,
+    line_idx: usize,
+) {
+    // Metadata records populate id/cwd/model/metadata_timestamp. Both modes
+    // consume these: the scan for the conversation summary, the entries path for
+    // each entry's cwd/model and its timestamp fallback.
     match record.get("type").and_then(Value::as_str) {
         Some("session_meta") => {
             if let Some(payload) = record.get("payload") {
@@ -388,17 +703,30 @@ fn process_codex_record(state: &mut CodexParseState, record: &Value, line_idx: u
     }
 
     let item = record.get("payload").unwrap_or(record);
-    match item.get("type").and_then(Value::as_str) {
-        Some("message") => process_message_item(state, item, timestamp),
-        Some("function_call") | Some("custom_tool_call") => {
+    let kind = item.get("type").and_then(Value::as_str);
+
+    // Only the entries path stamps individual entries, so only it pays for
+    // parsing the record's timestamp per line.
+    let timestamp = match mode {
+        ParseMode::Entries => record_timestamp(record),
+        ParseMode::Scan => None,
+    };
+
+    match (mode, kind) {
+        // Messages feed both paths (preview/counts for the scan, an entry for
+        // the viewer); process_message_item branches on the mode internally.
+        (_, Some("message")) => process_message_item(state, item, mode, timestamp),
+        (ParseMode::Scan, Some("token_count")) => parse_token_count(state, item),
+        (ParseMode::Entries, Some("function_call") | Some("custom_tool_call")) => {
             process_tool_call_item(state, item, timestamp, line_idx)
         }
-        Some("web_search_call") => process_web_search_item(state, item, timestamp, line_idx),
-        Some("function_call_output") | Some("custom_tool_call_output") => {
+        (ParseMode::Entries, Some("web_search_call")) => {
+            process_web_search_item(state, item, timestamp, line_idx)
+        }
+        (ParseMode::Entries, Some("function_call_output") | Some("custom_tool_call_output")) => {
             process_tool_output_item(state, item, timestamp, line_idx)
         }
-        Some("reasoning") => process_reasoning_item(state, item, timestamp),
-        Some("token_count") => parse_token_count(state, item),
+        (ParseMode::Entries, Some("reasoning")) => process_reasoning_item(state, item, timestamp),
         _ => {}
     }
 }
@@ -466,6 +794,7 @@ fn parse_turn_context(state: &mut CodexParseState, payload: &Value) {
 fn process_message_item(
     state: &mut CodexParseState,
     item: &Value,
+    mode: ParseMode,
     timestamp: Option<DateTime<FixedOffset>>,
 ) {
     let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
@@ -478,42 +807,50 @@ fn process_message_item(
         return;
     }
 
-    let text = extract_text_from_content_blocks(&blocks);
+    // The text is needed either way: as the preview/full-text contribution in
+    // scan mode, and as the same non-empty guard the entries path applied.
+    let text = extract_text_from_blocks(&blocks);
     if text.trim().is_empty() {
         return;
     }
 
-    let timestamp = timestamp_string(timestamp, state.metadata_timestamp);
-    let uuid = item
-        .get("id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-
-    match role {
-        "user" => state.entries.push(LogEntry::User {
-            message: UserMessage {
-                content: UserContent::Blocks(blocks),
-            },
-            timestamp,
-            cwd: state
-                .cwd
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-        }),
-        "assistant" => state.entries.push(LogEntry::Assistant {
-            message: AssistantMessage {
-                content: blocks,
-                model: state.model.clone(),
-                usage: None,
-                id: uuid,
-            },
-            timestamp,
-        }),
-        _ => {}
+    match mode {
+        // Scan builds no entries; it only needs the text and the message count.
+        ParseMode::Scan => {
+            state.all_parts.push(text);
+            state.message_count += 1;
+        }
+        // The viewer wants the reconstructed entry, not the preview text.
+        ParseMode::Entries => {
+            let timestamp = timestamp_string(timestamp, state.metadata_timestamp);
+            let uuid = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            match role {
+                "user" => state.entries.push(LogEntry::User {
+                    message: UserMessage {
+                        content: UserContent::Blocks(blocks),
+                    },
+                    timestamp,
+                    cwd: state
+                        .cwd
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                }),
+                "assistant" => state.entries.push(LogEntry::Assistant {
+                    message: AssistantMessage {
+                        content: blocks,
+                        model: state.model.clone(),
+                        usage: None,
+                        id: uuid,
+                    },
+                    timestamp,
+                }),
+                _ => {}
+            }
+        }
     }
-
-    state.all_parts.push(text);
-    state.message_count += 1;
 }
 
 fn process_tool_call_item(
@@ -770,6 +1107,46 @@ fn collect_session_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Group session transcripts by the directory that directly contains them, one
+/// group per leaf directory (`sessions/YYYY/MM/DD/`). The streaming loader sends
+/// one batch per group so history paints progressively instead of only after
+/// the whole tree is parsed.
+///
+/// Every group holds the files found *directly* in its directory, so the union
+/// over all groups is exactly [`collect_session_files`]'s set — no file is
+/// processed twice even when a directory holds both transcripts and
+/// subdirectories. Groups are returned newest-directory-first (by path name, so
+/// the date hierarchy sorts chronologically) to surface recent work first.
+fn collect_session_batch_dirs(root: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+
+    while let Some(dir) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Same symlink handling as collect_session_files: never descend a
+            // symlinked directory, but still accept symlinked files.
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                dirs.push(path);
+            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+        if !files.is_empty() {
+            groups.push((dir, files));
+        }
+    }
+
+    // Newest first: YYYY/MM/DD path strings sort chronologically.
+    groups.sort_by(|(a, _), (b, _)| b.cmp(a));
+    groups
+}
+
 fn resolve_codex_home(env_value: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
     env_value
         // codex itself treats a set-but-empty CODEX_HOME as unset.
@@ -822,17 +1199,6 @@ fn text_from_codex_content(value: &Value) -> Option<String> {
     }
 }
 
-fn extract_text_from_content_blocks(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn parse_tool_input(item: &Value) -> Value {
     let Some(input) = item.get("arguments").or_else(|| item.get("input")) else {
         return Value::Null;
@@ -857,11 +1223,27 @@ fn parse_timestamp(value: &str) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(value).ok()
 }
 
-fn update_timestamp_bounds(state: &mut CodexParseState, timestamp: DateTime<FixedOffset>) {
+/// Fold a record's raw timestamp string into the first/last bounds without a
+/// per-record allocation or (for the last) a per-record parse. The first bound
+/// is parsed eagerly only until it is set; the last is retained as a string and
+/// parsed once at EOF.
+fn record_raw_timestamp(state: &mut CodexParseState, raw: &str) {
     if state.first_timestamp.is_none() {
-        state.first_timestamp = Some(timestamp);
+        state.first_timestamp = parse_timestamp(raw);
     }
-    state.last_timestamp = Some(timestamp);
+    state.last_timestamp_raw.clear();
+    state.last_timestamp_raw.push_str(raw);
+    state.has_last_timestamp = true;
+}
+
+/// Parse the retained last-timestamp string exactly once. A malformed final
+/// timestamp leaves `last_timestamp` unset, and the conversation summary falls
+/// back through `metadata_timestamp`/file mtime just as it would for a record
+/// that never carried a timestamp.
+fn finalize_timestamps(state: &mut CodexParseState) {
+    if state.has_last_timestamp {
+        state.last_timestamp = parse_timestamp(&state.last_timestamp_raw);
+    }
 }
 
 fn timestamp_string(
@@ -938,17 +1320,46 @@ fn run_codex_command(mut command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude::{extract_text_from_assistant, extract_text_from_user};
     use std::io::Cursor;
 
-    fn parse(content: &str, show_last: bool) -> ParsedCodexTranscript {
+    const TEST_PATH: &str =
+        "rollout-2026-06-10T17-58-01-019eb42f-a4e2-75e0-b7ad-2268948a559c.jsonl";
+
+    fn scan(content: &str, show_last: bool) -> ParsedCodexTranscript {
         parse_codex_transcript_reader(
-            PathBuf::from("rollout-2026-06-10T17-58-01-019eb42f-a4e2-75e0-b7ad-2268948a559c.jsonl"),
+            PathBuf::from(TEST_PATH),
             Cursor::new(content),
+            ParseMode::Scan,
             show_last,
             None,
             None,
         )
         .unwrap()
+    }
+
+    fn entries(content: &str) -> Vec<LogEntry> {
+        parse_codex_transcript_reader(
+            PathBuf::from(TEST_PATH),
+            Cursor::new(content),
+            ParseMode::Entries,
+            false,
+            None,
+            None,
+        )
+        .unwrap()
+        .entries
+    }
+
+    /// Run both passes over the same transcript and combine them, so existing
+    /// tests can keep asserting on the conversation summary (scan) and the
+    /// reconstructed entries (entries) from a single call.
+    fn parse(content: &str, show_last: bool) -> ParsedCodexTranscript {
+        let scanned = scan(content, show_last);
+        ParsedCodexTranscript {
+            conversation: scanned.conversation,
+            entries: entries(content),
+        }
     }
 
     #[test]
@@ -1012,6 +1423,136 @@ mod tests {
             session_id_from_path(&path).as_deref(),
             Some("019eb42f-a4e2-75e0-b7ad-2268948a559c")
         );
+    }
+
+    // Assert two conversation summaries are field-for-field identical for every
+    // value the cached row persists. Behavioral identity of the scan output is
+    // the hard requirement: a cached row must never change meaning.
+    fn assert_same_summary(a: &Conversation, b: &Conversation) {
+        assert_eq!(a.id, b.id, "id");
+        assert_eq!(a.preview, b.preview, "preview");
+        assert_eq!(a.full_text, b.full_text, "full_text");
+        assert_eq!(a.message_count, b.message_count, "message_count");
+        assert_eq!(a.model, b.model, "model");
+        assert_eq!(a.total_tokens, b.total_tokens, "total_tokens");
+        assert_eq!(a.timestamp, b.timestamp, "timestamp");
+        assert_eq!(a.project_path, b.project_path, "project_path");
+        assert_eq!(a.cwd, b.cwd, "cwd");
+        assert_eq!(a.duration_minutes, b.duration_minutes, "duration_minutes");
+    }
+
+    #[test]
+    fn scan_ignores_giant_tool_output_but_keeps_identical_summary() {
+        // A multi-megabyte function_call_output is the bulk of a transcript.
+        // Scan mode must produce exactly the summary it would if that payload
+        // were empty — it contributes only its timestamp bound, never its body.
+        let giant = "X".repeat(4 * 1024 * 1024);
+        let with_giant = [
+            r#"{"timestamp":"2026-06-11T00:58:16.810Z","type":"session_meta","payload":{"id":"019eb42f-a4e2-75e0-b7ad-2268948a559c","timestamp":"2026-06-11T00:58:01.875Z","cwd":"/tmp/project","source":"cli"}}"#.to_string(),
+            r#"{"timestamp":"2026-06-11T00:58:16.812Z","type":"turn_context","payload":{"cwd":"/tmp/project","workspace_roots":["/tmp/project"],"model":"gpt-5.5"}}"#.to_string(),
+            r#"{"timestamp":"2026-06-11T00:58:16.813Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Build Codex support"}]}}"#.to_string(),
+            r#"{"timestamp":"2026-06-11T00:58:27.514Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#.to_string(),
+            format!(
+                r#"{{"timestamp":"2026-06-11T00:58:27.714Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_1","output":"{giant}"}}}}"#
+            ),
+            r#"{"timestamp":"2026-06-11T00:58:30.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#.to_string(),
+            r#"{"timestamp":"2026-06-11T00:58:30.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1234}}}}"#.to_string(),
+        ]
+        .join("\n");
+
+        // Golden reference: the same transcript with the tool-output body emptied
+        // (its timestamp is unchanged, so it still contributes the same bound).
+        let with_empty = with_giant.replace(&giant, "");
+
+        let scanned_giant = scan(&with_giant, false).conversation.unwrap();
+        let scanned_empty = scan(&with_empty, false).conversation.unwrap();
+
+        assert_same_summary(&scanned_giant, &scanned_empty);
+
+        // Concrete expected values, so the golden compare can't pass by both
+        // sides being wrong the same way.
+        assert_eq!(scanned_giant.id, "019eb42f-a4e2-75e0-b7ad-2268948a559c");
+        assert_eq!(scanned_giant.preview, "Build Codex support ... Done");
+        assert_eq!(scanned_giant.full_text, "Build Codex support Done");
+        assert_eq!(scanned_giant.message_count, 2);
+        assert_eq!(scanned_giant.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(scanned_giant.total_tokens, 1234);
+        // The giant tool output never becomes preview/full-text.
+        assert!(!scanned_giant.full_text.contains('X'));
+        assert!(!scanned_giant.preview.contains('X'));
+
+        // Scan mode builds no entries at all — that work is exclusive to the
+        // viewer path.
+        assert!(scan(&with_giant, false).entries.is_empty());
+    }
+
+    #[test]
+    fn read_entries_reconstructs_transcript_and_scan_builds_no_conversation() {
+        // Same transcript, exercised through the entries (viewer) path. The
+        // reconstructed LogEntry list must be unchanged: user msg, assistant
+        // msg, the tool-call, and the tool-result carrying the full output.
+        let content = [
+            r#"{"timestamp":"2026-06-11T00:58:16.810Z","type":"session_meta","payload":{"id":"019eb42f-a4e2-75e0-b7ad-2268948a559c","timestamp":"2026-06-11T00:58:01.875Z","cwd":"/tmp/project","source":"cli"}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:16.812Z","type":"turn_context","payload":{"cwd":"/tmp/project","workspace_roots":["/tmp/project"],"model":"gpt-5.5"}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:16.813Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Build Codex support"}]}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:27.514Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:27.714Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"BUILD OK"}}"#,
+            r#"{"timestamp":"2026-06-11T00:58:30.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#,
+        ]
+        .join("\n");
+
+        let log = entries(&content);
+        assert_eq!(log.len(), 4);
+
+        // 0: user message
+        match &log[0] {
+            LogEntry::User { message, cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/tmp/project"));
+                assert_eq!(extract_text_from_user(message), "Build Codex support");
+            }
+            other => panic!("expected user entry, got {other:?}"),
+        }
+        // 1: assistant tool-call, stamped with the turn's model
+        match &log[1] {
+            LogEntry::Assistant { message, .. } => match message.content.first() {
+                Some(ContentBlock::ToolUse { name, .. }) => assert_eq!(name, "exec_command"),
+                other => panic!("expected tool_use, got {other:?}"),
+            },
+            other => panic!("expected assistant entry, got {other:?}"),
+        }
+        // 2: tool result carries the full output body verbatim
+        match &log[2] {
+            LogEntry::User { message, .. } => match &message.content {
+                UserContent::Blocks(blocks) => match blocks.first() {
+                    Some(ContentBlock::ToolResult { content, .. }) => {
+                        assert_eq!(content.as_ref().and_then(Value::as_str), Some("BUILD OK"));
+                    }
+                    other => panic!("expected tool_result, got {other:?}"),
+                },
+                other => panic!("expected blocks, got {other:?}"),
+            },
+            other => panic!("expected user entry, got {other:?}"),
+        }
+        // 3: assistant final message
+        match &log[3] {
+            LogEntry::Assistant { message, .. } => {
+                assert_eq!(extract_text_from_assistant(message), "Done");
+                assert_eq!(message.model.as_deref(), Some("gpt-5.5"));
+            }
+            other => panic!("expected assistant entry, got {other:?}"),
+        }
+
+        // Mode contract: the entries pass builds no conversation summary.
+        let entries_pass = parse_codex_transcript_reader(
+            PathBuf::from(TEST_PATH),
+            Cursor::new(&content),
+            ParseMode::Entries,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(entries_pass.conversation.is_none());
     }
 
     #[test]
@@ -1111,5 +1652,68 @@ mod tests {
             codex_home: PathBuf::new(),
         };
         assert!(provider.sessions_root().is_none());
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(name: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mnemonai-codex-{}-{}-{}",
+                name,
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn batches_sessions_per_day_directory_newest_first() {
+        let tmp = TestTempDir::new("batch-dirs");
+        let root = &tmp.path;
+
+        // sessions/2026/06/{10,11}/, plus a stray transcript directly under a
+        // month directory, plus a non-jsonl file that must be ignored.
+        let day_10 = root.join("2026/06/10");
+        let day_11 = root.join("2026/06/11");
+        let month = root.join("2026/06");
+        fs::create_dir_all(&day_10).unwrap();
+        fs::create_dir_all(&day_11).unwrap();
+        fs::write(day_10.join("rollout-a.jsonl"), b"{}").unwrap();
+        fs::write(day_10.join("rollout-b.jsonl"), b"{}").unwrap();
+        fs::write(day_11.join("rollout-c.jsonl"), b"{}").unwrap();
+        fs::write(month.join("stray.jsonl"), b"{}").unwrap();
+        fs::write(day_11.join("notes.txt"), b"ignore me").unwrap();
+
+        let groups = collect_session_batch_dirs(root);
+
+        // One group per directory that directly holds a transcript, newest
+        // (lexicographically greatest path) first: .../06/11, .../06/10, .../06.
+        let dirs: Vec<&Path> = groups.iter().map(|(dir, _)| dir.as_path()).collect();
+        assert_eq!(
+            dirs,
+            vec![day_11.as_path(), day_10.as_path(), month.as_path()]
+        );
+
+        // Each group holds exactly its own directory's jsonl files, and their
+        // union is the whole corpus — no file counted twice, .txt excluded.
+        let counts: Vec<usize> = groups.iter().map(|(_, files)| files.len()).collect();
+        assert_eq!(counts, vec![1, 2, 1]);
+        let total: usize = counts.iter().sum();
+        assert_eq!(total, collect_session_files(root).len());
     }
 }
