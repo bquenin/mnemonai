@@ -99,7 +99,7 @@ impl ConversationLoad {
 
 impl CursorAgentProvider {
     pub fn new() -> Self {
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = home::home_dir().unwrap_or_default();
         Self {
             projects_root: home.join(".cursor").join("projects"),
         }
