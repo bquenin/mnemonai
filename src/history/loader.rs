@@ -116,7 +116,7 @@ pub fn load_all_conversations(
     prune_conversations(ProviderKind::Claude, &stale);
 
     // Global sort by timestamp (newest first)
-    all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    all_conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
     debug::info(
         debug_level,
@@ -298,7 +298,7 @@ fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Project>> 
         .collect();
 
     // Sort by recently modified
-    projects.sort_by(|a, b| b.modified.cmp(&a.modified));
+    projects.sort_by_key(|c| std::cmp::Reverse(c.modified));
 
     Ok(projects)
 }
@@ -428,7 +428,7 @@ fn load_conversations_with_cache(
         .collect();
 
     // Ensure deterministic ordering after parallel processing
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
     // Inject project info into each conversation
     let fallback_path = projects_dir

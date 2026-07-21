@@ -263,7 +263,7 @@ fn load_conversations(
         });
     }
 
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
     Ok(conversations)
 }
@@ -527,10 +527,7 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
                 push_message(&mut messages, message);
             }
             LogEntry::User {
-                message,
-                timestamp,
-                cwd: _,
-                ..
+                message, timestamp, ..
             } => push_user_message(&mut messages, message, timestamp, entry_index),
             LogEntry::Assistant {
                 message, timestamp, ..
@@ -1402,7 +1399,11 @@ mod tests {
         assert_eq!(date.time().to_string(), "00:00:00");
 
         let timestamp = parse_timestamp_filter("2026-06-20T12:34:56-07:00", "--before").unwrap();
-        assert_eq!(timestamp.to_rfc3339(), "2026-06-20T12:34:56-07:00");
+        // Compare instants, not local renderings: the parsed value is a
+        // DateTime<Local>, so its RFC 3339 string depends on the host
+        // timezone (this assertion must also hold on a UTC CI runner).
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-06-20T12:34:56-07:00").unwrap();
+        assert_eq!(timestamp, expected);
         assert!(parse_timestamp_filter("06/20/2026", "--after").is_err());
     }
 

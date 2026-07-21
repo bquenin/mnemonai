@@ -794,17 +794,16 @@ fn build_conversation(
         Some(dt.with_timezone(&Local))
     }) {
         ts
-    } else if let Some(ws_ts) = ws_info.and_then(|i| i.timestamp_millis) {
+    } else {
+        let ws_ts = ws_info.and_then(|i| i.timestamp_millis)?;
         let ts = Utc
             .timestamp_millis_opt(ws_ts)
             .single()
             .unwrap_or_else(Utc::now);
         ts.with_timezone(&Local)
-    } else {
-        return None;
     };
 
-    let fake_path = db_path.with_file_name(format!("cursor-{}.jsonl", &info.conv_id));
+    let fake_path = db_path.with_file_name(format!("cursor-{}.jsonl", info.conv_id));
 
     let preview = preview_text
         .split_whitespace()
