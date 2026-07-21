@@ -709,7 +709,7 @@ impl App {
             None => return,
         };
 
-        // Try provider-based export for non-JSONL formats
+        // Locate the conversation to pick its provider and assistant label
         let conv = self.conversations.iter().find(|c| c.path == path);
 
         let assistant_label = match conv.map(|c| &c.provider) {
@@ -730,13 +730,15 @@ impl App {
         };
         let provider = conv.and_then(|c| providers.iter().find(|p| p.kind() == c.provider));
 
-        let result = if let (Some(provider), Some(conv)) = (provider, conv) {
+        let result = if let (Some(entry_format), Some(provider), Some(conv)) =
+            (format.entry_format(), provider, conv)
+        {
             // Use provider to read entries for export
             match provider.read_entries(conv) {
                 Ok(entries) => {
                     let content = crate::tui::export::generate_content_from_entries(
                         &entries,
-                        format,
+                        entry_format,
                         export_options,
                     );
                     if to_clipboard {
@@ -766,8 +768,18 @@ impl App {
                     message: format!("Failed to read: {}", e),
                 },
             }
+        } else if matches!(format, crate::tui::export::ExportFormat::Jsonl)
+            && matches!(conv.map(|c| &c.provider), Some(ProviderKind::Cursor))
+        {
+            // Cursor IDE conversations live in a SQLite database and carry a
+            // fabricated .jsonl path, so there is no raw transcript file to
+            // export.
+            crate::tui::export::ExportResult {
+                message: "JSONL export is not available for Cursor conversations".to_string(),
+            }
         } else {
-            // Fallback to file-based export
+            // File-based export: raw JSONL always copies the transcript file
+            // verbatim; other formats land here when no provider is available.
             if to_clipboard {
                 crate::tui::export::export_to_clipboard(&path, format, export_options)
             } else {
@@ -1903,6 +1915,124 @@ mod tests {
             app.filtered(),
             &[1],
             "with a trailing space only the whole-word 'auth' conversation matches"
+        );
+    }
+
+    /// Provider stub for export tests. Its entries are irrelevant: JSONL
+    /// export must bypass entry-based generation entirely.
+    struct StubProvider(ProviderKind);
+
+    impl Provider for StubProvider {
+        fn kind(&self) -> ProviderKind {
+            self.0.clone()
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn load_conversations(
+            &self,
+            _show_last: bool,
+            _debug: Option<crate::cli::DebugLevel>,
+        ) -> Result<Vec<Conversation>> {
+            Ok(Vec::new())
+        }
+
+        fn load_conversations_streaming(
+            &self,
+            _show_last: bool,
+            _debug: Option<crate::cli::DebugLevel>,
+        ) -> Receiver<LoaderMessage> {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            rx
+        }
+
+        fn read_entries(&self, _conversation: &Conversation) -> Result<Vec<LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn resume(&self, _conversation: &Conversation, _default_args: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _conversation: &Conversation) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn enter_view_mode(app: &mut App, conversation_path: PathBuf) {
+        app.app_mode = AppMode::View(ViewState {
+            conversation_path,
+            scroll_offset: 0,
+            rendered_lines: Vec::new(),
+            total_lines: 0,
+            tool_display: ToolDisplayMode::Hidden,
+            show_thinking: false,
+            show_timing: false,
+            content_width: 80,
+            search_mode: ViewSearchMode::Off,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match: 0,
+            cached_entries: Vec::new(),
+        });
+    }
+
+    /// JSONL export must write the raw transcript file even when the
+    /// conversation's provider is available. It used to be routed through
+    /// entry-based generation, which exported the literal
+    /// "<JSONL export requires file path>" placeholder instead.
+    #[test]
+    fn jsonl_export_writes_raw_transcript_not_placeholder() {
+        let dir =
+            std::env::temp_dir().join(format!("mnemonai-jsonl-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("conv.jsonl");
+        // Include a line that entry parsing would drop, to prove the export is
+        // the verbatim file rather than a re-rendering of parsed entries.
+        let raw = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n{\"not\":\"a log entry\"}\n";
+        std::fs::write(&transcript, raw).unwrap();
+
+        let mut conv = make_conv("hi", 0);
+        conv.path = transcript.clone();
+        let mut app = app_with_conversations(vec![conv]);
+        enter_view_mode(&mut app, transcript);
+
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(StubProvider(ProviderKind::Claude))];
+        // Option 3 = JSONL, to_clipboard = false writes a file in the cwd
+        app.perform_export_with_providers(3, false, &providers);
+
+        let (message, _) = app.status_message.clone().expect("export sets a status");
+        let filename = message
+            .strip_prefix("Exported to ")
+            .unwrap_or_else(|| panic!("unexpected export status: {message}"))
+            .to_string();
+        let exported = std::fs::read_to_string(&filename);
+        let _ = std::fs::remove_file(&filename);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(exported.unwrap(), raw);
+    }
+
+    /// Cursor IDE conversations live in a SQLite database behind a fabricated
+    /// .jsonl path, so JSONL export must report unavailability instead of
+    /// exporting placeholder or garbage content.
+    #[test]
+    fn jsonl_export_for_cursor_reports_unavailable() {
+        let fake_path = PathBuf::from("/nonexistent/cursor-fake.jsonl");
+        let mut conv = make_conv("hi", 0);
+        conv.provider = ProviderKind::Cursor;
+        conv.path = fake_path.clone();
+        let mut app = app_with_conversations(vec![conv]);
+        enter_view_mode(&mut app, fake_path);
+
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(StubProvider(ProviderKind::Cursor))];
+        app.perform_export_with_providers(3, false, &providers);
+
+        let (message, _) = app.status_message.clone().expect("export sets a status");
+        assert_eq!(
+            message,
+            "JSONL export is not available for Cursor conversations"
         );
     }
 }
