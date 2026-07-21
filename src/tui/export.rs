@@ -26,6 +26,17 @@ pub enum ExportFormat {
     Jsonl,
 }
 
+/// Formats whose content is generated from parsed log entries.
+///
+/// Raw JSONL is deliberately absent: a JSONL export copies the source
+/// transcript file verbatim and must never go through entry-based generation.
+#[derive(Clone, Copy, Debug)]
+pub enum EntryFormat {
+    Ledger,
+    Plain,
+    Markdown,
+}
+
 impl ExportFormat {
     /// Get format from menu option index (0-3)
     pub fn from_index(index: usize) -> Option<Self> {
@@ -44,6 +55,17 @@ impl ExportFormat {
             ExportFormat::Ledger | ExportFormat::Plain => "txt",
             ExportFormat::Markdown => "md",
             ExportFormat::Jsonl => "jsonl",
+        }
+    }
+
+    /// The entry-based format for this export, or `None` for raw JSONL
+    /// (which copies the transcript file instead of generating content)
+    pub fn entry_format(&self) -> Option<EntryFormat> {
+        match self {
+            ExportFormat::Ledger => Some(EntryFormat::Ledger),
+            ExportFormat::Plain => Some(EntryFormat::Plain),
+            ExportFormat::Markdown => Some(EntryFormat::Markdown),
+            ExportFormat::Jsonl => None,
         }
     }
 }
@@ -127,11 +149,15 @@ fn generate_content(
     format: ExportFormat,
     options: ExportOptions,
 ) -> std::io::Result<String> {
-    match format {
-        ExportFormat::Jsonl => fs::read_to_string(source_path),
-        _ => {
+    match format.entry_format() {
+        None => fs::read_to_string(source_path),
+        Some(entry_format) => {
             let entries = read_entries_from_file(source_path)?;
-            Ok(generate_content_from_entries(&entries, format, options))
+            Ok(generate_content_from_entries(
+                &entries,
+                entry_format,
+                options,
+            ))
         }
     }
 }
@@ -155,17 +181,13 @@ fn read_entries_from_file(path: &Path) -> std::io::Result<Vec<LogEntry>> {
 /// Generate content in the specified format from pre-parsed entries
 pub fn generate_content_from_entries(
     entries: &[LogEntry],
-    format: ExportFormat,
+    format: EntryFormat,
     options: ExportOptions,
 ) -> String {
     match format {
-        ExportFormat::Plain => generate_plain_from_entries(entries, options),
-        ExportFormat::Markdown => generate_markdown_from_entries(entries, options),
-        ExportFormat::Ledger => generate_ledger_from_entries(entries, options),
-        ExportFormat::Jsonl => {
-            // JSONL from entries is not supported (use file-based export instead)
-            String::from("<JSONL export requires file path>")
-        }
+        EntryFormat::Plain => generate_plain_from_entries(entries, options),
+        EntryFormat::Markdown => generate_markdown_from_entries(entries, options),
+        EntryFormat::Ledger => generate_ledger_from_entries(entries, options),
     }
 }
 
@@ -442,5 +464,47 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
             serde_json::to_string_pretty(value).unwrap_or_else(|_| "<error>".to_string())
         }
         None => "<no content>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// JSONL export must return the transcript file verbatim, including lines
+    /// that don't parse as log entries.
+    #[test]
+    fn generate_content_jsonl_returns_raw_file() {
+        let dir =
+            std::env::temp_dir().join(format!("mnemonai-export-jsonl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("raw.jsonl");
+        let raw = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n{\"not\":\"a log entry\"}\n";
+        fs::write(&file, raw).unwrap();
+
+        let content =
+            generate_content(&file, ExportFormat::Jsonl, ExportOptions::default()).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(content, raw);
+    }
+
+    /// Raw JSONL is the only format without an entry-based generator, so it
+    /// can never be routed through `generate_content_from_entries`.
+    #[test]
+    fn only_jsonl_has_no_entry_format() {
+        assert!(matches!(
+            ExportFormat::Ledger.entry_format(),
+            Some(EntryFormat::Ledger)
+        ));
+        assert!(matches!(
+            ExportFormat::Plain.entry_format(),
+            Some(EntryFormat::Plain)
+        ));
+        assert!(matches!(
+            ExportFormat::Markdown.entry_format(),
+            Some(EntryFormat::Markdown)
+        ));
+        assert!(ExportFormat::Jsonl.entry_format().is_none());
     }
 }
