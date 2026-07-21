@@ -3,8 +3,8 @@ use crate::claude::{
 };
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, delete_conversation, fingerprint_from_metadata,
-    load_provider_cache, prune_conversations, save_conversations,
+    CachedFileConversation, SourceFingerprint, delete_conversation, load_provider_cache,
+    prune_conversations, save_conversations,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -20,8 +20,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 pub struct CursorAgentProvider {
@@ -30,18 +30,57 @@ pub struct CursorAgentProvider {
 
 struct AgentProject {
     project_dir_name: String,
-    workspace_path: Option<PathBuf>,
-    transcript_files: Vec<PathBuf>,
+    transcript_files: Vec<TranscriptFile>,
     modified: SystemTime,
+}
+
+/// A transcript file paired with the metadata captured during the directory
+/// walk. Statting once here lets the sort, the project modified-time, and the
+/// cache fingerprint all reuse the same values instead of re-stat'ing.
+struct TranscriptFile {
+    path: PathBuf,
+    modified: SystemTime,
+    size: u64,
+}
+
+impl TranscriptFile {
+    fn fingerprint(&self) -> SourceFingerprint {
+        SourceFingerprint {
+            modified_millis: system_time_to_millis(self.modified),
+            size: self.size.min(i64::MAX as u64) as i64,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct CursorAgentTranscriptRecord {
-    role: String,
+    /// Present only on Cursor Agent event records (`turn_ended`, ...). Deserialized
+    /// so the event predicate can run on the typed record instead of a second
+    /// `serde_json::Value` pass.
+    #[serde(rename = "type", default)]
+    type_field: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
-    #[serde(default)]
-    message: CursorAgentTranscriptMessage,
+    /// `None` distinguishes "no message key" (event record) from an empty message.
+    /// An explicit `"message": null` stays a hard parse error (see
+    /// `present_message`), matching the previous required-struct behavior.
+    #[serde(default, deserialize_with = "present_message")]
+    message: Option<CursorAgentTranscriptMessage>,
+}
+
+/// Deserialize a `message` value that is present in the JSON. A plain
+/// `Option` would also map an explicit `"message": null` to `None`, silently
+/// reclassifying a malformed record as an event or an empty message; the
+/// previous code deserialized the struct directly, so null was an error.
+fn present_message<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<CursorAgentTranscriptMessage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CursorAgentTranscriptMessage::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -78,10 +117,10 @@ struct CursorAgentTranscriptBlock {
 
 struct ParsedTranscriptLine {
     entry: LogEntry,
-    text_for_search: Option<String>,
-    text_for_preview: Option<String>,
+    /// Search text and preview text were always identical; a single field feeds
+    /// both. `None` means the line produced no displayable text.
+    text: Option<String>,
     timestamp: Option<DateTime<FixedOffset>>,
-    counts_as_message: bool,
 }
 
 enum ConversationLoad {
@@ -110,13 +149,10 @@ impl CursorAgentProvider {
             return Ok(Vec::new());
         }
 
-        let chats_dir = self
-            .projects_root
-            .parent()
-            .map(|cursor_dir| cursor_dir.join("chats"));
-
-        // Each project costs real I/O: listing transcripts plus the DFS
-        // filesystem probing in resolve_workspace_path. Run them in parallel.
+        // Each project costs real I/O to list its transcripts. Run the walks in
+        // parallel. Workspace-path resolution is deliberately *not* done here: it
+        // is a filesystem-probing DFS whose result is only needed on cache
+        // misses, so `load_project_conversations` resolves it lazily.
         let entries: Vec<_> = fs::read_dir(&self.projects_root)?.flatten().collect();
         let mut projects: Vec<AgentProject> = entries
             .par_iter()
@@ -136,9 +172,10 @@ impl CursorAgentProvider {
                     return None;
                 }
 
+                // Reuse the mtimes captured during the walk; no extra stat calls.
                 let modified = transcript_files
                     .iter()
-                    .filter_map(|path| file_modified_time(path))
+                    .map(|file| file.modified)
                     .max()
                     .unwrap_or(SystemTime::UNIX_EPOCH);
 
@@ -148,12 +185,8 @@ impl CursorAgentProvider {
                     .unwrap_or("")
                     .to_string();
 
-                let workspace_path =
-                    resolve_workspace_path(&project_dir_name, chats_dir.as_deref());
-
                 Some(AgentProject {
                     project_dir_name,
-                    workspace_path,
                     transcript_files,
                     modified,
                 })
@@ -174,24 +207,40 @@ impl CursorAgentProvider {
         debug_level: Option<DebugLevel>,
         cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
     ) -> (Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>) {
-        let workspace_path = project.workspace_path.clone();
-        let project_dir_name = project.project_dir_name.clone();
+        let project_dir_name = project.project_dir_name.as_str();
+        // Cached conversations already carry their workspace path, so the DFS in
+        // resolve_workspace_path only matters on a cache miss. Resolve it lazily
+        // and at most once per project, shared across the parallel file walk.
+        let workspace_path: OnceLock<Option<PathBuf>> = OnceLock::new();
+        let resolve_workspace = || {
+            workspace_path.get_or_init(|| {
+                let chats_dir = self
+                    .projects_root
+                    .parent()
+                    .map(|cursor_dir| cursor_dir.join("chats"));
+                resolve_workspace_path(project_dir_name, chats_dir.as_deref())
+            })
+        };
+
         let loaded: Vec<ConversationLoad> = project
             .transcript_files
             .par_iter()
-            .filter_map(|path| {
+            .filter_map(|file| {
+                let path = &file.path;
                 let filename = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let fingerprint = file_fingerprint(path);
+                // Fingerprint comes from the metadata captured during the walk;
+                // no extra stat call here.
+                let fingerprint = file.fingerprint();
 
                 // Always consume the cache entry for a file we've seen: whatever
                 // remains in the map afterwards is treated as deleted and pruned,
-                // and a file that merely failed to stat or parse isn't deleted.
+                // and a file that merely failed to parse isn't deleted.
                 let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(path));
-                if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
+                if let Some(cached) = cached_entry
                     && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
                 {
                     debug::debug(
@@ -201,11 +250,12 @@ impl CursorAgentProvider {
                     return Some(ConversationLoad::Cached(conversation));
                 }
 
+                // Cache miss: only now do we need the resolved workspace path.
                 match process_transcript_file(
-                    path.clone(),
+                    file,
                     show_last,
-                    workspace_path.clone(),
-                    project_dir_name.clone(),
+                    resolve_workspace().as_deref(),
+                    project_dir_name,
                     debug_level,
                 ) {
                     Ok(Some(conversation)) => {
@@ -216,12 +266,7 @@ impl CursorAgentProvider {
                                 filename, conversation.preview
                             ),
                         );
-                        match fingerprint {
-                            Some(fingerprint) => {
-                                Some(ConversationLoad::Fresh(conversation, fingerprint))
-                            }
-                            None => Some(ConversationLoad::Cached(conversation)),
-                        }
+                        Some(ConversationLoad::Fresh(conversation, fingerprint))
                     }
                     Ok(None) => None,
                     Err(err) => {
@@ -385,7 +430,14 @@ impl super::Provider for CursorAgentProvider {
                 continue;
             }
 
-            match parse_transcript_line(&line, line_idx + 1, workspace_path) {
+            // The viewer/export path only needs the LogEntry; skip the preview and
+            // search-text summarization that only the scan path consumes.
+            match parse_transcript_line_with_mode(
+                &line,
+                line_idx + 1,
+                workspace_path,
+                ParseMode::EntryOnly,
+            ) {
                 Ok(Some(parsed)) => entries.push(parsed.entry),
                 Ok(None) => {}
                 Err(err) => {
@@ -450,16 +502,18 @@ impl super::Provider for CursorAgentProvider {
 }
 
 fn process_transcript_file(
-    path: PathBuf,
+    transcript: &TranscriptFile,
     show_last: bool,
-    workspace_path: Option<PathBuf>,
-    project_dir_name: String,
+    workspace_path: Option<&Path>,
+    project_dir_name: &str,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let file = File::open(&path)?;
+    let path = &transcript.path;
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut all_parts = Vec::new();
-    let mut preview_parts = Vec::new();
+    // Preview and search text draw from the same per-line text; keep one vector
+    // (preview slices its first/last few, full text joins all of it).
+    let mut parts = Vec::new();
     let mut message_count = 0;
     let mut parse_errors = Vec::new();
     let mut first_timestamp: Option<DateTime<FixedOffset>> = None;
@@ -484,7 +538,7 @@ fn process_transcript_file(
             continue;
         }
 
-        match parse_transcript_line(&line, line_idx + 1, workspace_path.as_deref()) {
+        match parse_transcript_line(&line, line_idx + 1, workspace_path) {
             Ok(Some(parsed)) => {
                 if let Some(ts) = parsed.timestamp {
                     if first_timestamp.is_none() {
@@ -493,15 +547,10 @@ fn process_transcript_file(
                     last_timestamp = Some(ts);
                 }
 
-                if let Some(text) = parsed.text_for_search {
-                    all_parts.push(text);
+                if let Some(text) = parsed.text {
+                    parts.push(text);
                 }
-                if let Some(text) = parsed.text_for_preview {
-                    preview_parts.push(text);
-                }
-                if parsed.counts_as_message {
-                    message_count += 1;
-                }
+                message_count += 1;
             }
             Ok(None) => {}
             Err(err) => {
@@ -525,33 +574,33 @@ fn process_transcript_file(
         }
     }
 
-    if preview_parts.is_empty() {
+    if parts.is_empty() {
         return Ok(None);
     }
 
     let preview = if show_last {
-        preview_parts
+        parts
             .iter()
             .rev()
             .take(3)
-            .cloned()
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(" ... ")
     } else {
-        preview_parts
+        parts
             .iter()
             .take(3)
-            .cloned()
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(" ... ")
     };
 
     let preview = normalize_whitespace(&preview);
-    let full_text = normalize_whitespace(&all_parts.join(" "));
+    let full_text = normalize_whitespace(&parts.join(" "));
+    // Fall back to the mtime captured during the walk rather than re-stat'ing.
     let timestamp = last_timestamp
         .map(|ts| ts.with_timezone(&Local))
-        .or_else(|| file_modified_time(&path).map(DateTime::<Local>::from))
-        .unwrap_or_else(Local::now);
+        .unwrap_or_else(|| DateTime::<Local>::from(transcript.modified));
     let duration_minutes = match (first_timestamp, last_timestamp) {
         (Some(first), Some(last)) => {
             let duration = last.signed_duration_since(first);
@@ -564,16 +613,15 @@ fn process_transcript_file(
         .and_then(|stem| stem.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let project_name = workspace_path
-        .as_ref()
-        .map(|workspace| format_short_name_from_path(workspace))
-        .or_else(|| {
-            let last_segment = project_dir_name.rsplit('-').next()?;
-            (!last_segment.is_empty()).then(|| last_segment.to_string())
-        });
+    let project_name = workspace_path.map(format_short_name_from_path).or_else(|| {
+        let last_segment = project_dir_name.rsplit('-').next()?;
+        (!last_segment.is_empty()).then(|| last_segment.to_string())
+    });
 
+    // Clone the owned copies the Conversation needs exactly once, at the end.
+    let workspace_path = workspace_path.map(Path::to_path_buf);
     Ok(Some(Conversation {
-        path,
+        path: path.clone(),
         index: 0,
         provider: ProviderKind::CursorAgent,
         id,
@@ -594,43 +642,89 @@ fn process_transcript_file(
     }))
 }
 
+/// Controls how much per-line text work `parse_transcript_line` performs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParseMode {
+    /// Scan/index path: also derive preview/search text and the timestamp.
+    Full,
+    /// Viewer/export path: build the `LogEntry` only and skip the
+    /// summarization + timestamp work that only the scan path consumes.
+    EntryOnly,
+}
+
 fn parse_transcript_line(
     line: &str,
     line_idx: usize,
     workspace_path: Option<&Path>,
 ) -> Result<Option<ParsedTranscriptLine>> {
-    let value: Value = serde_json::from_str(line)?;
-    if is_cursor_agent_event_record(&value) {
+    parse_transcript_line_with_mode(line, line_idx, workspace_path, ParseMode::Full)
+}
+
+fn parse_transcript_line_with_mode(
+    line: &str,
+    line_idx: usize,
+    workspace_path: Option<&Path>,
+    mode: ParseMode,
+) -> Result<Option<ParsedTranscriptLine>> {
+    // Deserialize once into the typed record; the event predicate then runs on
+    // the typed struct rather than a second `serde_json::Value` traversal.
+    let record: CursorAgentTranscriptRecord = serde_json::from_str(line)?;
+    if is_cursor_agent_event_record(&record) {
         return Ok(None);
     }
 
-    let record: CursorAgentTranscriptRecord = serde_json::from_value(value)?;
-    let timestamp = record
-        .timestamp
-        .as_deref()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok());
-    let timestamp_str = record.timestamp.unwrap_or_default();
+    // Records that reach here must carry a role. Missing `role` used to surface
+    // as a serde deserialization error (the field was required); reproduce that
+    // exactly with an explicit missing-field error so malformed message-like
+    // records keep failing.
+    let Some(role) = record.role else {
+        return Err(<serde_json::Error as serde::de::Error>::missing_field("role").into());
+    };
 
-    let blocks: Vec<ContentBlock> = record
+    let content = record
         .message
-        .content
-        .iter()
+        .map(|message| message.content)
+        .unwrap_or_default();
+
+    // Compute the preview summary before consuming `content`: it only inspects
+    // block_type/name, so it must read the raw blocks (a missing tool name is
+    // skipped here, unlike the converted block which substitutes "tool").
+    let preview_summary = (mode == ParseMode::Full).then(|| summarize_blocks_for_preview(&content));
+
+    // Move each block's payload (text/input/content/source) into the ContentBlock
+    // instead of cloning it.
+    let blocks: Vec<ContentBlock> = content
+        .into_iter()
         .enumerate()
-        .filter_map(|(block_idx, block)| block_to_content_block(block, line_idx, block_idx))
+        .filter_map(|(block_idx, block)| block_into_content_block(block, line_idx, block_idx))
         .collect();
 
     if blocks.is_empty() {
         return Ok(None);
     }
 
-    let text = normalize_whitespace(&extract_text_from_blocks(&blocks));
-    let summary = if text.is_empty() {
-        summarize_blocks_for_preview(&record.message.content)
-    } else {
-        Some(text.clone())
+    let text = match mode {
+        ParseMode::Full => {
+            let text = normalize_whitespace(&extract_text_from_blocks(&blocks));
+            if text.is_empty() {
+                preview_summary.flatten()
+            } else {
+                Some(text)
+            }
+        }
+        ParseMode::EntryOnly => None,
     };
-    let role = record.role.to_lowercase();
-    let entry = match role.as_str() {
+
+    let timestamp = match mode {
+        ParseMode::Full => record
+            .timestamp
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok()),
+        ParseMode::EntryOnly => None,
+    };
+    let timestamp_str = record.timestamp.unwrap_or_default();
+
+    let entry = match role.to_lowercase().as_str() {
         "user" => LogEntry::User {
             message: UserMessage {
                 content: UserContent::Blocks(blocks),
@@ -652,54 +746,41 @@ fn parse_transcript_line(
 
     Ok(Some(ParsedTranscriptLine {
         entry,
-        text_for_search: summary.clone(),
-        text_for_preview: summary,
+        text,
         timestamp,
-        counts_as_message: true,
     }))
 }
 
-fn is_cursor_agent_event_record(value: &Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.contains_key("type")
-            && !object.contains_key("role")
-            && !object.contains_key("message")
-    })
+fn is_cursor_agent_event_record(record: &CursorAgentTranscriptRecord) -> bool {
+    record.type_field.is_some() && record.role.is_none() && record.message.is_none()
 }
 
-fn block_to_content_block(
-    block: &CursorAgentTranscriptBlock,
+fn block_into_content_block(
+    block: CursorAgentTranscriptBlock,
     line_idx: usize,
     block_idx: usize,
 ) -> Option<ContentBlock> {
     match block.block_type.as_str() {
-        "text" => block
-            .text
-            .as_ref()
-            .map(|text| ContentBlock::Text { text: text.clone() }),
+        "text" => block.text.map(|text| ContentBlock::Text { text }),
         "tool_use" => Some(ContentBlock::ToolUse {
             id: block
                 .id
-                .clone()
                 .unwrap_or_else(|| format!("cursor-agent-{}-{}", line_idx, block_idx)),
-            name: block.name.clone().unwrap_or_else(|| "tool".to_string()),
-            input: block.input.clone().unwrap_or(Value::Null),
+            name: block.name.unwrap_or_else(|| "tool".to_string()),
+            input: block.input.unwrap_or(Value::Null),
         }),
         "tool_result" => Some(ContentBlock::ToolResult {
             tool_use_id: block
                 .tool_use_id
-                .clone()
                 .unwrap_or_else(|| format!("cursor-agent-result-{}-{}", line_idx, block_idx)),
-            content: block.content.clone(),
+            content: block.content,
             is_error: block.is_error,
-            status: block.status.clone(),
+            status: block.status,
         }),
         "thinking" => Some(ContentBlock::Thinking {
-            thinking: block.thinking.clone().unwrap_or_default(),
+            thinking: block.thinking.unwrap_or_default(),
         }),
-        "image" => block.source.as_ref().map(|source| ContentBlock::Image {
-            source: source.clone(),
-        }),
+        "image" => block.source.map(|source| ContentBlock::Image { source }),
         _ => None,
     }
 }
@@ -719,17 +800,17 @@ fn summarize_blocks_for_preview(blocks: &[CursorAgentTranscriptBlock]) -> Option
     (!summary.is_empty()).then_some(summary)
 }
 
-fn collect_transcript_files(transcripts_dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+fn collect_transcript_files(transcripts_dir: &Path) -> Vec<TranscriptFile> {
+    let mut paths = Vec::new();
     let entries = match fs::read_dir(transcripts_dir) {
         Ok(entries) => entries,
-        Err(_) => return files,
+        Err(_) => return Vec::new(),
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
-            files.push(path);
+            paths.push(path);
             continue;
         }
 
@@ -739,7 +820,7 @@ fn collect_transcript_files(transcripts_dir: &Path) -> Vec<PathBuf> {
 
         let default_path = path.join(format!("{}.jsonl", entry.file_name().to_string_lossy()));
         if default_path.is_file() {
-            files.push(default_path);
+            paths.push(default_path);
             continue;
         }
 
@@ -750,14 +831,36 @@ fn collect_transcript_files(transcripts_dir: &Path) -> Vec<PathBuf> {
         for nested in nested_entries.flatten() {
             let nested_path = nested.path();
             if nested_path.is_file() && nested_path.extension().is_some_and(|ext| ext == "jsonl") {
-                files.push(nested_path);
+                paths.push(nested_path);
                 break;
             }
         }
     }
 
-    files.sort_by_key(|path| file_modified_time(path).unwrap_or(SystemTime::UNIX_EPOCH));
-    files.reverse();
+    // Stat each file exactly once, capturing both the mtime (for sorting and the
+    // timestamp fallback) and the size (for the cache fingerprint).
+    let mut files: Vec<TranscriptFile> = paths
+        .into_iter()
+        .map(|path| {
+            let (modified, size) = fs::metadata(&path)
+                .map(|metadata| {
+                    (
+                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                        metadata.len(),
+                    )
+                })
+                .unwrap_or((SystemTime::UNIX_EPOCH, 0));
+            TranscriptFile {
+                path,
+                modified,
+                size,
+            }
+        })
+        .collect();
+
+    // Newest first. The captured mtimes make this a plain field compare — no
+    // syscall per comparison.
+    files.sort_by(|a, b| b.modified.cmp(&a.modified));
     files
 }
 
@@ -943,14 +1046,13 @@ fn component_prefix_viable(prefix: &str, is_last: bool) -> bool {
     })
 }
 
-fn file_modified_time(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).ok()?.modified().ok()
-}
-
-fn file_fingerprint(path: &Path) -> Option<SourceFingerprint> {
-    fs::metadata(path)
-        .ok()
-        .map(|metadata| fingerprint_from_metadata(&metadata))
+/// Milliseconds since the Unix epoch, matching the encoding the conversation
+/// index uses for `SourceFingerprint::modified_millis` so warm-cache lookups
+/// keep matching.
+fn system_time_to_millis(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 fn transcript_parent_dir(path: &Path, conversation_id: &str) -> Option<PathBuf> {
@@ -1060,6 +1162,24 @@ mod tests {
         }
     }
 
+    /// Build a `TranscriptFile` for an existing path, statting it once the way
+    /// `collect_transcript_files` does.
+    fn transcript_file(path: PathBuf) -> TranscriptFile {
+        let (modified, size) = fs::metadata(&path)
+            .map(|metadata| {
+                (
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    metadata.len(),
+                )
+            })
+            .unwrap_or((SystemTime::UNIX_EPOCH, 0));
+        TranscriptFile {
+            path,
+            modified,
+            size,
+        }
+    }
+
     #[test]
     fn parse_transcript_line_converts_tool_calls() {
         let line = r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Checking now"},{"type":"tool_use","name":"Shell","input":{"command":"git status"}}]}}"#;
@@ -1079,7 +1199,7 @@ mod tests {
             }
             other => panic!("expected assistant entry, got {:?}", other),
         }
-        assert_eq!(parsed.text_for_preview.as_deref(), Some("Checking now"));
+        assert_eq!(parsed.text.as_deref(), Some("Checking now"));
     }
 
     #[test]
@@ -1125,10 +1245,10 @@ mod tests {
         .unwrap();
 
         let conversation = process_transcript_file(
-            transcript_path,
+            &transcript_file(transcript_path),
             false,
-            Some(workspace_path.clone()),
-            "test-workspace".to_string(),
+            Some(workspace_path.as_path()),
+            "test-workspace",
             None,
         )
         .unwrap()
@@ -1288,10 +1408,10 @@ mod tests {
         .unwrap();
 
         let conversation = process_transcript_file(
-            transcript_path,
+            &transcript_file(transcript_path),
             false,
             None,
-            "Users-me-myproject".to_string(),
+            "Users-me-myproject",
             None,
         )
         .unwrap()
@@ -1344,5 +1464,138 @@ mod tests {
             Some(candidate_b),
             "MD5 tiebreaker should select the candidate with a matching chats directory"
         );
+    }
+
+    #[test]
+    fn event_predicate_treats_typed_record_by_fields() {
+        // Has `type`, no `role`, no `message` -> event record, skipped.
+        let event = r#"{"type":"turn_ended","status":"success"}"#;
+        assert!(parse_transcript_line(event, 1, None).unwrap().is_none());
+
+        // A `type` field alongside a real message with a role is NOT an event:
+        // the predicate requires the role to be absent.
+        let typed_message = r#"{"type":"message","role":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let parsed = parse_transcript_line(typed_message, 1, None)
+            .unwrap()
+            .expect("typed message with a role should parse as a message");
+        assert!(matches!(parsed.entry, LogEntry::Assistant { .. }));
+        assert_eq!(parsed.text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_transcript_line_rejects_explicit_null_message() {
+        // "message": null failed struct deserialization before the single-parse
+        // rewrite; the presence-tracking Option must not reclassify it as an
+        // event record or an empty message.
+        let with_role = r#"{"role":"user","message":null}"#;
+        assert!(parse_transcript_line(with_role, 1, None).is_err());
+
+        let with_type = r#"{"type":"turn_ended","message":null}"#;
+        assert!(parse_transcript_line(with_type, 1, None).is_err());
+    }
+
+    #[test]
+    fn merged_parts_preview_takes_first_three() {
+        let temp = TestTempDir::new("preview-first");
+        let transcript_path = temp.path.join("chat-first.jsonl");
+        let mut file = File::create(&transcript_path).unwrap();
+        for word in ["one", "two", "three", "four", "five"] {
+            writeln!(
+                file,
+                r#"{{"role":"user","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+                word
+            )
+            .unwrap();
+        }
+
+        let conversation =
+            process_transcript_file(&transcript_file(transcript_path), false, None, "proj", None)
+                .unwrap()
+                .unwrap();
+
+        // Preview keeps the first three parts.
+        assert_eq!(conversation.preview, "one ... two ... three");
+        // Full text spans every part, not just the previewed ones.
+        assert_eq!(conversation.full_text, "one two three four five");
+        assert_eq!(conversation.message_count, 5);
+    }
+
+    #[test]
+    fn merged_parts_preview_show_last_takes_last_three() {
+        let temp = TestTempDir::new("preview-last");
+        let transcript_path = temp.path.join("chat-last.jsonl");
+        let mut file = File::create(&transcript_path).unwrap();
+        for word in ["one", "two", "three", "four", "five"] {
+            writeln!(
+                file,
+                r#"{{"role":"user","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+                word
+            )
+            .unwrap();
+        }
+
+        let conversation =
+            process_transcript_file(&transcript_file(transcript_path), true, None, "proj", None)
+                .unwrap()
+                .unwrap();
+
+        // show_last keeps the last three parts, most-recent first.
+        assert_eq!(conversation.preview, "five ... four ... three");
+        assert_eq!(conversation.full_text, "one two three four five");
+    }
+
+    #[test]
+    fn read_entries_skips_preview_text_but_builds_entries() {
+        let temp = TestTempDir::new("read-entries");
+        let transcript_path = temp.path.join("chat-entries.jsonl");
+        let mut file = File::create(&transcript_path).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","timestamp":"2026-04-24T20:00:00Z","message":{{"content":[{{"type":"text","text":"question"}}]}}}}"#
+        )
+        .unwrap();
+        // Event records must still be skipped on the entry-only path.
+        writeln!(file, r#"{{"type":"turn_ended","status":"success"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"assistant","timestamp":"2026-04-24T20:01:00Z","message":{{"content":[{{"type":"thinking","thinking":"pondering"}},{{"type":"text","text":"answer"}}]}}}}"#
+        )
+        .unwrap();
+
+        let provider = CursorAgentProvider {
+            projects_root: temp.path.clone(),
+        };
+        let conversation = Conversation {
+            path: transcript_path,
+            index: 0,
+            provider: ProviderKind::CursorAgent,
+            id: "chat-entries".to_string(),
+            timestamp: Local::now(),
+            preview: String::new(),
+            full_text: String::new(),
+            project_name: None,
+            project_path: None,
+            cwd: None,
+            message_count: 0,
+            parse_errors: Vec::new(),
+            summary: None,
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+            search_text_lower: None,
+            search_topic_end: None,
+        };
+
+        let entries = provider.read_entries(&conversation).unwrap();
+        assert_eq!(entries.len(), 2, "event record should be skipped");
+        assert!(matches!(entries[0], LogEntry::User { .. }));
+        match &entries[1] {
+            LogEntry::Assistant { message, .. } => {
+                assert_eq!(message.content.len(), 2);
+                assert!(matches!(message.content[0], ContentBlock::Thinking { .. }));
+                assert!(matches!(message.content[1], ContentBlock::Text { .. }));
+            }
+            other => panic!("expected assistant entry, got {:?}", other),
+        }
     }
 }
