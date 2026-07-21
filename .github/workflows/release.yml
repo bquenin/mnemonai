@@ -39,10 +39,6 @@ jobs:
       - name: Package
         run: |
           bin="target/${{ matrix.target }}/release/${BIN_NAME}"
-          # Only strip on Linux to avoid corrupting macOS code signatures
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            strip "$bin" || true
-          fi
           archive="${BIN_NAME}-${{ matrix.platform }}.tar.gz"
           tar -C "$(dirname "$bin")" -czf "$archive" ${BIN_NAME}
           shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
