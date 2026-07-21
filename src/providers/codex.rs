@@ -224,7 +224,7 @@ impl CodexProvider {
             .into_iter()
             .map(ConversationLoad::into_conversation)
             .collect();
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
         Ok(conversations)
     }
 

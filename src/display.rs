@@ -591,11 +591,9 @@ fn process_user_message<F: OutputFormatter>(
                             printed_content = true;
                         }
                     }
-                    ContentBlock::ToolResult { content, .. } => {
-                        if !no_tools {
-                            formatter.format_tool_result(content.as_ref());
-                            printed_content = true;
-                        }
+                    ContentBlock::ToolResult { content, .. } if !no_tools => {
+                        formatter.format_tool_result(content.as_ref());
+                        printed_content = true;
                     }
                     _ => {}
                 }

@@ -263,7 +263,7 @@ fn load_conversations(
         });
     }
 
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
     Ok(conversations)
 }
@@ -527,10 +527,7 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
                 push_message(&mut messages, message);
             }
             LogEntry::User {
-                message,
-                timestamp,
-                cwd: _,
-                ..
+                message, timestamp, ..
             } => push_user_message(&mut messages, message, timestamp, entry_index),
             LogEntry::Assistant {
                 message, timestamp, ..

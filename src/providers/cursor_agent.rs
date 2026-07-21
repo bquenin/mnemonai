@@ -193,7 +193,7 @@ impl CursorAgentProvider {
             })
             .collect();
 
-        projects.sort_by(|a, b| b.modified.cmp(&a.modified));
+        projects.sort_by_key(|c| std::cmp::Reverse(c.modified));
         Ok(projects)
     }
 
@@ -298,7 +298,7 @@ impl CursorAgentProvider {
             .map(ConversationLoad::into_conversation)
             .collect();
 
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
         (conversations, fresh)
     }
 }
@@ -347,7 +347,7 @@ impl super::Provider for CursorAgentProvider {
             .unwrap_or_default();
         prune_conversations(ProviderKind::CursorAgent, &stale);
 
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
         Ok(conversations)
     }
@@ -853,7 +853,7 @@ fn collect_transcript_files(transcripts_dir: &Path) -> Vec<TranscriptFile> {
 
     // Newest first. The captured mtimes make this a plain field compare — no
     // syscall per comparison.
-    files.sort_by(|a, b| b.modified.cmp(&a.modified));
+    files.sort_by_key(|c| std::cmp::Reverse(c.modified));
     files
 }
 

@@ -287,7 +287,7 @@ impl App {
     pub fn finish_loading(&mut self) {
         // Sort all conversations by timestamp (newest first)
         self.conversations
-            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            .sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
         // Now precompute search text (only once, at the end)
         self.searchable = search::precompute_search_text(&mut self.conversations);
