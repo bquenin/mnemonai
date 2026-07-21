@@ -1,4 +1,4 @@
-use crate::claude::LogEntry;
+use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage};
 use crate::error::{AppError, Result};
 use crate::history::{Conversation, LoaderMessage, ProviderKind};
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -299,7 +299,8 @@ fn open_cache_db() -> Option<Connection> {
          CREATE TABLE IF NOT EXISTS user_bubble_keys (
              conv_id      TEXT PRIMARY KEY,
              min_user_key TEXT,
-             max_user_key TEXT
+             max_user_key TEXT,
+             bubble_count INTEGER
          );
          CREATE TABLE IF NOT EXISTS conversation_full_text (
              conv_id      TEXT PRIMARY KEY,
@@ -308,16 +309,23 @@ fn open_cache_db() -> Option<Connection> {
          );",
     )
     .ok()?;
+    // Migrate pre-existing user_bubble_keys tables that lack the bubble_count
+    // column (added for staleness detection). Rows keep bubble_count NULL, which
+    // reads back as a mismatch below and triggers a one-time re-derive.
+    let _ = conn.execute_batch("ALTER TABLE user_bubble_keys ADD COLUMN bubble_count INTEGER");
     Some(conn)
 }
 
+/// A cached user-bubble-key entry: (min_user_key, max_user_key, bubble_count).
+/// `bubble_count` is `None` for rows written before the column existed; such
+/// rows never match a live conversation's count and so are treated as stale.
+type CachedUserKeys = (Option<String>, Option<String>, Option<usize>);
+
 /// Bulk-load all cached user bubble key entries.
-fn load_cached_user_keys(
-    cache_conn: &Connection,
-) -> HashMap<String, (Option<String>, Option<String>)> {
+fn load_cached_user_keys(cache_conn: &Connection) -> HashMap<String, CachedUserKeys> {
     let mut map = HashMap::new();
     let mut stmt = match cache_conn
-        .prepare("SELECT conv_id, min_user_key, max_user_key FROM user_bubble_keys")
+        .prepare("SELECT conv_id, min_user_key, max_user_key, bubble_count FROM user_bubble_keys")
     {
         Ok(s) => s,
         Err(_) => return map,
@@ -327,13 +335,14 @@ fn load_cached_user_keys(
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<usize>>(3)?,
         ))
     }) {
         Ok(r) => r,
         Err(_) => return map,
     };
     for row in rows.flatten() {
-        map.insert(row.0, (row.1, row.2));
+        map.insert(row.0, (row.1, row.2, row.3));
     }
     map
 }
@@ -346,18 +355,19 @@ fn query_user_key_for_conv(
 ) -> (Option<String>, Option<String>) {
     let prefix = format!("bubbleId:{}:", conv_id);
     let prefix_end = format!("bubbleId:{};", conv_id);
-    let result = cursor_conn.query_row(
+    let Ok(mut stmt) = cursor_conn.prepare_cached(
         "SELECT MIN(key), MAX(key) FROM cursorDiskKV \
          WHERE key >= ?1 AND key < ?2 \
            AND json_extract(CAST(value AS TEXT), '$.type') = 1",
-        rusqlite::params![&prefix, &prefix_end],
-        |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        },
-    );
+    ) else {
+        return (None, None);
+    };
+    let result = stmt.query_row(rusqlite::params![&prefix, &prefix_end], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    });
     result.unwrap_or((None, None))
 }
 
@@ -398,18 +408,18 @@ fn query_user_keys_for_convs(
         .collect()
 }
 
+/// A user-bubble-key entry to persist: (conv_id, min_user_key, max_user_key, bubble_count).
+type UserKeyEntry = (String, Option<String>, Option<String>, usize);
+
 /// Batch-insert user bubble key entries into the cache in a single transaction.
-fn save_user_keys_to_cache(
-    cache_conn: &Connection,
-    entries: &[(String, Option<String>, Option<String>)],
-) {
+fn save_user_keys_to_cache(cache_conn: &Connection, entries: &[UserKeyEntry]) {
     if entries.is_empty() {
         return;
     }
     let _ = cache_conn.execute_batch("BEGIN");
     {
-        let mut stmt = match cache_conn.prepare(
-            "INSERT OR REPLACE INTO user_bubble_keys (conv_id, min_user_key, max_user_key) VALUES (?1, ?2, ?3)",
+        let mut stmt = match cache_conn.prepare_cached(
+            "INSERT OR REPLACE INTO user_bubble_keys (conv_id, min_user_key, max_user_key, bubble_count) VALUES (?1, ?2, ?3, ?4)",
         ) {
             Ok(s) => s,
             Err(_) => {
@@ -417,8 +427,8 @@ fn save_user_keys_to_cache(
                 return;
             }
         };
-        for (conv_id, min_key, max_key) in entries {
-            let _ = stmt.execute(rusqlite::params![conv_id, min_key, max_key]);
+        for (conv_id, min_key, max_key, bubble_count) in entries {
+            let _ = stmt.execute(rusqlite::params![conv_id, min_key, max_key, bubble_count]);
         }
     }
     let _ = cache_conn.execute_batch("COMMIT");
@@ -454,12 +464,15 @@ fn load_cached_full_text(cache_conn: &Connection) -> HashMap<String, (String, us
 fn query_full_text_for_conv(cursor_conn: &Connection, conv_id: &str) -> String {
     let prefix = format!("bubbleId:{}:", conv_id);
     let prefix_end = format!("bubbleId:{};", conv_id);
-    let result = cursor_conn.query_row(
+    let Ok(mut stmt) = cursor_conn.prepare_cached(
         "SELECT GROUP_CONCAT(NULLIF(json_extract(CAST(value AS TEXT), '$.text'), ''), ' ') \
          FROM cursorDiskKV WHERE key >= ?1 AND key < ?2",
-        rusqlite::params![&prefix, &prefix_end],
-        |row| row.get::<_, Option<String>>(0),
-    );
+    ) else {
+        return String::new();
+    };
+    let result = stmt.query_row(rusqlite::params![&prefix, &prefix_end], |row| {
+        row.get::<_, Option<String>>(0)
+    });
     result.unwrap_or(None).unwrap_or_default()
 }
 
@@ -470,7 +483,7 @@ fn save_full_text_to_cache(cache_conn: &Connection, entries: &[(String, String, 
     }
     let _ = cache_conn.execute_batch("BEGIN");
     {
-        let mut stmt = match cache_conn.prepare(
+        let mut stmt = match cache_conn.prepare_cached(
             "INSERT OR REPLACE INTO conversation_full_text (conv_id, full_text, bubble_count) VALUES (?1, ?2, ?3)",
         ) {
             Ok(s) => s,
@@ -486,6 +499,54 @@ fn save_full_text_to_cache(cache_conn: &Connection, entries: &[(String, String, 
     let _ = cache_conn.execute_batch("COMMIT");
 }
 
+/// Delete a single conversation's rows from every sidecar cache table.
+/// Best-effort: called when a conversation is deleted from Cursor's own DB so
+/// the sidecar doesn't retain orphaned min/max keys or full text.
+fn delete_conv_from_cache(cache_conn: &Connection, conv_id: &str) {
+    let _ = cache_conn.execute(
+        "DELETE FROM user_bubble_keys WHERE conv_id = ?1",
+        rusqlite::params![conv_id],
+    );
+    let _ = cache_conn.execute(
+        "DELETE FROM conversation_full_text WHERE conv_id = ?1",
+        rusqlite::params![conv_id],
+    );
+}
+
+/// Prune sidecar rows whose conv_id is no longer among the live conversations.
+///
+/// MUST only be called after the main-database enumeration succeeded: `live`
+/// has to be the complete set of discovered conversation ids, otherwise valid
+/// cache entries would be dropped. Nothing ever removed these rows before, so
+/// the sidecar grew unbounded as conversations were deleted in Cursor.
+fn prune_stale_cache_rows(cache_conn: &Connection, live: &std::collections::HashSet<&str>) {
+    for table in ["user_bubble_keys", "conversation_full_text"] {
+        let sql = format!("SELECT conv_id FROM {}", table);
+        let existing: Vec<String> = match cache_conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                Ok(rows) => rows.flatten().collect(),
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let orphans: Vec<&String> = existing
+            .iter()
+            .filter(|id| !live.contains(id.as_str()))
+            .collect();
+        if orphans.is_empty() {
+            continue;
+        }
+        let delete_sql = format!("DELETE FROM {} WHERE conv_id = ?1", table);
+        let _ = cache_conn.execute_batch("BEGIN");
+        if let Ok(mut stmt) = cache_conn.prepare_cached(&delete_sql) {
+            for id in orphans {
+                let _ = stmt.execute(rusqlite::params![id]);
+            }
+        }
+        let _ = cache_conn.execute_batch("COMMIT");
+    }
+}
+
 /// Build full-text map for all conversations, using cache where possible.
 /// For cached conversations with matching bubble count, uses the cached text.
 /// For new/changed conversations, queries per-conversation (sub-ms each) and updates cache.
@@ -495,26 +556,31 @@ fn build_full_text_map(
     cache_conn: Option<&Connection>,
 ) -> HashMap<String, String> {
     let cached = cache_conn.map(load_cached_full_text).unwrap_or_default();
-    build_full_text_map_from_cached(None, cursor_conn, conv_infos, &cached, cache_conn)
+    build_full_text_map_from_cached(None, cursor_conn, conv_infos, cached, cache_conn)
 }
 
 /// Like `build_full_text_map`, but with cache entries preloaded (so the cache
 /// read can happen on another thread) and, when `parallel_db_path` is given,
 /// cache misses fetched in parallel across read-only connections.
+///
+/// Takes ownership of `cached` so cache hits can be moved (not cloned) into the
+/// result map — the full-text corpus is large and used to be copied per entry.
 fn build_full_text_map_from_cached(
     parallel_db_path: Option<&Path>,
     cursor_conn: &Connection,
     conv_infos: &[ConvInfo],
-    cached: &HashMap<String, (String, usize)>,
+    mut cached: HashMap<String, (String, usize)>,
     cache_conn: Option<&Connection>,
 ) -> HashMap<String, String> {
     let mut full_text_map = HashMap::with_capacity(conv_infos.len());
     let mut misses: Vec<&ConvInfo> = Vec::new();
 
     for info in conv_infos {
-        match cached.get(&info.conv_id) {
-            Some((text, count)) if *count == info.bubble_count => {
-                full_text_map.insert(info.conv_id.clone(), text.clone());
+        // Move the cached text out on a hit (matching bubble_count) instead of
+        // cloning it. `remove` also drops stale entries we won't reuse.
+        match cached.remove(&info.conv_id) {
+            Some((text, count)) if count == info.bubble_count => {
+                full_text_map.insert(info.conv_id.clone(), text);
             }
             // Cache miss or stale — query fresh
             _ => misses.push(info),
@@ -556,12 +622,14 @@ fn build_full_text_map_from_cached(
             .collect(),
     };
 
-    for (conv_id, text, _) in &new_entries {
-        full_text_map.insert(conv_id.clone(), text.clone());
-    }
-
+    // Persist fresh entries to the cache before moving them into the result map,
+    // so the corpus is written straight from `new_entries` (no extra clone).
     if let Some(cache) = cache_conn {
         save_full_text_to_cache(cache, &new_entries);
+    }
+
+    for (conv_id, text, _) in new_entries {
+        full_text_map.insert(conv_id, text);
     }
 
     full_text_map
@@ -619,7 +687,7 @@ fn batch_fetch_bubbles(conn: &Connection, keys: &[String]) -> Result<HashMap<Str
             "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key IN ({})",
             placeholders.join(",")
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> = chunk
             .iter()
             .map(|k| k as &dyn rusqlite::types::ToSql)
@@ -658,7 +726,7 @@ fn build_conversation(
     bubble_map: &HashMap<String, Value>,
     index_timestamps: &HashMap<String, i64>,
     workspace_map: &HashMap<String, WorkspaceInfo>,
-    full_text_map: &HashMap<String, String>,
+    full_text_map: &mut HashMap<String, String>,
     db_path: &Path,
 ) -> Option<Conversation> {
     // Extract preview text with priority chain:
@@ -737,9 +805,11 @@ fn build_conversation(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    // All early returns above are done, so this conversation is being kept:
+    // move the full text out of the map (each conv_id is built at most once on
+    // the success path) rather than cloning the whole corpus.
     let full_text = full_text_map
-        .get(&info.conv_id)
-        .cloned()
+        .remove(&info.conv_id)
         .unwrap_or_else(|| preview.clone());
 
     Some(Conversation {
@@ -764,18 +834,25 @@ fn build_conversation(
     })
 }
 
-/// Collect unique keys to fetch from a set of ConvInfo entries.
+/// Collect the keys to fetch from a set of ConvInfo entries.
+///
+/// `first_key` and `preview_key` are identical unless `show_last` is set (see
+/// `query_conv_infos`), so `preview_key` is only pushed when it actually
+/// differs. Bubble keys embed their conversation id, so keys never collide
+/// across conversations; the only remaining intra-conversation overlap
+/// (`user_preview_key` equal to a boundary key) is harmless in an `IN (...)`
+/// fetch, so no global sort/dedup pass is needed.
 fn collect_keys_to_fetch(conv_infos: &[ConvInfo]) -> Vec<String> {
-    let mut keys: Vec<String> = Vec::with_capacity(conv_infos.len() * 3);
+    let mut keys: Vec<String> = Vec::with_capacity(conv_infos.len() * 2);
     for info in conv_infos {
         keys.push(info.first_key.clone());
-        keys.push(info.preview_key.clone());
+        if info.preview_key != info.first_key {
+            keys.push(info.preview_key.clone());
+        }
         if let Some(ref uk) = info.user_preview_key {
             keys.push(uk.clone());
         }
     }
-    keys.sort();
-    keys.dedup();
     keys
 }
 
@@ -812,10 +889,15 @@ fn load_conversations_from_conn_inner(
 
     if let Some(cache_conn) = cache_ref {
         let cached = load_cached_user_keys(cache_conn);
-        let mut new_entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        let mut new_entries: Vec<UserKeyEntry> = Vec::new();
 
         for info in &mut conv_infos {
-            if let Some((min_key, max_key)) = cached.get(&info.conv_id) {
+            // Cache hit only when the stored bubble_count matches the live count;
+            // otherwise the conversation gained/lost messages and the cached
+            // min/max user keys are stale.
+            if let Some((min_key, max_key, Some(count))) = cached.get(&info.conv_id)
+                && *count == info.bubble_count
+            {
                 info.user_preview_key = if show_last {
                     max_key.clone()
                 } else {
@@ -828,11 +910,20 @@ fn load_conversations_from_conn_inner(
                 } else {
                     min_key.clone()
                 };
-                new_entries.push((info.conv_id.clone(), min_key, max_key));
+                new_entries.push((info.conv_id.clone(), min_key, max_key, info.bubble_count));
             }
         }
 
         save_user_keys_to_cache(cache_conn, &new_entries);
+
+        // Enumeration succeeded (query_conv_infos above), so conv_infos is the
+        // complete live set — safe to drop sidecar rows for conversations that
+        // no longer exist.
+        let live: std::collections::HashSet<&str> = conv_infos
+            .iter()
+            .map(|info| info.conv_id.as_str())
+            .collect();
+        prune_stale_cache_rows(cache_conn, &live);
     } else {
         let mut user_keys = query_user_bubble_keys(conn, show_last);
         for info in &mut conv_infos {
@@ -843,7 +934,7 @@ fn load_conversations_from_conn_inner(
     let keys_to_fetch = collect_keys_to_fetch(&conv_infos);
     let bubble_map = batch_fetch_bubbles(conn, &keys_to_fetch)?;
     let index_timestamps = load_index_timestamps(conn);
-    let full_text_map = build_full_text_map(conn, &conv_infos, cache_ref);
+    let mut full_text_map = build_full_text_map(conn, &conv_infos, cache_ref);
 
     let conversations: Vec<Conversation> = conv_infos
         .iter()
@@ -853,7 +944,7 @@ fn load_conversations_from_conn_inner(
                 &bubble_map,
                 &index_timestamps,
                 workspace_map,
-                &full_text_map,
+                &mut full_text_map,
                 db_path,
             )
         })
@@ -957,15 +1048,29 @@ impl super::Provider for CursorProvider {
 
             // Resolve user_preview_keys from cache BEFORE splitting into phases.
             // On warm cache this fills all keys, so every conversation builds in the
-            // first batch — no visible refresh when phase 2 arrives.
+            // first batch — no visible refresh when phase 2 arrives. Only trust a
+            // cached entry whose bubble_count matches the live count; a stale entry
+            // is left unresolved so phase 2 re-derives it from the database.
             for info in &mut conv_infos {
-                if let Some((min_key, max_key)) = cached_user_keys.get(&info.conv_id) {
+                if let Some((min_key, max_key, Some(count))) = cached_user_keys.get(&info.conv_id)
+                    && *count == info.bubble_count
+                {
                     info.user_preview_key = if show_last {
                         max_key.clone()
                     } else {
                         min_key.clone()
                     };
                 }
+            }
+
+            // Enumeration succeeded above, so conv_infos is the complete live
+            // set — prune sidecar rows for conversations that no longer exist.
+            if let Some(ref cache) = cache_conn {
+                let live: std::collections::HashSet<&str> = conv_infos
+                    .iter()
+                    .map(|info| info.conv_id.as_str())
+                    .collect();
+                prune_stale_cache_rows(cache, &live);
             }
 
             // Batch-fetch all keys we know about (first, preview, and cached user keys).
@@ -980,11 +1085,11 @@ impl super::Provider for CursorProvider {
                 };
 
             // Build full-text search index for all conversations (cached, sub-ms per miss).
-            let full_text_map = build_full_text_map_from_cached(
+            let mut full_text_map = build_full_text_map_from_cached(
                 Some(&global_db_path),
                 &conn,
                 &conv_infos,
-                &cached_full_text,
+                cached_full_text,
                 cache_conn.as_ref(),
             );
 
@@ -999,7 +1104,7 @@ impl super::Provider for CursorProvider {
                     &bubble_map,
                     &index_timestamps,
                     &workspace_map,
-                    &full_text_map,
+                    &mut full_text_map,
                     &global_db_path,
                 ) {
                     phase1_convs.push(conv);
@@ -1025,7 +1130,7 @@ impl super::Provider for CursorProvider {
                             .map(|(conv_id, min_key, max_key)| (conv_id, (min_key, max_key)))
                             .collect();
 
-                    let mut new_entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+                    let mut new_entries: Vec<UserKeyEntry> = Vec::new();
                     for info in &mut remaining_infos {
                         let Some((min_key, max_key)) = resolved.get(&info.conv_id) else {
                             continue;
@@ -1035,7 +1140,12 @@ impl super::Provider for CursorProvider {
                         } else {
                             min_key.clone()
                         };
-                        new_entries.push((info.conv_id.clone(), min_key.clone(), max_key.clone()));
+                        new_entries.push((
+                            info.conv_id.clone(),
+                            min_key.clone(),
+                            max_key.clone(),
+                            info.bubble_count,
+                        ));
                     }
                     save_user_keys_to_cache(cache, &new_entries);
                 } else {
@@ -1068,7 +1178,7 @@ impl super::Provider for CursorProvider {
                             &full_map,
                             &index_timestamps,
                             &workspace_map,
-                            &full_text_map,
+                            &mut full_text_map,
                             &global_db_path,
                         )
                     })
@@ -1176,6 +1286,12 @@ impl super::Provider for CursorProvider {
             }
         }
 
+        // Drop the conversation's sidecar cache rows too, so the cache doesn't
+        // keep stale keys/full text for a conversation that no longer exists.
+        if let Some(cache_conn) = open_cache_db() {
+            delete_conv_from_cache(&cache_conn, conv_id);
+        }
+
         Ok(())
     }
 }
@@ -1196,8 +1312,6 @@ struct Bubble {
     model: Option<String>,
     /// Thinking block text
     thinking: Option<String>,
-    /// Thinking block signature
-    thinking_signature: Option<String>,
     /// Tool call data
     tool_name: Option<String>,
     tool_args: Option<String>,
@@ -1245,12 +1359,6 @@ fn parse_bubble(json_str: &str) -> Option<Bubble> {
         .and_then(|t| t.get("text"))
         .and_then(|t| t.as_str())
         .filter(|s| !s.is_empty())
-        .map(String::from);
-
-    let thinking_signature = v
-        .get("thinking")
-        .and_then(|t| t.get("signature"))
-        .and_then(|t| t.as_str())
         .map(String::from);
 
     let tool_former = v.get("toolFormerData");
@@ -1313,7 +1421,6 @@ fn parse_bubble(json_str: &str) -> Option<Bubble> {
         created_at,
         model,
         thinking,
-        thinking_signature,
         tool_name,
         tool_args,
         tool_call_id,
@@ -1410,31 +1517,27 @@ fn bubble_to_log_entry(bubble: &Bubble) -> Option<LogEntry> {
             if text.is_empty() {
                 return None;
             }
-            let json = serde_json::json!({
-                "type": "user",
-                "timestamp": timestamp,
-                "message": {
-                    "role": "user",
-                    "content": text
-                }
-            });
-            serde_json::from_value(json).ok()
+            Some(LogEntry::User {
+                message: UserMessage {
+                    content: UserContent::String(text),
+                },
+                timestamp,
+                cwd: None,
+            })
         }
         BUBBLE_TYPE_ASSISTANT => {
             let text = bubble_text(bubble);
 
             // Build content blocks
-            let mut content_blocks = Vec::new();
+            let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
-            // Add thinking block if present
-            if let (Some(thinking), Some(signature)) =
-                (&bubble.thinking, &bubble.thinking_signature)
-            {
-                content_blocks.push(serde_json::json!({
-                    "type": "thinking",
-                    "thinking": thinking,
-                    "signature": signature
-                }));
+            // Add thinking block whenever thinking text exists. (Cursor omits a
+            // signature for many blocks; ContentBlock::Thinking has no signature
+            // field anyway, so keying on the signature only hid valid thinking.)
+            if let Some(thinking) = &bubble.thinking {
+                content_blocks.push(ContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                });
             }
 
             // Add tool use block if present (tool_call_id and tool_args may be absent)
@@ -1449,62 +1552,42 @@ fn bubble_to_log_entry(bubble: &Bubble) -> Option<LogEntry> {
                     .as_ref()
                     .and_then(|args| serde_json::from_str(args).ok())
                     .unwrap_or(Value::Object(serde_json::Map::new()));
-                content_blocks.push(serde_json::json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input
-                }));
+                content_blocks.push(ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input,
+                });
 
                 // Add tool result if present
                 if let Some(ref result) = bubble.tool_result {
                     let truncated = truncate_str(result, 500);
-                    let mut result_block = serde_json::json!({
-                        "type": "tool_result",
-                        "tool_use_id": id,
-                        "content": truncated
+                    content_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content: Some(Value::String(truncated)),
+                        is_error: None,
+                        status: bubble.tool_status.clone(),
                     });
-                    if let Some(status) = &bubble.tool_status {
-                        result_block
-                            .as_object_mut()
-                            .unwrap()
-                            .insert("status".to_string(), Value::String(status.clone()));
-                    }
-                    content_blocks.push(result_block);
                 }
             }
 
             // Add text block if present
             if !text.is_empty() {
-                content_blocks.push(serde_json::json!({
-                    "type": "text",
-                    "text": text
-                }));
+                content_blocks.push(ContentBlock::Text { text });
             }
 
             if content_blocks.is_empty() {
                 return None;
             }
 
-            let mut message = serde_json::json!({
-                "role": "assistant",
-                "content": content_blocks
-            });
-
-            if let Some(ref model) = bubble.model {
-                message
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("model".to_string(), Value::String(model.clone()));
-            }
-
-            let json = serde_json::json!({
-                "type": "assistant",
-                "timestamp": timestamp,
-                "message": message
-            });
-
-            serde_json::from_value(json).ok()
+            Some(LogEntry::Assistant {
+                message: AssistantMessage {
+                    content: content_blocks,
+                    model: bubble.model.clone(),
+                    usage: None,
+                    id: None,
+                },
+                timestamp,
+            })
         }
         _ => None,
     }
@@ -1661,7 +1744,6 @@ mod tests {
             bubble.thinking,
             Some("Let me think about this...".to_string())
         );
-        assert_eq!(bubble.thinking_signature, Some("sig123".to_string()));
     }
 
     #[test]
@@ -1681,7 +1763,6 @@ mod tests {
             created_at: Some("2025-01-01T00:00:00Z".to_string()),
             model: None,
             thinking: None,
-            thinking_signature: None,
             tool_name: None,
             tool_args: None,
             tool_call_id: None,
@@ -1706,7 +1787,6 @@ mod tests {
             created_at: Some("2025-01-01T00:00:01Z".to_string()),
             model: Some("claude-sonnet-4".to_string()),
             thinking: None,
-            thinking_signature: None,
             tool_name: None,
             tool_args: None,
             tool_call_id: None,
@@ -1734,7 +1814,6 @@ mod tests {
             created_at: Some("2025-01-01T00:00:01Z".to_string()),
             model: None,
             thinking: None,
-            thinking_signature: None,
             tool_name: None,
             tool_args: None,
             tool_call_id: None,
@@ -2138,7 +2217,13 @@ mod tests {
             "CREATE TABLE user_bubble_keys (
                  conv_id      TEXT PRIMARY KEY,
                  min_user_key TEXT,
-                 max_user_key TEXT
+                 max_user_key TEXT,
+                 bubble_count INTEGER
+             );
+             CREATE TABLE conversation_full_text (
+                 conv_id      TEXT PRIMARY KEY,
+                 full_text    TEXT NOT NULL,
+                 bubble_count INTEGER NOT NULL
              );",
         )
         .unwrap();
@@ -2206,11 +2291,13 @@ mod tests {
                 "conv-a".to_string(),
                 Some("bubbleId:conv-a:111".to_string()),
                 Some("bubbleId:conv-a:999".to_string()),
+                3,
             ),
             (
                 "conv-b".to_string(),
                 Some("bubbleId:conv-b:222".to_string()),
                 Some("bubbleId:conv-b:888".to_string()),
+                5,
             ),
         ];
 
@@ -2222,14 +2309,16 @@ mod tests {
             loaded.get("conv-a"),
             Some(&(
                 Some("bubbleId:conv-a:111".to_string()),
-                Some("bubbleId:conv-a:999".to_string())
+                Some("bubbleId:conv-a:999".to_string()),
+                Some(3),
             ))
         );
         assert_eq!(
             loaded.get("conv-b"),
             Some(&(
                 Some("bubbleId:conv-b:222".to_string()),
-                Some("bubbleId:conv-b:888".to_string())
+                Some("bubbleId:conv-b:888".to_string()),
+                Some(5),
             ))
         );
     }
@@ -2238,13 +2327,13 @@ mod tests {
     fn test_cache_null_keys_round_trip() {
         let cache = create_test_cache_db();
 
-        let entries = vec![("conv-empty".to_string(), None, None)];
+        let entries = vec![("conv-empty".to_string(), None, None, 0)];
 
         save_user_keys_to_cache(&cache, &entries);
         let loaded = load_cached_user_keys(&cache);
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded.get("conv-empty"), Some(&(None, None)));
+        assert_eq!(loaded.get("conv-empty"), Some(&(None, None, Some(0))));
     }
 
     #[test]
@@ -2297,5 +2386,293 @@ mod tests {
                 .unwrap();
         assert_eq!(convs2.len(), 1);
         assert_eq!(convs2[0].preview, "My question");
+    }
+
+    /// Seed a single user_bubble_keys row (bypassing save_user_keys_to_cache so
+    /// tests can plant a deliberately stale bubble_count).
+    fn seed_user_key_row(
+        cache: &Connection,
+        conv_id: &str,
+        min_key: Option<&str>,
+        max_key: Option<&str>,
+        bubble_count: i64,
+    ) {
+        cache
+            .execute(
+                "INSERT OR REPLACE INTO user_bubble_keys \
+                 (conv_id, min_user_key, max_user_key, bubble_count) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![conv_id, min_key, max_key, bubble_count],
+            )
+            .unwrap();
+    }
+
+    fn count_rows(cache: &Connection, table: &str, conv_id: &str) -> i64 {
+        cache
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {} WHERE conv_id = ?1", table),
+                rusqlite::params![conv_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_stale_user_key_cache_is_refreshed() {
+        // A conversation gained a new (last) user bubble after its user-key row
+        // was cached. With staleness detection the bubble_count mismatch forces
+        // a re-derive, so --show-last reflects the new last message instead of
+        // the stale cached one.
+        let conn = create_test_db();
+        let cache = create_test_cache_db();
+        let conv = "conv-stale";
+
+        // Original user bubble (was the only user message when the row was cached).
+        insert_bubble(
+            &conn,
+            conv,
+            "11111111-user1",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "Old question",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        // A newer user bubble that arrived after caching.
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-user2",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "New question",
+                "createdAt": "2025-06-01T10:05:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        // Stale cache: bubble_count=1 (real count is 2) and max_user_key points
+        // at the OLD user bubble.
+        let old_key = format!("bubbleId:{}:11111111-user1", conv);
+        seed_user_key_row(&cache, conv, Some(&old_key), Some(&old_key), 1);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+
+        // show_last=true: the stale max_user_key would yield "Old question"; the
+        // refreshed derivation must yield the true last user bubble.
+        let convs =
+            load_conversations_from_conn_inner(&conn, true, &ws_map, &db_path, Some(&cache))
+                .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].preview, "New question");
+
+        // The cache row was rewritten with the correct count and key.
+        let cached = load_cached_user_keys(&cache);
+        let entry = cached.get(conv).unwrap();
+        assert_eq!(entry.2, Some(2), "bubble_count should be refreshed to 2");
+        assert_eq!(
+            entry.1.as_deref(),
+            Some(&*format!("bubbleId:{}:ffffffff-user2", conv))
+        );
+    }
+
+    #[test]
+    fn test_delete_conv_from_cache_removes_rows() {
+        let cache = create_test_cache_db();
+        let conv = "conv-del";
+        let other = "conv-keep";
+
+        seed_user_key_row(&cache, conv, Some("k1"), Some("k2"), 3);
+        seed_user_key_row(&cache, other, Some("o1"), Some("o2"), 4);
+        save_full_text_to_cache(
+            &cache,
+            &[
+                (conv.to_string(), "text to delete".to_string(), 3),
+                (other.to_string(), "text to keep".to_string(), 4),
+            ],
+        );
+
+        delete_conv_from_cache(&cache, conv);
+
+        assert_eq!(count_rows(&cache, "user_bubble_keys", conv), 0);
+        assert_eq!(count_rows(&cache, "conversation_full_text", conv), 0);
+        // The unrelated conversation's rows are untouched.
+        assert_eq!(count_rows(&cache, "user_bubble_keys", other), 1);
+        assert_eq!(count_rows(&cache, "conversation_full_text", other), 1);
+    }
+
+    #[test]
+    fn test_prune_stale_cache_rows_drops_orphans_keeps_live() {
+        let cache = create_test_cache_db();
+
+        seed_user_key_row(&cache, "conv-live", Some("k1"), Some("k2"), 2);
+        seed_user_key_row(&cache, "conv-orphan", Some("o1"), Some("o2"), 1);
+        save_full_text_to_cache(
+            &cache,
+            &[
+                ("conv-live".to_string(), "live text".to_string(), 2),
+                ("conv-orphan".to_string(), "orphan text".to_string(), 1),
+            ],
+        );
+
+        let mut live = std::collections::HashSet::new();
+        live.insert("conv-live");
+        prune_stale_cache_rows(&cache, &live);
+
+        assert_eq!(count_rows(&cache, "user_bubble_keys", "conv-live"), 1);
+        assert_eq!(count_rows(&cache, "conversation_full_text", "conv-live"), 1);
+        assert_eq!(count_rows(&cache, "user_bubble_keys", "conv-orphan"), 0);
+        assert_eq!(
+            count_rows(&cache, "conversation_full_text", "conv-orphan"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_load_prunes_orphaned_cache_rows() {
+        // End-to-end: a conversation present only in the sidecar (deleted from
+        // Cursor's DB) is pruned after a successful load.
+        let conn = create_test_db();
+        let cache = create_test_cache_db();
+        let conv = "conv-present";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "Still here",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        // Orphan rows: no such conversation exists in `conn`.
+        seed_user_key_row(&cache, "conv-gone", Some("g1"), Some("g2"), 1);
+        save_full_text_to_cache(&cache, &[("conv-gone".to_string(), "ghost".to_string(), 1)]);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+        let convs =
+            load_conversations_from_conn_inner(&conn, false, &ws_map, &db_path, Some(&cache))
+                .unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(count_rows(&cache, "user_bubble_keys", "conv-gone"), 0);
+        assert_eq!(count_rows(&cache, "conversation_full_text", "conv-gone"), 0);
+        // The live conversation's freshly written row survives.
+        assert_eq!(count_rows(&cache, "user_bubble_keys", conv), 1);
+    }
+
+    #[test]
+    fn test_bubble_to_log_entry_user_text() {
+        let bubble = Bubble {
+            bubble_type: BUBBLE_TYPE_USER,
+            text: "What does this do?".to_string(),
+            rich_text: None,
+            created_at: Some("2025-06-01T10:00:00Z".to_string()),
+            model: None,
+            thinking: None,
+            tool_name: None,
+            tool_args: None,
+            tool_call_id: None,
+            tool_result: None,
+            tool_status: None,
+        };
+        let entry = bubble_to_log_entry(&bubble).unwrap();
+        match entry {
+            LogEntry::User {
+                message, timestamp, ..
+            } => {
+                assert_eq!(timestamp, "2025-06-01T10:00:00Z");
+                assert_eq!(
+                    crate::claude::extract_text_from_user(&message),
+                    "What does this do?"
+                );
+            }
+            _ => panic!("Expected User entry"),
+        }
+    }
+
+    #[test]
+    fn test_bubble_to_log_entry_assistant_thinking_without_signature() {
+        // Regression: thinking blocks used to be emitted only when a signature
+        // was present. Now unsigned thinking is kept.
+        let bubble = Bubble {
+            bubble_type: BUBBLE_TYPE_ASSISTANT,
+            text: "Here is the answer".to_string(),
+            rich_text: None,
+            created_at: Some("2025-06-01T10:00:01Z".to_string()),
+            model: Some("claude-sonnet-4".to_string()),
+            thinking: Some("Considering the options".to_string()),
+            tool_name: None,
+            tool_args: None,
+            tool_call_id: None,
+            tool_result: None,
+            tool_status: None,
+        };
+        let entry = bubble_to_log_entry(&bubble).unwrap();
+        match entry {
+            LogEntry::Assistant { message, .. } => {
+                assert_eq!(message.model.as_deref(), Some("claude-sonnet-4"));
+                let has_thinking = message.content.iter().any(|b| {
+                    matches!(b, ContentBlock::Thinking { thinking } if thinking == "Considering the options")
+                });
+                assert!(has_thinking, "unsigned thinking block should be present");
+                assert_eq!(
+                    crate::claude::extract_text_from_assistant(&message),
+                    "Here is the answer"
+                );
+            }
+            _ => panic!("Expected Assistant entry"),
+        }
+    }
+
+    #[test]
+    fn test_bubble_to_log_entry_assistant_tool_use_and_result() {
+        let bubble = Bubble {
+            bubble_type: BUBBLE_TYPE_ASSISTANT,
+            text: String::new(),
+            rich_text: None,
+            created_at: Some("2025-06-01T10:00:02Z".to_string()),
+            model: None,
+            thinking: None,
+            tool_name: Some("read_file".to_string()),
+            tool_args: Some(r#"{"path":"main.rs"}"#.to_string()),
+            tool_call_id: Some("call_42".to_string()),
+            tool_result: Some("fn main() {}".to_string()),
+            tool_status: Some("completed".to_string()),
+        };
+        let entry = bubble_to_log_entry(&bubble).unwrap();
+        let LogEntry::Assistant { message, .. } = entry else {
+            panic!("Expected Assistant entry");
+        };
+
+        let tool_use = message.content.iter().find_map(|b| match b {
+            ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+            _ => None,
+        });
+        let (id, name, input) = tool_use.expect("tool_use block");
+        assert_eq!(id, "call_42");
+        assert_eq!(name, "read_file");
+        assert_eq!(input.get("path").and_then(|v| v.as_str()), Some("main.rs"));
+
+        let tool_result = message.content.iter().find_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                status,
+                ..
+            } => Some((tool_use_id, content, status)),
+            _ => None,
+        });
+        let (result_id, content, status) = tool_result.expect("tool_result block");
+        assert_eq!(result_id, "call_42");
+        assert_eq!(
+            content.as_ref().and_then(|v| v.as_str()),
+            Some("fn main() {}")
+        );
+        assert_eq!(status.as_deref(), Some("completed"));
     }
 }
