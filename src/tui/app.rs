@@ -658,8 +658,12 @@ impl App {
                 *selected = (*selected + 1).min(crate::tui::export::ExportFormat::ALL.len() - 1);
                 None
             }
-            // Number keys for direct selection (1-based menu positions)
-            KeyCode::Char(c @ '1'..='4') => {
+            // Number keys for direct selection (1-based menu positions);
+            // the accepted range is derived from ExportFormat::ALL so shortcuts
+            // stay in sync with the rendered menu if formats are added.
+            KeyCode::Char(c @ '1'..='9')
+                if (c as usize - '1' as usize) < crate::tui::export::ExportFormat::ALL.len() =>
+            {
                 let index = c as usize - '1' as usize;
                 self.perform_export_with_providers(index, is_yank, providers);
                 self.dialog_mode = DialogMode::None;
