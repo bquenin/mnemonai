@@ -225,9 +225,6 @@ impl CodexProvider {
             .map(ConversationLoad::into_conversation)
             .collect();
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        for (idx, conversation) in conversations.iter_mut().enumerate() {
-            conversation.index = idx;
-        }
         Ok(conversations)
     }
 
@@ -1062,7 +1059,6 @@ fn build_codex_conversation(
 
     Some(Conversation {
         path,
-        index: 0,
         provider: ProviderKind::Codex,
         id,
         timestamp,

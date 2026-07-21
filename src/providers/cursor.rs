@@ -814,7 +814,6 @@ fn build_conversation(
 
     Some(Conversation {
         path: fake_path,
-        index: 0,
         provider: ProviderKind::Cursor,
         id: info.conv_id.clone(),
         timestamp: local_ts,

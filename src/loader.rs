@@ -155,7 +155,6 @@ mod tests {
     fn conversation(id: &str, cwd: Option<PathBuf>, project_path: Option<PathBuf>) -> Conversation {
         Conversation {
             path: PathBuf::from(format!("/tmp/{id}.jsonl")),
-            index: 0,
             provider: ProviderKind::Codex,
             id: id.to_string(),
             timestamp: Local.timestamp_opt(1_700_000_000, 0).single().unwrap(),

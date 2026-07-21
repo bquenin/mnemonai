@@ -66,7 +66,6 @@ pub struct ParseError {
 #[derive(Clone)]
 pub struct Conversation {
     pub path: PathBuf,
-    pub index: usize,
     /// Which provider this conversation belongs to
     pub provider: ProviderKind,
     /// Unique identifier (session UUID for Claude, composer/chat ID for Cursor)

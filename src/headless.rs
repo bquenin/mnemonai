@@ -183,7 +183,6 @@ fn run_list(
     if let Some(limit) = command.limit {
         conversations.truncate(limit);
     }
-    reindex_conversations(&mut conversations);
 
     let summaries: Vec<_> = conversations
         .iter()
@@ -265,7 +264,6 @@ fn load_conversations(
     }
 
     conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    reindex_conversations(&mut conversations);
 
     Ok(conversations)
 }
@@ -381,12 +379,6 @@ fn invalid_timestamp(value: &str, flag: &str) -> AppError {
         "Invalid {} value '{}'; expected RFC 3339 or YYYY-MM-DD",
         flag, value
     ))
-}
-
-fn reindex_conversations(conversations: &mut [Conversation]) {
-    for (idx, conversation) in conversations.iter_mut().enumerate() {
-        conversation.index = idx;
-    }
 }
 
 fn load_global_conversations(
@@ -776,7 +768,6 @@ mod tests {
     fn conversation(id: &str, path: &str, provider: ProviderKind) -> Conversation {
         Conversation {
             path: PathBuf::from(path),
-            index: 0,
             provider,
             id: id.to_string(),
             timestamp: Local.timestamp_opt(1_700_000_000, 0).single().unwrap(),

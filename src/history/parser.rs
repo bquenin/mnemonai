@@ -779,7 +779,6 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
 
     Ok(Some(Conversation {
         path,
-        index: 0,
         provider: ProviderKind::Claude,
         id,
         timestamp,

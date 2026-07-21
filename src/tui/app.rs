@@ -289,11 +289,6 @@ impl App {
         self.conversations
             .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-        // Reindex after sorting
-        for (idx, conv) in self.conversations.iter_mut().enumerate() {
-            conv.index = idx;
-        }
-
         // Now precompute search text (only once, at the end)
         self.searchable = search::precompute_search_text(&mut self.conversations);
 
@@ -1877,7 +1872,6 @@ mod tests {
     fn make_conv(text: &str, idx: usize) -> Conversation {
         Conversation {
             path: PathBuf::from(format!("/tmp/conv-{idx}.jsonl")),
-            index: idx,
             provider: ProviderKind::Claude,
             id: format!("conv-{idx}"),
             timestamp: Local::now(),
