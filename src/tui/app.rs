@@ -1632,9 +1632,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Name column width for ledger-style display
-const NAME_WIDTH: usize = 9;
-
 /// Run the TUI with background loading
 /// Returns the action and the final list of conversations
 pub fn run_with_loader(
@@ -1709,7 +1706,10 @@ pub fn run_with_loader(
 
         let frame_area = guard.terminal.get_frame().area();
         let viewport_height = frame_area.height.saturating_sub(3) as usize;
-        let content_width = (frame_area.width as usize).saturating_sub(NAME_WIDTH + 3);
+        // Subtract the viewer's rendered prefix (name column + separator, plus
+        // the timestamp column when timing is on) so wrapped lines fit exactly.
+        let content_width = (frame_area.width as usize)
+            .saturating_sub(crate::tui::viewer::prefix_width(app.show_timing));
 
         // Check for resize in view mode (recomputes wrapped content for the new
         // width). The frame area only reflects a terminal resize after the draw
@@ -1838,7 +1838,8 @@ pub fn run_single_file(
     loop {
         let frame_area = guard.terminal.get_frame().area();
         let viewport_height = frame_area.height.saturating_sub(3) as usize;
-        let content_width = (frame_area.width as usize).saturating_sub(NAME_WIDTH + 3);
+        let content_width = (frame_area.width as usize)
+            .saturating_sub(crate::tui::viewer::prefix_width(app.show_timing));
 
         // Check for resize in view mode (this triggers initial render too)
         app.check_view_resize(content_width, viewport_height, providers);

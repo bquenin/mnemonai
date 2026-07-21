@@ -19,6 +19,26 @@ use unicode_width::UnicodeWidthStr;
 const NAME_WIDTH: usize = 12;
 /// Width of timestamp prefix when timing is enabled (space + HH:MM + space)
 const TIMESTAMP_WIDTH: usize = 7;
+/// Display width of the " │ " separator rendered between the name column and content
+const SEPARATOR_WIDTH: usize = 3;
+
+/// Total display width of the fixed prefix rendered before content on every
+/// ledger line: the name column plus the " │ " separator, and the timestamp
+/// column when timing is enabled.
+///
+/// This is the single source of truth for the prefix cost. `app.rs` subtracts
+/// it from the terminal width to derive `content_width`, so wrapped lines never
+/// exceed the viewport. Because the timing column widens the prefix, the usable
+/// content width depends on `show_timing`; toggling timing re-renders the view
+/// (see the resize path in `app.rs`).
+pub fn prefix_width(show_timing: bool) -> usize {
+    let base = NAME_WIDTH + SEPARATOR_WIDTH;
+    if show_timing {
+        base + TIMESTAMP_WIDTH
+    } else {
+        base
+    }
+}
 const WHITE: (u8, u8, u8) = (255, 255, 255);
 const USER_TEXT: (u8, u8, u8) = (240, 180, 100);
 const SEPARATOR_COLOR: (u8, u8, u8) = (80, 80, 80);
@@ -677,7 +697,9 @@ impl TuiMarkdownRenderer {
 
         // Handle text wrapping
         for word in text.split_inclusive(char::is_whitespace) {
-            let word_width = word.chars().count();
+            // Measure display columns (CJK/emoji are wide), not char count, so
+            // wide text wraps before overflowing the viewport.
+            let word_width = word.width();
 
             // Check if we need to wrap
             if self.current_width + word_width > self.max_width && self.current_width > 0 {
@@ -732,8 +754,8 @@ impl TuiMarkdownRenderer {
 
     fn push_styled_text(&mut self, text: &str, style: LineStyle) {
         if !text.is_empty() {
+            self.current_width += text.width();
             self.current_line.push((text.to_string(), style));
-            self.current_width += text.chars().count();
         }
     }
 
@@ -1863,6 +1885,85 @@ mod tests {
         eprintln!("Table output:\n{}", result);
         assert!(result.contains('├'), "Expected row separators");
         assert!(result.contains('┼'), "Expected cross junctions");
+    }
+
+    /// Total display width of a fully-rendered ledger line (prefix + content).
+    fn rendered_line_width(line: &RenderedLine) -> usize {
+        line.spans.iter().map(|(t, _)| t.width()).sum()
+    }
+
+    fn user_entry(text: &str) -> LogEntry {
+        LogEntry::User {
+            message: crate::claude::UserMessage {
+                content: UserContent::String(text.to_string()),
+            },
+            timestamp: "2026-02-04T19:46:38.440Z".to_string(),
+            cwd: None,
+        }
+    }
+
+    fn test_render_options(content_width: usize, show_timing: bool) -> RenderOptions {
+        RenderOptions {
+            tool_display: ToolDisplayMode::Truncated,
+            show_thinking: false,
+            show_timing,
+            content_width,
+            assistant_label: "Claude".to_string(),
+            assistant_color: (0, 0, 0),
+            assistant_dim_color: (0, 0, 0),
+        }
+    }
+
+    #[test]
+    fn test_prefix_width_matches_rendered_prefix() {
+        // Prefix = name column (12) + " │ " separator (3), plus the timestamp
+        // column (7) when timing is on.
+        assert_eq!(prefix_width(false), NAME_WIDTH + SEPARATOR_WIDTH);
+        assert_eq!(
+            prefix_width(true),
+            NAME_WIDTH + SEPARATOR_WIDTH + TIMESTAMP_WIDTH
+        );
+    }
+
+    #[test]
+    fn test_wrapped_lines_fit_terminal_width() {
+        // A wrapped line at max width must fit within the terminal for both
+        // timing on and off. content_width is derived exactly as app.rs does:
+        // terminal_width - prefix_width(show_timing).
+        let terminal_width = 60;
+        let text = "lorem ipsum dolor sit amet consectetur ".repeat(12);
+        for show_timing in [false, true] {
+            let content_width = terminal_width - prefix_width(show_timing);
+            let entry = user_entry(&text);
+            let options = test_render_options(content_width, show_timing);
+            let lines = render_entries(std::slice::from_ref(&entry), &options);
+            assert!(!lines.is_empty());
+            for line in &lines {
+                let w = rendered_line_width(line);
+                assert!(
+                    w <= terminal_width,
+                    "rendered line width {w} exceeds terminal width {terminal_width} \
+                     (show_timing={show_timing})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cjk_wrapping_respects_display_width() {
+        // CJK glyphs are two display columns each. Wrapping must measure display
+        // width, not char count, or these lines overflow content_width.
+        let content_width = 20;
+        let text = "字 ".repeat(40);
+        let lines = render_markdown_to_lines(&text, content_width);
+        assert!(lines.len() > 1, "text should wrap across multiple lines");
+        for line in &lines {
+            let w: usize = line.spans.iter().map(|(t, _)| t.width()).sum();
+            assert!(
+                w <= content_width,
+                "content line display width {w} exceeds content_width {content_width}"
+            );
+        }
     }
 
     #[test]
