@@ -630,8 +630,6 @@ fn process_transcript_file(
         model: None,
         total_tokens: 0,
         duration_minutes,
-        search_text_lower: None,
-        search_topic_end: None,
     }))
 }
 
@@ -1286,8 +1284,6 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-            search_text_lower: None,
-            search_topic_end: None,
         };
 
         provider.delete(&conversation).unwrap();
@@ -1573,8 +1569,6 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-            search_text_lower: None,
-            search_topic_end: None,
         };
 
         let entries = provider.read_entries(&conversation).unwrap();

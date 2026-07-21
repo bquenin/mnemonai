@@ -159,6 +159,25 @@ pub struct App {
     previous_query: String,
     /// Whether to show conversations whose project directory no longer exists
     show_deleted_projects: bool,
+    /// Monotonic counter bumped whenever the query, filtered set, or corpus
+    /// changes. Used to invalidate the hidden-match context cache below.
+    filter_generation: u64,
+    /// Memoized hidden-match context snippets for the list UI. Scanning the
+    /// corpus for the context line is expensive, so results are cached and
+    /// only recomputed when the query (`filter_generation`) or render `width`
+    /// changes — not on every idle repaint. Interior mutability lets the
+    /// immutable render path populate it lazily.
+    context_cache: std::cell::RefCell<ContextCache>,
+}
+
+/// Cache of computed hidden-match context snippets, valid for one
+/// (`generation`, `width`) pair. `entries` maps a conversation index to its
+/// snippet (`None` meaning "no hidden match", cached to avoid recomputation).
+#[derive(Default)]
+struct ContextCache {
+    generation: u64,
+    width: usize,
+    entries: std::collections::HashMap<usize, Option<String>>,
 }
 
 impl App {
@@ -188,6 +207,8 @@ impl App {
             single_file_mode: false,
             previous_query: String::new(),
             show_deleted_projects,
+            filter_generation: 0,
+            context_cache: std::cell::RefCell::new(ContextCache::default()),
         }
     }
 
@@ -248,6 +269,8 @@ impl App {
             single_file_mode: true,
             previous_query: String::new(),
             show_deleted_projects: true,
+            filter_generation: 0,
+            context_cache: std::cell::RefCell::new(ContextCache::default()),
         }
     }
 
@@ -286,6 +309,8 @@ impl App {
 
         // Now precompute search text (only once, at the end)
         self.searchable = search::precompute_search_text(&mut self.conversations);
+        // The corpus just changed; invalidate any memoized context snippets.
+        self.filter_generation = self.filter_generation.wrapping_add(1);
 
         self.loading_state = LoadingState::Ready;
 
@@ -361,6 +386,41 @@ impl App {
 
         // Cache parsed query words for render performance
         self.refresh_query_words();
+
+        // Query changed: any memoized context snippets are now stale.
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+    }
+
+    /// Return the memoized hidden-match context snippet for one list item,
+    /// computing it on first use for the current (query, width). Relies on
+    /// `searchable[i].index == i`, maintained by precompute and
+    /// `remove_selected_from_list`. The snippet is lowercased (see
+    /// `compute_context_snippet`).
+    pub fn cached_context(
+        &self,
+        conv_idx: usize,
+        width: usize,
+        query_words: &[&str],
+        truncated_preview: &str,
+    ) -> Option<String> {
+        let mut cache = self.context_cache.borrow_mut();
+        if cache.generation != self.filter_generation || cache.width != width {
+            cache.generation = self.filter_generation;
+            cache.width = width;
+            cache.entries.clear();
+        }
+        if let Some(snippet) = cache.entries.get(&conv_idx) {
+            return snippet.clone();
+        }
+        let text_lower = self
+            .searchable
+            .get(conv_idx)
+            .map(|s| s.text_lower.as_str())
+            .unwrap_or("");
+        let snippet =
+            super::ui::compute_context_snippet(text_lower, truncated_preview, query_words, width);
+        cache.entries.insert(conv_idx, snippet.clone());
+        snippet
     }
 
     /// Move selection up
@@ -441,10 +501,6 @@ impl App {
 
     pub fn conversations(&self) -> &[Conversation] {
         &self.conversations
-    }
-
-    pub fn searchable(&self) -> &[SearchableConversation] {
-        &self.searchable
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -608,6 +664,9 @@ impl App {
             self.selected = Some(self.filtered.len() - 1);
         }
         // else: selected stays the same (now pointing to next item)
+
+        // Indices shifted; memoized context snippets keyed by conv_idx are stale.
+        self.filter_generation = self.filter_generation.wrapping_add(1);
     }
 
     /// Handle a key event during confirmation mode
@@ -1849,8 +1908,6 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-            search_text_lower: None,
-            search_topic_end: None,
         }
     }
 
@@ -1885,6 +1942,8 @@ mod tests {
             single_file_mode: false,
             previous_query: String::new(),
             show_deleted_projects: true,
+            filter_generation: 0,
+            context_cache: std::cell::RefCell::new(ContextCache::default()),
         }
     }
 

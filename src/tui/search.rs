@@ -11,10 +11,11 @@ const TOPIC_WEIGHT: f64 = 3.0;
 
 /// Precomputed search data for a conversation
 pub struct SearchableConversation {
-    /// Lowercased full text for searching
+    /// Lowercased full text for searching. This is the only in-memory copy of
+    /// the conversation body: `Conversation.full_text` is emptied during
+    /// precompute so the corpus is not held twice. The list UI derives its
+    /// hidden-match context line from this lowercased text.
     pub text_lower: String,
-    /// Original full text (moved from Conversation to avoid duplication)
-    pub full_text: String,
     /// Byte offset where the topic window ends in `text_lower`.
     /// Matches within `text_lower[..topic_end]` are weighted higher.
     pub topic_end: usize,
@@ -50,7 +51,7 @@ struct QueryTerm<'a> {
 }
 
 /// Find a char-boundary at or after TOPIC_WINDOW_SIZE bytes.
-pub fn topic_end_for_text(text: &str) -> usize {
+fn topic_end_for_text(text: &str) -> usize {
     if text.len() <= TOPIC_WINDOW_SIZE {
         text.len()
     } else {
@@ -63,25 +64,19 @@ pub fn topic_end_for_text(text: &str) -> usize {
 }
 
 /// Precompute lowercased search text for all conversations.
-/// Moves `full_text` ownership from each Conversation into SearchableConversation
-/// to avoid storing the same text twice in memory.
+/// Takes `full_text` out of each Conversation, lowercases it into
+/// `text_lower`, and drops the original — so the conversation body lives in
+/// memory exactly once (as the lowercased search copy).
 pub fn precompute_search_text(conversations: &mut [Conversation]) -> Vec<SearchableConversation> {
     conversations
         .par_iter_mut()
         .enumerate()
         .map(|(idx, conv)| {
             let full_text = std::mem::take(&mut conv.full_text);
-            let text_lower = conv
-                .search_text_lower
-                .take()
-                .unwrap_or_else(|| normalize_for_search(&full_text));
-            let topic_end = conv
-                .search_topic_end
-                .take()
-                .unwrap_or_else(|| topic_end_for_text(&text_lower));
+            let text_lower = normalize_for_search(&full_text);
+            let topic_end = topic_end_for_text(&text_lower);
             SearchableConversation {
                 text_lower,
-                full_text,
                 topic_end,
                 index: idx,
             }
@@ -302,8 +297,6 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-            search_text_lower: None,
-            search_topic_end: None,
         }
     }
 

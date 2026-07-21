@@ -1073,8 +1073,6 @@ fn build_codex_conversation(
         model: state.model,
         total_tokens: state.total_tokens,
         duration_minutes,
-        search_text_lower: None,
-        search_topic_end: None,
     })
 }
 

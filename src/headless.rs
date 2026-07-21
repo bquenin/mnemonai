@@ -779,8 +779,6 @@ mod tests {
             model: Some("model".to_string()),
             total_tokens: 42,
             duration_minutes: Some(3),
-            search_text_lower: None,
-            search_topic_end: None,
         }
     }
 
