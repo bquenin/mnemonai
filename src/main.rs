@@ -20,7 +20,7 @@ use clap::Parser;
 use cli::Args;
 use error::{AppError, Result};
 use history::LoaderMessage;
-use providers::Provider;
+use providers::{LoadOptions, Provider};
 use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -219,12 +219,19 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Determine how to load conversations based on mode
+    // Determine how to load conversations based on mode. The TUI needs each
+    // conversation's full text for in-app search, so it loads under the full
+    // profile.
+    let load_options = LoadOptions {
+        show_last,
+        debug: args.debug,
+        include_full_text: true,
+    };
     let (conversations, selected_path) = if use_global {
         // Global mode - merge streaming loaders from all providers
         let receivers: Vec<_> = providers
             .iter()
-            .map(|p| p.load_conversations_streaming(show_last, args.debug))
+            .map(|p| p.load_conversations_streaming(load_options))
             .collect();
         let rx = merge_streaming_loaders(receivers);
 
@@ -251,7 +258,7 @@ fn run() -> Result<()> {
         let scope_roots = loader::filter_path_roots(&current_dir)?;
         let receivers: Vec<_> = providers
             .iter()
-            .map(|p| p.load_conversations_streaming(show_last, args.debug))
+            .map(|p| p.load_conversations_streaming(load_options))
             .collect();
         let rx = loader::filter_loader_messages(merge_streaming_loaders(receivers), scope_roots);
 
@@ -357,6 +364,14 @@ fn bench_startup(
 
     let overall = Instant::now();
 
+    // Mirror the interactive TUI: benchmark the full profile (full text loaded)
+    // so the measured startup matches what the TUI actually does.
+    let options = LoadOptions {
+        show_last,
+        debug: debug_level,
+        include_full_text: true,
+    };
+
     // Start all providers first (mirrors real startup), then drain each in its
     // own thread so a slow provider doesn't block the others' message streams.
     let receivers: Vec<(String, Receiver<LoaderMessage>)> = providers
@@ -364,7 +379,7 @@ fn bench_startup(
         .map(|p| {
             (
                 p.name().to_string(),
-                p.load_conversations_streaming(show_last, debug_level),
+                p.load_conversations_streaming(options),
             )
         })
         .collect();

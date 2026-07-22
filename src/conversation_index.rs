@@ -3,20 +3,81 @@
 //! File-backed providers use this sidecar database to skip reparsing unchanged
 //! JSONL transcripts and to reuse lowercased search text on warm starts.
 
-use crate::history::{Conversation, ProviderKind, path_to_string};
+use crate::history::{Conversation, PreviewPair, ProviderKind, path_to_string};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::fs::Metadata;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 2;
+// v3: dropped `show_last` from the primary key and split `preview` into
+// `preview_first`/`preview_last`, so one row now serves both preview modes.
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceFingerprint {
     pub modified_millis: i64,
     pub size: i64,
+}
+
+/// A freshly parsed conversation awaiting persistence, borrowed for the save so
+/// no `Conversation` is cloned. Both previews are stored regardless of the
+/// caller's mode so a later `--first`/`--last` flip stays warm.
+pub struct FreshRow<'a> {
+    pub conversation: &'a Conversation,
+    pub previews: &'a PreviewPair,
+    pub fingerprint: SourceFingerprint,
+}
+
+/// One conversation resolved by a file provider during a scan: either reused
+/// from the cache, or freshly parsed and (when a fingerprint is available)
+/// awaiting persistence.
+///
+/// `Cached` also covers freshly parsed files that cannot be fingerprinted (a
+/// failed `stat`): they are returned but not persisted, exactly as before.
+pub enum LoadedConversation {
+    Cached(Conversation),
+    Fresh {
+        conversation: Conversation,
+        previews: PreviewPair,
+        fingerprint: SourceFingerprint,
+    },
+}
+
+impl LoadedConversation {
+    /// Borrow the persistable payload, or `None` for entries that must not be
+    /// written back (cache hits and unfingerprintable fresh parses).
+    fn as_fresh(&self) -> Option<FreshRow<'_>> {
+        match self {
+            LoadedConversation::Fresh {
+                conversation,
+                previews,
+                fingerprint,
+            } => Some(FreshRow {
+                conversation,
+                previews,
+                fingerprint: *fingerprint,
+            }),
+            LoadedConversation::Cached(_) => None,
+        }
+    }
+
+    /// Consume into the conversation to return to the caller. Under the metadata
+    /// profile (`include_full_text = false`) the full text is dropped *after*
+    /// the save has read it, so the returned value stays lean while the cache
+    /// row remains complete.
+    pub fn into_conversation(self, include_full_text: bool) -> Conversation {
+        let mut conversation = match self {
+            LoadedConversation::Cached(conversation) => conversation,
+            LoadedConversation::Fresh { conversation, .. } => conversation,
+        };
+        if !include_full_text {
+            conversation.full_text = String::new();
+        }
+        conversation
+    }
 }
 
 #[derive(Clone)]
@@ -48,17 +109,18 @@ pub fn fingerprint_from_metadata(metadata: &Metadata) -> SourceFingerprint {
 pub fn load_provider_cache(
     provider: ProviderKind,
     show_last: bool,
+    include_full_text: bool,
 ) -> HashMap<PathBuf, CachedFileConversation> {
     let Some(conn) = open_index_db() else {
         return HashMap::new();
     };
 
-    load_provider_cache_from_conn(&conn, provider, show_last).unwrap_or_default()
+    load_provider_cache_from_conn(&conn, provider, show_last, include_full_text).unwrap_or_default()
 }
 
-pub fn save_conversations<'a, I>(provider: ProviderKind, show_last: bool, entries: I)
+pub fn save_conversations<'a, I>(provider: ProviderKind, entries: I)
 where
-    I: IntoIterator<Item = (&'a Conversation, SourceFingerprint)>,
+    I: IntoIterator<Item = FreshRow<'a>>,
 {
     let entries: Vec<_> = entries.into_iter().collect();
     if entries.is_empty() {
@@ -71,7 +133,7 @@ where
         return;
     };
 
-    if let Err(err) = save_conversations_to_conn(&mut conn, provider, show_last, entries) {
+    if let Err(err) = save_conversations_to_conn(&mut conn, provider, entries) {
         let _ = crate::debug_log::log_debug(&format!("conversation index: save failed: {err}"));
     }
 }
@@ -79,21 +141,20 @@ where
 fn save_conversations_to_conn<'a, I>(
     conn: &mut Connection,
     provider: ProviderKind,
-    show_last: bool,
     entries: I,
 ) -> rusqlite::Result<()>
 where
-    I: IntoIterator<Item = (&'a Conversation, SourceFingerprint)>,
+    I: IntoIterator<Item = FreshRow<'a>>,
 {
     let tx = conn.transaction()?;
 
     {
         let mut stmt = tx.prepare(
             "INSERT OR REPLACE INTO file_conversations (
-                schema_version, provider, show_last, source_path, source_mtime_millis,
-                source_size, id, timestamp, preview, full_text, project_name,
-                project_path, cwd, message_count, parse_errors_json, summary, model,
-                total_tokens, duration_minutes
+                schema_version, provider, source_path, source_mtime_millis,
+                source_size, id, timestamp, preview_first, preview_last, full_text,
+                project_name, project_path, cwd, message_count, parse_errors_json,
+                summary, model, total_tokens, duration_minutes
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                 ?15, ?16, ?17, ?18, ?19
@@ -101,22 +162,26 @@ where
         )?;
 
         let provider_key = provider.key();
-        let show_last = i64::from(show_last);
 
-        for (conversation, fingerprint) in entries {
+        for FreshRow {
+            conversation,
+            previews,
+            fingerprint,
+        } in entries
+        {
             let parse_errors_json = serde_json::to_string(&conversation.parse_errors)
                 .unwrap_or_else(|_| "[]".to_string());
 
             stmt.execute(params![
                 SCHEMA_VERSION,
                 provider_key,
-                show_last,
                 conversation.path.to_string_lossy(),
                 fingerprint.modified_millis,
                 fingerprint.size,
                 conversation.id,
                 conversation.timestamp.to_rfc3339(),
-                conversation.preview,
+                previews.first,
+                previews.last,
                 conversation.full_text,
                 conversation.project_name.as_deref(),
                 path_to_string(conversation.project_path.as_deref()),
@@ -181,6 +246,93 @@ fn prune_conversations_from_conn(
     tx.commit()
 }
 
+/// Shared cache choreography for the file-backed providers (Claude, Codex,
+/// Cursor Agent). Each provider keeps its own file enumeration and batching;
+/// this owns the parts that were triplicated: loading the cache map honoring the
+/// projection, consuming an entry on every load attempt, claiming files that
+/// could not be fingerprinted so they are never mistaken for deletions, saving
+/// fresh rows from references, and pruning whatever is left over once — and only
+/// once — enumeration has succeeded.
+pub struct ProviderCache {
+    provider: ProviderKind,
+    entries: Mutex<HashMap<PathBuf, CachedFileConversation>>,
+}
+
+impl ProviderCache {
+    /// Load the provider's cache map, selecting previews for `show_last` and
+    /// decoding `full_text` only when `include_full_text`.
+    pub fn load(provider: ProviderKind, show_last: bool, include_full_text: bool) -> Self {
+        Self {
+            provider,
+            entries: Mutex::new(load_provider_cache(provider, show_last, include_full_text)),
+        }
+    }
+
+    /// An empty cache (no rows), for the defensive path where a background
+    /// cache-load thread cannot be joined: every file then looks like a miss and
+    /// is reparsed, and — since nothing was claimed — nothing is pruned.
+    pub fn empty(provider: ProviderKind) -> Self {
+        Self {
+            provider,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Consume the cache entry for `path` — on *any* attempt, hit or miss —
+    /// returning the cached conversation only when the fingerprint still matches.
+    /// Removing on every attempt is what lets [`Self::prune_unclaimed`] treat the
+    /// leftover map as exactly the set of deleted files.
+    pub fn take_if_fresh(
+        &self,
+        path: &Path,
+        fingerprint: SourceFingerprint,
+    ) -> Option<Conversation> {
+        let entry = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|mut entries| entries.remove(path))?;
+        entry.into_conversation_if_fresh(fingerprint)
+    }
+
+    /// Claim `path` without using it, so a later prune leaves its cached row
+    /// alone. For files that could not be `stat`ed (no fingerprint) or failed to
+    /// parse: the file is still on disk, so its cache row must not be pruned.
+    pub fn claim(&self, path: &Path) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(path);
+        }
+    }
+
+    /// Persist freshly parsed rows from a borrowed iterator — no `Conversation`
+    /// clones. Safe to call repeatedly (per project or per batch); an empty
+    /// iterator does not even open the database.
+    pub fn save_fresh<'a, I>(&self, loaded: I)
+    where
+        I: IntoIterator<Item = &'a LoadedConversation>,
+    {
+        save_conversations(
+            self.provider,
+            loaded.into_iter().filter_map(LoadedConversation::as_fresh),
+        );
+    }
+
+    /// Prune cache rows for files nobody claimed — i.e. deleted files. Call this
+    /// only after a successful enumeration; a failed enumeration must skip it
+    /// entirely (the caller returns early) or the cache would be emptied. Paths
+    /// beneath any `keep_under` directory are spared, for providers (Claude)
+    /// whose individual projects can fail to load while the rest succeed.
+    pub fn prune_unclaimed(self, keep_under: &[PathBuf]) {
+        let provider = self.provider;
+        let leftover = self.entries.into_inner().unwrap_or_default();
+        let stale: Vec<PathBuf> = leftover
+            .into_keys()
+            .filter(|path| !keep_under.iter().any(|dir| path.starts_with(dir)))
+            .collect();
+        prune_conversations(provider, &stale);
+    }
+}
+
 fn delete_conversation_from_conn(
     conn: &Connection,
     provider: ProviderKind,
@@ -197,58 +349,66 @@ fn load_provider_cache_from_conn(
     conn: &Connection,
     provider: ProviderKind,
     show_last: bool,
+    include_full_text: bool,
 ) -> rusqlite::Result<HashMap<PathBuf, CachedFileConversation>> {
     let mut stmt = conn.prepare(
         "SELECT
-            source_path, source_mtime_millis, source_size, id, timestamp, preview,
-            full_text, project_name, project_path, cwd, message_count,
-            parse_errors_json, summary, model, total_tokens, duration_minutes
+            source_path, source_mtime_millis, source_size, id, timestamp,
+            preview_first, preview_last, full_text, project_name, project_path,
+            cwd, message_count, parse_errors_json, summary, model, total_tokens,
+            duration_minutes
          FROM file_conversations
-         WHERE schema_version = ?1 AND provider = ?2 AND show_last = ?3",
+         WHERE schema_version = ?1 AND provider = ?2",
     )?;
 
-    let rows = stmt.query_map(
-        params![SCHEMA_VERSION, provider.key(), i64::from(show_last)],
-        |row| {
-            let source_path: String = row.get(0)?;
-            let timestamp: String = row.get(4)?;
-            let timestamp = DateTime::parse_from_rfc3339(&timestamp)
-                .map(|ts| ts.with_timezone(&Local))
-                .unwrap_or_else(|_| Local::now());
-            let message_count: i64 = row.get(10)?;
-            let parse_errors_json: String = row.get(11)?;
-            let parse_errors = serde_json::from_str(&parse_errors_json).unwrap_or_default();
-            let total_tokens: i64 = row.get(14)?;
-            let duration_minutes: Option<i64> = row.get(15)?;
+    let rows = stmt.query_map(params![SCHEMA_VERSION, provider.key()], |row| {
+        let source_path: String = row.get(0)?;
+        let timestamp: String = row.get(4)?;
+        let timestamp = DateTime::parse_from_rfc3339(&timestamp)
+            .map(|ts| ts.with_timezone(&Local))
+            .unwrap_or_else(|_| Local::now());
+        // One row holds both previews; pick the one this scan asked for.
+        let preview: String = if show_last { row.get(6)? } else { row.get(5)? };
+        // Under the metadata profile the (potentially large) full_text column is
+        // never touched — SQLite skips reading it and nothing is retained.
+        let full_text = if include_full_text {
+            row.get(7)?
+        } else {
+            String::new()
+        };
+        let message_count: i64 = row.get(11)?;
+        let parse_errors_json: String = row.get(12)?;
+        let parse_errors = serde_json::from_str(&parse_errors_json).unwrap_or_default();
+        let total_tokens: i64 = row.get(15)?;
+        let duration_minutes: Option<i64> = row.get(16)?;
 
-            Ok((
-                PathBuf::from(&source_path),
-                CachedFileConversation {
-                    fingerprint: SourceFingerprint {
-                        modified_millis: row.get(1)?,
-                        size: row.get(2)?,
-                    },
-                    conversation: Conversation {
-                        path: PathBuf::from(source_path),
-                        provider,
-                        id: row.get(3)?,
-                        timestamp,
-                        preview: row.get(5)?,
-                        full_text: row.get(6)?,
-                        project_name: row.get(7)?,
-                        project_path: optional_path(row.get(8)?),
-                        cwd: optional_path(row.get(9)?),
-                        message_count: message_count.max(0) as usize,
-                        parse_errors,
-                        summary: row.get(12)?,
-                        model: row.get(13)?,
-                        total_tokens: total_tokens.max(0) as u64,
-                        duration_minutes: duration_minutes.map(|v| v.max(0) as u64),
-                    },
+        Ok((
+            PathBuf::from(&source_path),
+            CachedFileConversation {
+                fingerprint: SourceFingerprint {
+                    modified_millis: row.get(1)?,
+                    size: row.get(2)?,
                 },
-            ))
-        },
-    )?;
+                conversation: Conversation {
+                    path: PathBuf::from(source_path),
+                    provider,
+                    id: row.get(3)?,
+                    timestamp,
+                    preview,
+                    full_text,
+                    project_name: row.get(8)?,
+                    project_path: optional_path(row.get(9)?),
+                    cwd: optional_path(row.get(10)?),
+                    message_count: message_count.max(0) as usize,
+                    parse_errors,
+                    summary: row.get(13)?,
+                    model: row.get(14)?,
+                    total_tokens: total_tokens.max(0) as u64,
+                    duration_minutes: duration_minutes.map(|v| v.max(0) as u64),
+                },
+            },
+        ))
+    })?;
 
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
@@ -269,13 +429,13 @@ fn open_index_db() -> Option<Connection> {
 const EXPECTED_COLUMNS: [&str; 19] = [
     "schema_version",
     "provider",
-    "show_last",
     "source_path",
     "source_mtime_millis",
     "source_size",
     "id",
     "timestamp",
-    "preview",
+    "preview_first",
+    "preview_last",
     "full_text",
     "project_name",
     "project_path",
@@ -291,13 +451,13 @@ const EXPECTED_COLUMNS: [&str; 19] = [
 const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS file_conversations (
              schema_version        INTEGER NOT NULL,
              provider              TEXT NOT NULL,
-             show_last             INTEGER NOT NULL,
              source_path           TEXT NOT NULL,
              source_mtime_millis   INTEGER NOT NULL,
              source_size           INTEGER NOT NULL,
              id                    TEXT NOT NULL,
              timestamp             TEXT NOT NULL,
-             preview               TEXT NOT NULL,
+             preview_first         TEXT NOT NULL,
+             preview_last          TEXT NOT NULL,
              full_text             TEXT NOT NULL,
              project_name          TEXT,
              project_path          TEXT,
@@ -308,7 +468,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS file_conversations (
              model                 TEXT,
              total_tokens          INTEGER NOT NULL,
              duration_minutes      INTEGER,
-             PRIMARY KEY (schema_version, provider, show_last, source_path)
+             PRIMARY KEY (schema_version, provider, source_path)
          );";
 
 fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -415,6 +575,34 @@ mod tests {
         }
     }
 
+    fn make_previews() -> PreviewPair {
+        PreviewPair {
+            first: "First Preview".to_string(),
+            last: "Last Preview".to_string(),
+        }
+    }
+
+    /// Save a single conversation with a throwaway preview pair, for tests that
+    /// only care about round-tripping non-preview fields.
+    fn save_one(
+        conn: &mut Connection,
+        provider: ProviderKind,
+        conversation: &Conversation,
+        fingerprint: SourceFingerprint,
+    ) {
+        let previews = make_previews();
+        save_conversations_to_conn(
+            conn,
+            provider,
+            [FreshRow {
+                conversation,
+                previews: &previews,
+                fingerprint,
+            }],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn load_cache_round_trips_conversation() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -432,15 +620,10 @@ mod tests {
             size: 456,
         };
 
-        save_conversations_to_conn(
-            &mut conn,
-            ProviderKind::Claude,
-            false,
-            [(&conversation, fingerprint)],
-        )
-        .unwrap();
+        save_one(&mut conn, ProviderKind::Claude, &conversation, fingerprint);
 
-        let mut cache = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        let mut cache =
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true).unwrap();
         let cached = cache.remove(&conversation.path).unwrap();
 
         assert!(
@@ -458,6 +641,63 @@ mod tests {
         assert_eq!(loaded.parse_errors.len(), 1);
         assert_eq!(loaded.parse_errors[0].line_number, 7);
         assert_eq!(loaded.full_text, "Hello Cache Body");
+    }
+
+    #[test]
+    fn saved_row_serves_both_preview_modes_and_projects_full_text() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&mut conn).unwrap();
+        let conversation = make_conversation(PathBuf::from("/tmp/session.jsonl"));
+        let previews = PreviewPair {
+            first: "First Preview".to_string(),
+            last: "Last Preview".to_string(),
+        };
+        let fingerprint = SourceFingerprint {
+            modified_millis: 10,
+            size: 20,
+        };
+        // A single write (no show_last) must satisfy loads in either mode.
+        save_conversations_to_conn(
+            &mut conn,
+            ProviderKind::Claude,
+            [FreshRow {
+                conversation: &conversation,
+                previews: &previews,
+                fingerprint,
+            }],
+        )
+        .unwrap();
+
+        // --first picks preview_first, --last picks preview_last, both fresh.
+        let first = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true)
+            .unwrap()
+            .remove(&conversation.path)
+            .unwrap()
+            .into_conversation_if_fresh(fingerprint)
+            .unwrap();
+        assert_eq!(first.preview, "First Preview");
+        assert_eq!(first.full_text, "Hello Cache Body");
+
+        let last = load_provider_cache_from_conn(&conn, ProviderKind::Claude, true, true)
+            .unwrap()
+            .remove(&conversation.path)
+            .unwrap()
+            .into_conversation_if_fresh(fingerprint)
+            .unwrap();
+        assert_eq!(last.preview, "Last Preview");
+
+        // The metadata profile returns an empty full_text but every other field
+        // is identical to the full-profile load.
+        let projected = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, false)
+            .unwrap()
+            .remove(&conversation.path)
+            .unwrap()
+            .into_conversation_if_fresh(fingerprint)
+            .unwrap();
+        assert_eq!(projected.full_text, "");
+        assert_eq!(projected.preview, first.preview);
+        assert_eq!(projected.id, first.id);
+        assert_eq!(projected.message_count, first.message_count);
     }
 
     #[test]
@@ -484,15 +724,10 @@ mod tests {
             modified_millis: 1,
             size: 2,
         };
-        save_conversations_to_conn(
-            &mut conn,
-            ProviderKind::Claude,
-            false,
-            [(&conversation, fingerprint)],
-        )
-        .unwrap();
+        save_one(&mut conn, ProviderKind::Claude, &conversation, fingerprint);
 
-        let cache = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        let cache =
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true).unwrap();
         assert!(cache.contains_key(&conversation.path));
     }
 
@@ -505,18 +740,13 @@ mod tests {
             modified_millis: 1,
             size: 2,
         };
-        save_conversations_to_conn(
-            &mut conn,
-            ProviderKind::Claude,
-            false,
-            [(&conversation, fingerprint)],
-        )
-        .unwrap();
+        save_one(&mut conn, ProviderKind::Claude, &conversation, fingerprint);
 
         // Re-running init_schema (a second app start) must not wipe the cache.
         init_schema(&mut conn).unwrap();
 
-        let cache = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        let cache =
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true).unwrap();
         assert!(cache.contains_key(&conversation.path));
     }
 
@@ -530,11 +760,22 @@ mod tests {
             modified_millis: 1,
             size: 2,
         };
+        let previews = make_previews();
         save_conversations_to_conn(
             &mut conn,
             ProviderKind::Claude,
-            false,
-            [(&stale, fingerprint), (&current, fingerprint)],
+            [
+                FreshRow {
+                    conversation: &stale,
+                    previews: &previews,
+                    fingerprint,
+                },
+                FreshRow {
+                    conversation: &current,
+                    previews: &previews,
+                    fingerprint,
+                },
+            ],
         )
         .unwrap();
         // Rewrite one row as if a previous build with the same column set (so
@@ -555,7 +796,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 1);
-        let cache = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        let cache =
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true).unwrap();
         assert!(cache.contains_key(&current.path));
     }
 
@@ -569,30 +811,18 @@ mod tests {
             size: 456,
         };
 
-        save_conversations_to_conn(
-            &mut conn,
-            ProviderKind::Claude,
-            false,
-            [(&conversation, fingerprint)],
-        )
-        .unwrap();
-        save_conversations_to_conn(
-            &mut conn,
-            ProviderKind::Claude,
-            true,
-            [(&conversation, fingerprint)],
-        )
-        .unwrap();
+        // One row now serves both preview modes; deleting it must clear both.
+        save_one(&mut conn, ProviderKind::Claude, &conversation, fingerprint);
 
         delete_conversation_from_conn(&conn, ProviderKind::Claude, &conversation.path).unwrap();
 
         assert!(
-            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false)
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            load_provider_cache_from_conn(&conn, ProviderKind::Claude, true)
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, true, true)
                 .unwrap()
                 .is_empty()
         );
@@ -608,22 +838,27 @@ mod tests {
             modified_millis: 1,
             size: 2,
         };
+        let previews = make_previews();
         save_conversations_to_conn(
             &mut conn,
             ProviderKind::Claude,
-            false,
-            [(&pruned, fingerprint), (&kept, fingerprint)],
+            [
+                FreshRow {
+                    conversation: &pruned,
+                    previews: &previews,
+                    fingerprint,
+                },
+                FreshRow {
+                    conversation: &kept,
+                    previews: &previews,
+                    fingerprint,
+                },
+            ],
         )
         .unwrap();
         // The same source path cached for another provider must survive a
         // Claude prune.
-        save_conversations_to_conn(
-            &mut conn,
-            ProviderKind::Codex,
-            false,
-            [(&pruned, fingerprint)],
-        )
-        .unwrap();
+        save_one(&mut conn, ProviderKind::Codex, &pruned, fingerprint);
 
         prune_conversations_from_conn(
             &mut conn,
@@ -632,10 +867,11 @@ mod tests {
         )
         .unwrap();
 
-        let claude = load_provider_cache_from_conn(&conn, ProviderKind::Claude, false).unwrap();
+        let claude =
+            load_provider_cache_from_conn(&conn, ProviderKind::Claude, false, true).unwrap();
         assert!(!claude.contains_key(&pruned.path));
         assert!(claude.contains_key(&kept.path));
-        let codex = load_provider_cache_from_conn(&conn, ProviderKind::Codex, false).unwrap();
+        let codex = load_provider_cache_from_conn(&conn, ProviderKind::Codex, false, true).unwrap();
         assert!(codex.contains_key(&pruned.path));
     }
 }

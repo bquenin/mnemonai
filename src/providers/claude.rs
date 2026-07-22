@@ -1,3 +1,4 @@
+use super::LoadOptions;
 use crate::claude::LogEntry;
 use crate::conversation_index::delete_conversation;
 use crate::error::{AppError, Result};
@@ -25,20 +26,12 @@ impl super::Provider for ClaudeProvider {
         "Claude Code"
     }
 
-    fn load_conversations(
-        &self,
-        show_last: bool,
-        debug: Option<crate::cli::DebugLevel>,
-    ) -> Result<Vec<Conversation>> {
-        history::load_all_conversations(show_last, debug, &self.exclude_paths)
+    fn load_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
+        history::load_all_conversations(options, &self.exclude_paths)
     }
 
-    fn load_conversations_streaming(
-        &self,
-        show_last: bool,
-        debug: Option<crate::cli::DebugLevel>,
-    ) -> Receiver<LoaderMessage> {
-        history::load_all_conversations_streaming(show_last, debug, self.exclude_paths.clone())
+    fn load_conversations_streaming(&self, options: LoadOptions) -> Receiver<LoaderMessage> {
+        history::load_all_conversations_streaming(options, self.exclude_paths.clone())
     }
 
     fn read_entries(&self, conversation: &Conversation) -> Result<Vec<LogEntry>> {

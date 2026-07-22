@@ -7,7 +7,7 @@ use crate::error::{AppError, Result};
 use crate::history::{
     Conversation, LoaderMessage, ParseError, path_to_string, project_path_is_live,
 };
-use crate::providers::Provider;
+use crate::providers::{LoadOptions, Provider};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
@@ -238,20 +238,21 @@ fn load_conversations(
 ) -> Result<Vec<Conversation>> {
     let local = use_local_scope(settings, command_local, force_global);
     let show_deleted_projects = command_show_deleted || settings.show_deleted_projects;
+    // Headless `list`/`show` never emit the conversation body, so load under the
+    // metadata profile: the corpus is never decoded from the cache, Cursor skips
+    // deriving it, and the returned conversations carry an empty body. A file
+    // provider's fresh parse still computes the text as a scan byproduct and
+    // writes the cache row complete, so a later full-profile (TUI) run that hits
+    // those rows gets a real search corpus.
+    let load_options = LoadOptions {
+        show_last: settings.show_last,
+        debug: settings.debug,
+        include_full_text: false,
+    };
     let mut conversations = if local {
-        crate::loader::load_local(
-            providers,
-            settings.show_last,
-            settings.debug,
-            provider_filter,
-        )?
+        crate::loader::load_local(providers, load_options, provider_filter)?
     } else {
-        load_global_conversations(
-            providers,
-            settings.show_last,
-            settings.debug,
-            provider_filter,
-        )?
+        load_global_conversations(providers, load_options, provider_filter)?
     };
 
     if !show_deleted_projects {
@@ -383,8 +384,7 @@ fn invalid_timestamp(value: &str, flag: &str) -> AppError {
 
 fn load_global_conversations(
     providers: &[Box<dyn Provider>],
-    show_last: bool,
-    debug: Option<DebugLevel>,
+    options: LoadOptions,
     provider_filter: Option<ProviderFilter>,
 ) -> Result<Vec<Conversation>> {
     // Start every matching provider's loader before draining any receiver so
@@ -397,7 +397,7 @@ fn load_global_conversations(
         .filter(|provider| {
             crate::loader::provider_filter_matches(provider_filter, &provider.kind())
         })
-        .map(|provider| provider.load_conversations_streaming(show_last, debug))
+        .map(|provider| provider.load_conversations_streaming(options))
         .collect();
 
     let mut conversations = Vec::new();
@@ -815,11 +815,7 @@ mod tests {
             "stub"
         }
 
-        fn load_conversations(
-            &self,
-            _show_last: bool,
-            _debug: Option<DebugLevel>,
-        ) -> Result<Vec<Conversation>> {
+        fn load_conversations(&self, _options: LoadOptions) -> Result<Vec<Conversation>> {
             if self.fatal {
                 Err(AppError::CommandError("stub failure".to_string()))
             } else {
@@ -829,8 +825,7 @@ mod tests {
 
         fn load_conversations_streaming(
             &self,
-            _show_last: bool,
-            _debug: Option<DebugLevel>,
+            _options: LoadOptions,
         ) -> std::sync::mpsc::Receiver<LoaderMessage> {
             let (tx, rx) = std::sync::mpsc::channel();
             if self.fatal {
@@ -1087,7 +1082,16 @@ mod tests {
             ),
         ];
 
-        let conversations = load_global_conversations(&providers, false, None, None).unwrap();
+        let conversations = load_global_conversations(
+            &providers,
+            LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: false,
+            },
+            None,
+        )
+        .unwrap();
 
         let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["claude-1", "codex-1"]);
@@ -1107,7 +1111,16 @@ mod tests {
             ),
         ];
 
-        let conversations = load_global_conversations(&providers, false, None, None).unwrap();
+        let conversations = load_global_conversations(
+            &providers,
+            LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: false,
+            },
+            None,
+        )
+        .unwrap();
 
         let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["codex-1"]);
@@ -1117,8 +1130,15 @@ mod tests {
     fn global_load_fatal_is_an_error_with_provider_filter() {
         let providers: Vec<Box<dyn Provider>> = vec![StubProvider::fatal(ProviderKind::Claude)];
 
-        let result =
-            load_global_conversations(&providers, false, None, Some(ProviderFilter::Claude));
+        let result = load_global_conversations(
+            &providers,
+            LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: false,
+            },
+            Some(ProviderFilter::Claude),
+        );
 
         assert!(result.is_err());
     }
@@ -1144,9 +1164,16 @@ mod tests {
             ),
         ];
 
-        let conversations =
-            load_global_conversations(&providers, false, None, Some(ProviderFilter::Codex))
-                .unwrap();
+        let conversations = load_global_conversations(
+            &providers,
+            LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: false,
+            },
+            Some(ProviderFilter::Codex),
+        )
+        .unwrap();
 
         let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["codex-1"]);

@@ -1,3 +1,4 @@
+use super::LoadOptions;
 use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage};
 use crate::error::{AppError, Result};
 use crate::history::{Conversation, LoaderMessage, ProviderKind};
@@ -174,13 +175,23 @@ impl CursorProvider {
     }
 
     /// Load all conversations from the global Cursor database.
-    fn load_from_global_db(&self, show_last: bool) -> Result<Vec<Conversation>> {
+    fn load_from_global_db(
+        &self,
+        show_last: bool,
+        include_full_text: bool,
+    ) -> Result<Vec<Conversation>> {
         let conn = Connection::open_with_flags(
             &self.global_db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let workspace_map = self.build_workspace_map();
-        load_conversations_from_conn(&conn, show_last, &workspace_map, &self.global_db_path)
+        load_conversations_from_conn(
+            &conn,
+            show_last,
+            include_full_text,
+            &workspace_map,
+            &self.global_db_path,
+        )
     }
 
     /// Load all bubbles for a conversation from the global database.
@@ -731,7 +742,7 @@ fn build_conversation(
     bubble_map: &HashMap<String, Value>,
     index_timestamps: &HashMap<String, i64>,
     workspace_map: &HashMap<String, WorkspaceInfo>,
-    full_text_map: &mut HashMap<String, String>,
+    full_text_map: Option<&mut HashMap<String, String>>,
     db_path: &Path,
 ) -> Option<Conversation> {
     // Extract preview text with priority chain:
@@ -809,12 +820,16 @@ fn build_conversation(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    // All early returns above are done, so this conversation is being kept:
-    // move the full text out of the map (each conv_id is built at most once on
-    // the success path) rather than cloning the whole corpus.
-    let full_text = full_text_map
-        .remove(&info.conv_id)
-        .unwrap_or_else(|| preview.clone());
+    // All early returns above are done, so this conversation is being kept.
+    // The TUI passes a full-text map (the body powers in-app search) and the
+    // text is moved out of it — each conv_id is built at most once on the
+    // success path — rather than cloning the whole corpus. Headless metadata
+    // loads pass `None` and leave the body empty, skipping the derivation
+    // entirely.
+    let full_text = match full_text_map {
+        Some(map) => map.remove(&info.conv_id).unwrap_or_else(|| preview.clone()),
+        None => String::new(),
+    };
 
     Some(Conversation {
         path: fake_path,
@@ -862,16 +877,25 @@ fn collect_keys_to_fetch(conv_infos: &[ConvInfo]) -> Vec<String> {
 fn load_conversations_from_conn(
     conn: &Connection,
     show_last: bool,
+    include_full_text: bool,
     workspace_map: &HashMap<String, WorkspaceInfo>,
     db_path: &Path,
 ) -> Result<Vec<Conversation>> {
-    load_conversations_from_conn_inner(conn, show_last, workspace_map, db_path, None)
+    load_conversations_from_conn_inner(
+        conn,
+        show_last,
+        include_full_text,
+        workspace_map,
+        db_path,
+        None,
+    )
 }
 
 /// Inner implementation that accepts an optional cache connection for testability.
 fn load_conversations_from_conn_inner(
     conn: &Connection,
     show_last: bool,
+    include_full_text: bool,
     workspace_map: &HashMap<String, WorkspaceInfo>,
     db_path: &Path,
     cache_conn_override: Option<&Connection>,
@@ -935,7 +959,11 @@ fn load_conversations_from_conn_inner(
     let keys_to_fetch = collect_keys_to_fetch(&conv_infos);
     let bubble_map = batch_fetch_bubbles(conn, &keys_to_fetch)?;
     let index_timestamps = load_index_timestamps(conn);
-    let mut full_text_map = build_full_text_map(conn, &conv_infos, cache_ref);
+    // Headless metadata loads skip the whole full-text derivation (the corpus
+    // is the largest allocation this loader makes); the TUI builds it to power
+    // in-app search.
+    let mut full_text_map =
+        include_full_text.then(|| build_full_text_map(conn, &conv_infos, cache_ref));
 
     let conversations: Vec<Conversation> = conv_infos
         .iter()
@@ -945,7 +973,7 @@ fn load_conversations_from_conn_inner(
                 &bubble_map,
                 &index_timestamps,
                 workspace_map,
-                &mut full_text_map,
+                full_text_map.as_mut(),
                 db_path,
             )
         })
@@ -963,11 +991,7 @@ impl super::Provider for CursorProvider {
         "Cursor (IDE)"
     }
 
-    fn load_conversations(
-        &self,
-        show_last: bool,
-        _debug: Option<crate::cli::DebugLevel>,
-    ) -> Result<Vec<Conversation>> {
+    fn load_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
         let _ = crate::debug_log::log_debug(&format!(
             "Cursor: checking global DB at {}",
             self.global_db_path.display()
@@ -978,17 +1002,15 @@ impl super::Provider for CursorProvider {
             return Ok(Vec::new());
         }
 
-        self.load_from_global_db(show_last)
+        self.load_from_global_db(options.show_last, options.include_full_text)
     }
 
-    fn load_conversations_streaming(
-        &self,
-        show_last: bool,
-        _debug: Option<crate::cli::DebugLevel>,
-    ) -> Receiver<LoaderMessage> {
+    fn load_conversations_streaming(&self, options: LoadOptions) -> Receiver<LoaderMessage> {
         let (tx, rx) = mpsc::channel();
         let global_db_path = self.global_db_path.clone();
         let workspace_storage_path = self.workspace_storage_path.clone();
+        let show_last = options.show_last;
+        let include_full_text = options.include_full_text;
 
         std::thread::spawn(move || {
             if !global_db_path.exists() {
@@ -1018,16 +1040,22 @@ impl super::Provider for CursorProvider {
             // below — load them on their own threads so their I/O overlaps
             // the scans of the (multi-GB) global database.
             let workspace_handle = std::thread::spawn(move || provider.build_workspace_map());
-            let cache_handle = std::thread::spawn(|| {
+            let cache_handle = std::thread::spawn(move || {
                 let cache_conn = open_cache_db();
                 let user_keys = cache_conn
                     .as_ref()
                     .map(load_cached_user_keys)
                     .unwrap_or_default();
-                let full_text = cache_conn
-                    .as_ref()
-                    .map(load_cached_full_text)
-                    .unwrap_or_default();
+                // The cached full-text corpus is the largest thing this loader
+                // hydrates; headless metadata loads never read it, so skip it.
+                let full_text = if include_full_text {
+                    cache_conn
+                        .as_ref()
+                        .map(load_cached_full_text)
+                        .unwrap_or_default()
+                } else {
+                    HashMap::new()
+                };
                 (cache_conn, user_keys, full_text)
             });
 
@@ -1085,14 +1113,18 @@ impl super::Provider for CursorProvider {
                     }
                 };
 
-            // Build full-text search index for all conversations (cached, sub-ms per miss).
-            let mut full_text_map = build_full_text_map_from_cached(
-                Some(&global_db_path),
-                &conn,
-                &conv_infos,
-                cached_full_text,
-                cache_conn.as_ref(),
-            );
+            // Build full-text search index for all conversations (cached, sub-ms
+            // per miss). Headless metadata loads skip it — no corpus is built or
+            // kept in memory.
+            let mut full_text_map = include_full_text.then(|| {
+                build_full_text_map_from_cached(
+                    Some(&global_db_path),
+                    &conn,
+                    &conv_infos,
+                    cached_full_text,
+                    cache_conn.as_ref(),
+                )
+            });
 
             let workspace_map = workspace_handle.join().unwrap_or_default();
 
@@ -1105,7 +1137,7 @@ impl super::Provider for CursorProvider {
                     &bubble_map,
                     &index_timestamps,
                     &workspace_map,
-                    &mut full_text_map,
+                    full_text_map.as_mut(),
                     &global_db_path,
                 ) {
                     phase1_convs.push(conv);
@@ -1179,7 +1211,7 @@ impl super::Provider for CursorProvider {
                             &full_map,
                             &index_timestamps,
                             &workspace_map,
-                            &mut full_text_map,
+                            full_text_map.as_mut(),
                             &global_db_path,
                         )
                     })
@@ -1835,7 +1867,11 @@ mod tests {
         }
 
         let convs = provider
-            .load_conversations(false, None)
+            .load_conversations(LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: true,
+            })
             .expect("Failed to load");
 
         eprintln!("Loaded {} Cursor conversations", convs.len());
@@ -1945,7 +1981,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1, "Should discover the conversation");
         assert_eq!(convs[0].preview, "How do I fix this bug?");
@@ -1981,7 +2017,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "Hello world");
@@ -2017,7 +2053,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
 
         assert_eq!(
             convs.len(),
@@ -2067,10 +2103,12 @@ mod tests {
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
 
-        let convs_first = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs_first =
+            load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
         assert_eq!(convs_first[0].preview, "First question");
 
-        let convs_last = load_conversations_from_conn(&conn, true, &ws_map, &db_path).unwrap();
+        let convs_last =
+            load_conversations_from_conn(&conn, true, true, &ws_map, &db_path).unwrap();
         assert_eq!(convs_last[0].preview, "Follow-up question");
     }
 
@@ -2096,7 +2134,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "Rich text content");
@@ -2158,7 +2196,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 2, "Should discover 2 of 3 conversations");
         let ids: Vec<&str> = convs.iter().map(|c| c.id.as_str()).collect();
@@ -2199,7 +2237,7 @@ mod tests {
 
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
-        let convs = load_conversations_from_conn(&conn, false, &ws_map, &db_path).unwrap();
+        let convs = load_conversations_from_conn(&conn, false, true, &ws_map, &db_path).unwrap();
 
         assert_eq!(convs.len(), 1);
         // The timestamp should come from the first_key (assistant at 10:00:00Z),
@@ -2372,7 +2410,7 @@ mod tests {
 
         // First call: populates cache
         let convs =
-            load_conversations_from_conn_inner(&conn, false, &ws_map, &db_path, Some(&cache))
+            load_conversations_from_conn_inner(&conn, false, true, &ws_map, &db_path, Some(&cache))
                 .unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "My question");
@@ -2383,10 +2421,65 @@ mod tests {
 
         // Second call: uses cache (same result)
         let convs2 =
-            load_conversations_from_conn_inner(&conn, false, &ws_map, &db_path, Some(&cache))
+            load_conversations_from_conn_inner(&conn, false, true, &ws_map, &db_path, Some(&cache))
                 .unwrap();
         assert_eq!(convs2.len(), 1);
         assert_eq!(convs2[0].preview, "My question");
+    }
+
+    #[test]
+    fn test_metadata_profile_skips_full_text_but_keeps_preview() {
+        // Headless metadata loads (include_full_text = false) return an empty
+        // body and never derive or persist the corpus, yet still resolve the
+        // preview and warm the user-key sidecar for a later --last flip.
+        let conn = create_test_db();
+        let cache = create_test_cache_db();
+        let conv = "conv-metadata-only";
+
+        insert_bubble(
+            &conn,
+            conv,
+            "00000000-asst",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_ASSISTANT,
+                "text": "Assistant reply",
+                "createdAt": "2025-06-01T10:00:00Z"
+            }),
+        );
+        insert_bubble(
+            &conn,
+            conv,
+            "ffffffff-user",
+            &serde_json::json!({
+                "type": BUBBLE_TYPE_USER,
+                "text": "My question",
+                "createdAt": "2025-06-01T10:01:00Z"
+            }),
+        );
+        insert_index_entry(&conn, conv, 1717236000000);
+
+        let ws_map = HashMap::new();
+        let db_path = PathBuf::from("/tmp/test.vscdb");
+
+        let convs = load_conversations_from_conn_inner(
+            &conn,
+            false,
+            false,
+            &ws_map,
+            &db_path,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(convs.len(), 1);
+        // Preview is still resolved under the metadata profile.
+        assert_eq!(convs[0].preview, "My question");
+        // The body is projected away — no corpus is materialized.
+        assert!(convs[0].full_text.is_empty());
+        // Derivation is skipped, so nothing is written to the full-text sidecar.
+        assert_eq!(count_rows(&cache, "conversation_full_text", conv), 0);
+        // The user-key sidecar is still warmed so a later --last load stays warm.
+        assert_eq!(count_rows(&cache, "user_bubble_keys", conv), 1);
     }
 
     /// Seed a single user_bubble_keys row (bypassing save_user_keys_to_cache so
@@ -2462,7 +2555,7 @@ mod tests {
         // show_last=true: the stale max_user_key would yield "Old question"; the
         // refreshed derivation must yield the true last user bubble.
         let convs =
-            load_conversations_from_conn_inner(&conn, true, &ws_map, &db_path, Some(&cache))
+            load_conversations_from_conn_inner(&conn, true, true, &ws_map, &db_path, Some(&cache))
                 .unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].preview, "New question");
@@ -2556,7 +2649,7 @@ mod tests {
         let ws_map = HashMap::new();
         let db_path = PathBuf::from("/tmp/test.vscdb");
         let convs =
-            load_conversations_from_conn_inner(&conn, false, &ws_map, &db_path, Some(&cache))
+            load_conversations_from_conn_inner(&conn, false, true, &ws_map, &db_path, Some(&cache))
                 .unwrap();
 
         assert_eq!(convs.len(), 1);

@@ -3,7 +3,7 @@
 //! This module handles parsing Claude conversation JSONL files and extracting
 //! conversation metadata like preview text, message counts, and working directory.
 
-use super::{Conversation, ParseError, ProviderKind};
+use super::{Conversation, ParseError, PreviewPair, ProviderKind};
 use crate::claude::{LogEntry, TokenUsage, extract_text_from_assistant, extract_text_from_user};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -415,13 +415,17 @@ fn classify_line(line: &str) -> ScanLine {
     }
 }
 
-/// Process a single conversation file and extract all necessary information
+/// Process a single conversation file and extract all necessary information.
+///
+/// Returns the conversation (with `preview` already selected for `show_last`)
+/// alongside both preview strings, so a caller persisting to the cache can store
+/// them and later serve either preview mode without re-parsing.
 pub fn process_conversation_file(
     path: PathBuf,
     show_last: bool,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
+) -> Result<Option<(Conversation, PreviewPair)>> {
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
     process_conversation_reader(path, reader, show_last, modified, debug_level)
@@ -434,7 +438,7 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
     show_last: bool,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
+) -> Result<Option<(Conversation, PreviewPair)>> {
     let filename = path
         .file_name()
         .and_then(|f| f.to_str())
@@ -709,21 +713,23 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
         .map(DateTime::<Local>::from)
         .unwrap_or_else(Local::now);
 
-    // Create preview (first or last 3 messages). show_last takes the last 3 in
-    // reverse order (newest first); otherwise the first 3 in order. This
-    // reproduces `preview_parts.iter().rev().take(3)` / `.iter().take(3)` over
-    // the full list, then a whole-string whitespace normalization.
-    let preview = if show_last {
-        preview_tail
-            .iter()
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ... ")
-    } else {
-        preview_head.join(" ... ")
+    // Create both previews in one pass so the cache can serve either mode. The
+    // last-messages preview takes the last 3 in reverse order (newest first);
+    // the first-messages preview takes the first 3 in order. This reproduces
+    // `preview_parts.iter().rev().take(3)` / `.iter().take(3)` over the full
+    // list, then a whole-string whitespace normalization.
+    let previews = PreviewPair {
+        first: normalize_whitespace(&preview_head.join(" ... ")),
+        last: normalize_whitespace(
+            &preview_tail
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ... "),
+        ),
     };
-    let preview = normalize_whitespace(&preview);
+    let preview = previews.select(show_last);
 
     // Build full_text in a single pass: normalized summary first (if any), then
     // each normalized part, joined by single spaces. This is byte-identical to
@@ -777,23 +783,26 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
         .unwrap_or("unknown")
         .to_string();
 
-    Ok(Some(Conversation {
-        path,
-        provider: ProviderKind::Claude,
-        id,
-        timestamp,
-        preview,
-        full_text,
-        project_name: None,
-        project_path: None,
-        cwd: extracted_cwd,
-        message_count,
-        parse_errors,
-        summary: extracted_summary,
-        model: extracted_model,
-        total_tokens,
-        duration_minutes,
-    }))
+    Ok(Some((
+        Conversation {
+            path,
+            provider: ProviderKind::Claude,
+            id,
+            timestamp,
+            preview,
+            full_text,
+            project_name: None,
+            project_path: None,
+            cwd: extracted_cwd,
+            message_count,
+            parse_errors,
+            summary: extracted_summary,
+            model: extracted_model,
+            total_tokens,
+            duration_minutes,
+        },
+        previews,
+    )))
 }
 
 /// Record a preview message, retaining only what the preview can ever show:
@@ -895,16 +904,28 @@ mod tests {
         )
     }
 
-    /// Helper to parse JSONL content
+    /// Helper to parse JSONL content, discarding the preview pair for the many
+    /// tests that only assert on the conversation itself.
     fn parse_jsonl(content: &str) -> Result<Option<Conversation>> {
         let reader = Cursor::new(content);
-        process_conversation_reader(
+        Ok(process_conversation_reader(
             PathBuf::from("test.jsonl"),
             reader,
             false, // show_last
             None,  // modified
             None,  // debug_level
-        )
+        )?
+        .map(|(conversation, _)| conversation))
+    }
+
+    /// Helper returning both the conversation and its preview pair.
+    fn parse_jsonl_with_previews(
+        content: &str,
+        show_last: bool,
+    ) -> Option<(Conversation, PreviewPair)> {
+        let reader = Cursor::new(content);
+        process_conversation_reader(PathBuf::from("test.jsonl"), reader, show_last, None, None)
+            .unwrap()
     }
 
     // === Warmup message filtering ===
@@ -1104,20 +1125,10 @@ mod tests {
         .join("\n");
 
         // Parse with show_last = false
-        let conv_first = {
-            let reader = Cursor::new(&content);
-            process_conversation_reader(PathBuf::from("test.jsonl"), reader, false, None, None)
-                .unwrap()
-                .unwrap()
-        };
+        let (conv_first, previews_first) = parse_jsonl_with_previews(&content, false).unwrap();
 
         // Parse with show_last = true
-        let conv_last = {
-            let reader = Cursor::new(&content);
-            process_conversation_reader(PathBuf::from("test.jsonl"), reader, true, None, None)
-                .unwrap()
-                .unwrap()
-        };
+        let (conv_last, previews_last) = parse_jsonl_with_previews(&content, true).unwrap();
 
         // show_last=false should start with "First"
         assert!(
@@ -1131,6 +1142,20 @@ mod tests {
             conv_last.preview.starts_with("Response 3"),
             "Preview should start with Response 3: {}",
             conv_last.preview
+        );
+
+        // The preview pair is identical regardless of which mode was requested:
+        // both previews are always computed, only `Conversation::preview` differs.
+        assert_eq!(previews_first, previews_last);
+        assert_eq!(conv_first.preview, previews_first.first);
+        assert_eq!(conv_last.preview, previews_first.last);
+        assert_eq!(
+            previews_first.first, "First ... Response 1 ... Second",
+            "first-messages preview pins the first three messages"
+        );
+        assert_eq!(
+            previews_first.last, "Response 3 ... Third ... Response 2",
+            "last-messages preview pins the last three in reverse order"
         );
     }
 
@@ -1592,8 +1617,13 @@ mod tests {
             return;
         }
 
-        let actual = actual.expect("expected a conversation, got None");
+        let (actual, previews) = actual.expect("expected a conversation, got None");
         assert_eq!(actual.preview, expected.preview, "preview mismatch");
+        assert_eq!(
+            previews.select(show_last),
+            actual.preview,
+            "preview pair must agree with the selected preview"
+        );
         assert_eq!(actual.full_text, expected.full_text, "full_text mismatch");
         assert_eq!(
             actual.message_count, expected.message_count,
@@ -1673,7 +1703,7 @@ mod tests {
         assert_matches_oracle(&content, false);
         assert_matches_oracle(&content, true);
 
-        let conv = process_conversation_reader(
+        let (conv, _) = process_conversation_reader(
             PathBuf::from("test.jsonl"),
             Cursor::new(content.as_str()),
             false,
@@ -1710,7 +1740,7 @@ mod tests {
         .join("\n");
         assert_matches_oracle(&content, false);
 
-        let conv = process_conversation_reader(
+        let (conv, _) = process_conversation_reader(
             PathBuf::from("test.jsonl"),
             Cursor::new(content.as_str()),
             false,
@@ -1732,7 +1762,7 @@ mod tests {
     fn rich_fixture_field_values_are_stable() {
         // Lock the concrete values the fixture produces so accidental drift in
         // either the scan or the oracle is caught.
-        let conv = {
+        let (conv, _) = {
             let reader = Cursor::new(rich_fixture());
             process_conversation_reader(
                 PathBuf::from("test.jsonl"),
@@ -1838,6 +1868,7 @@ mod tests {
         )
         .unwrap()
         .expect("test input should yield a conversation")
+        .0
         .parse_errors
         .len()
     }
@@ -1942,7 +1973,7 @@ mod tests {
         let bad_line = format!("{{{}", huge);
         let content = [user_msg("Hi", None), bad_line, user_msg("Bye", None)].join("\n");
 
-        let conv = {
+        let (conv, _) = {
             let reader = Cursor::new(&content);
             process_conversation_reader(PathBuf::from("t.jsonl"), reader, false, None, None)
                 .unwrap()
@@ -1968,7 +1999,7 @@ mod tests {
             user_msg("after", None),
         ]
         .join("\n");
-        let conv = {
+        let (conv, _) = {
             let reader = Cursor::new(&content);
             process_conversation_reader(PathBuf::from("t.jsonl"), reader, false, None, None)
                 .unwrap()
@@ -2088,24 +2119,17 @@ mod tests {
         }
         let content = lines.join("\n");
 
-        // show_last = false: first three preview messages.
-        let first = {
-            let reader = Cursor::new(&content);
-            process_conversation_reader(PathBuf::from("t.jsonl"), reader, false, None, None)
-                .unwrap()
-                .unwrap()
-        };
+        // A single parse computes both previews; pin each mode byte-for-byte.
+        let (first, previews) = parse_jsonl_with_previews(&content, false).unwrap();
         assert_eq!(first.preview, "user0 ... asst0 ... user1");
+        assert_eq!(previews.first, "user0 ... asst0 ... user1");
+        assert_eq!(previews.last, "asst5 ... user5 ... asst4");
         assert_matches_oracle(&content, false);
 
-        // show_last = true: last three, newest first.
-        let last = {
-            let reader = Cursor::new(&content);
-            process_conversation_reader(PathBuf::from("t.jsonl"), reader, true, None, None)
-                .unwrap()
-                .unwrap()
-        };
+        // show_last = true selects the last-messages preview from the same pair.
+        let (last, previews_last) = parse_jsonl_with_previews(&content, true).unwrap();
         assert_eq!(last.preview, "asst5 ... user5 ... asst4");
+        assert_eq!(previews_last, previews);
         assert_matches_oracle(&content, true);
     }
 

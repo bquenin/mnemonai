@@ -1,27 +1,26 @@
+use super::LoadOptions;
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage, extract_text_from_blocks,
 };
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, delete_conversation, load_provider_cache,
-    prune_conversations, save_conversations,
+    LoadedConversation, ProviderCache, SourceFingerprint, delete_conversation,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::{
-    Conversation, LoaderMessage, ParseError, ProviderKind, format_short_name_from_path,
+    Conversation, LoaderMessage, ParseError, PreviewPair, ProviderKind, format_short_name_from_path,
 };
 use chrono::{DateTime, FixedOffset, Local};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 pub struct CursorAgentProvider {
@@ -123,19 +122,6 @@ struct ParsedTranscriptLine {
     timestamp: Option<DateTime<FixedOffset>>,
 }
 
-enum ConversationLoad {
-    Cached(Conversation),
-    Fresh(Conversation, SourceFingerprint),
-}
-
-impl ConversationLoad {
-    fn into_conversation(self) -> Conversation {
-        match self {
-            Self::Cached(conversation) | Self::Fresh(conversation, _) => conversation,
-        }
-    }
-}
-
 impl CursorAgentProvider {
     pub fn new() -> Self {
         let home = home::home_dir().unwrap_or_default();
@@ -197,16 +183,17 @@ impl CursorAgentProvider {
         Ok(projects)
     }
 
-    /// Load one project's transcripts. Returns the conversations plus clones of
-    /// the freshly parsed ones (cache misses) so the caller can persist them in
-    /// a single batch at the end of the run.
+    /// Load one project's transcripts into [`LoadedConversation`] values,
+    /// consuming each seen file's cache entry (so leftover entries are exactly
+    /// the deleted files) and carrying fresh rows by reference for the caller to
+    /// persist. The caller converts, sorts, saves, and prunes.
     fn load_project_conversations(
         &self,
         project: &AgentProject,
         show_last: bool,
         debug_level: Option<DebugLevel>,
-        cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
-    ) -> (Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>) {
+        cache: &ProviderCache,
+    ) -> Vec<LoadedConversation> {
         let project_dir_name = project.project_dir_name.as_str();
         // Cached conversations already carry their workspace path, so the DFS in
         // resolve_workspace_path only matters on a cache miss. Resolve it lazily
@@ -222,7 +209,7 @@ impl CursorAgentProvider {
             })
         };
 
-        let loaded: Vec<ConversationLoad> = project
+        project
             .transcript_files
             .par_iter()
             .filter_map(|file| {
@@ -233,21 +220,16 @@ impl CursorAgentProvider {
                     .unwrap_or("unknown")
                     .to_string();
                 // Fingerprint comes from the metadata captured during the walk;
-                // no extra stat call here.
+                // no extra stat call here. A transcript always has a fingerprint,
+                // so `take_if_fresh` both claims the entry and answers freshness.
                 let fingerprint = file.fingerprint();
 
-                // Always consume the cache entry for a file we've seen: whatever
-                // remains in the map afterwards is treated as deleted and pruned,
-                // and a file that merely failed to parse isn't deleted.
-                let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(path));
-                if let Some(cached) = cached_entry
-                    && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
-                {
+                if let Some(conversation) = cache.take_if_fresh(path, fingerprint) {
                     debug::debug(
                         debug_level,
                         &format!("Loaded Cursor Agent transcript {} from index", filename),
                     );
-                    return Some(ConversationLoad::Cached(conversation));
+                    return Some(LoadedConversation::Cached(conversation));
                 }
 
                 // Cache miss: only now do we need the resolved workspace path.
@@ -258,7 +240,7 @@ impl CursorAgentProvider {
                     project_dir_name,
                     debug_level,
                 ) {
-                    Ok(Some(conversation)) => {
+                    Ok(Some((conversation, previews))) => {
                         debug::debug(
                             debug_level,
                             &format!(
@@ -266,7 +248,11 @@ impl CursorAgentProvider {
                                 filename, conversation.preview
                             ),
                         );
-                        Some(ConversationLoad::Fresh(conversation, fingerprint))
+                        Some(LoadedConversation::Fresh {
+                            conversation,
+                            previews,
+                            fingerprint,
+                        })
                     }
                     Ok(None) => None,
                     Err(err) => {
@@ -281,25 +267,7 @@ impl CursorAgentProvider {
                     }
                 }
             })
-            .collect();
-
-        let fresh: Vec<(Conversation, SourceFingerprint)> = loaded
-            .iter()
-            .filter_map(|loaded| match loaded {
-                ConversationLoad::Fresh(conversation, fingerprint) => {
-                    Some((conversation.clone(), *fingerprint))
-                }
-                ConversationLoad::Cached(_) => None,
-            })
-            .collect();
-
-        let mut conversations: Vec<Conversation> = loaded
-            .into_iter()
-            .map(ConversationLoad::into_conversation)
-            .collect();
-
-        conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
-        (conversations, fresh)
+            .collect()
     }
 }
 
@@ -312,59 +280,54 @@ impl super::Provider for CursorAgentProvider {
         "Cursor Agent CLI"
     }
 
-    fn load_conversations(
-        &self,
-        show_last: bool,
-        debug_level: Option<DebugLevel>,
-    ) -> Result<Vec<Conversation>> {
+    fn load_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
         let projects = self.list_projects()?;
         if projects.is_empty() {
             return Ok(Vec::new());
         }
 
-        let cache = Mutex::new(load_provider_cache(ProviderKind::CursorAgent, show_last));
-        let mut all_fresh: Vec<(Conversation, SourceFingerprint)> = Vec::new();
-        let mut conversations: Vec<Conversation> = Vec::new();
+        let debug_level = options.debug;
+        let cache = ProviderCache::load(
+            ProviderKind::CursorAgent,
+            options.show_last,
+            options.include_full_text,
+        );
+        let mut loaded: Vec<LoadedConversation> = Vec::new();
         for project in &projects {
-            let (convs, fresh) =
-                self.load_project_conversations(project, show_last, debug_level, &cache);
-            conversations.extend(convs);
-            all_fresh.extend(fresh);
+            loaded.extend(self.load_project_conversations(
+                project,
+                options.show_last,
+                debug_level,
+                &cache,
+            ));
         }
 
-        save_conversations(
-            ProviderKind::CursorAgent,
-            show_last,
-            all_fresh
-                .iter()
-                .map(|(conv, fingerprint)| (conv, *fingerprint)),
-        );
+        // Persist fresh rows from references before converting, then prune the
+        // entries no project claimed (deleted files).
+        cache.save_fresh(loaded.iter());
+        cache.prune_unclaimed(&[]);
 
-        // Entries no project claimed belong to files that no longer exist.
-        let stale: Vec<PathBuf> = cache
-            .into_inner()
-            .map(|cache| cache.into_keys().collect())
-            .unwrap_or_default();
-        prune_conversations(ProviderKind::CursorAgent, &stale);
-
+        let mut conversations: Vec<Conversation> = loaded
+            .into_iter()
+            .map(|entry| entry.into_conversation(options.include_full_text))
+            .collect();
         conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
         Ok(conversations)
     }
 
-    fn load_conversations_streaming(
-        &self,
-        show_last: bool,
-        debug_level: Option<DebugLevel>,
-    ) -> Receiver<LoaderMessage> {
+    fn load_conversations_streaming(&self, options: LoadOptions) -> Receiver<LoaderMessage> {
         let (tx, rx) = mpsc::channel();
         let projects_root = self.projects_root.clone();
+        let show_last = options.show_last;
+        let include_full_text = options.include_full_text;
+        let debug_level = options.debug;
 
         std::thread::spawn(move || {
             // The conversation index read is independent of the filesystem
             // walk in list_projects — overlap the two.
             let cache_handle = std::thread::spawn(move || {
-                Mutex::new(load_provider_cache(ProviderKind::CursorAgent, show_last))
+                ProviderCache::load(ProviderKind::CursorAgent, show_last, include_full_text)
             });
 
             let provider = CursorAgentProvider { projects_root };
@@ -378,33 +341,26 @@ impl super::Provider for CursorAgentProvider {
 
             let cache = cache_handle
                 .join()
-                .unwrap_or_else(|_| Mutex::new(HashMap::new()));
-            let mut all_fresh: Vec<(Conversation, SourceFingerprint)> = Vec::new();
+                .unwrap_or_else(|_| ProviderCache::empty(ProviderKind::CursorAgent));
             for project in &projects {
-                let (conversations, fresh) =
+                let loaded =
                     provider.load_project_conversations(project, show_last, debug_level, &cache);
-                all_fresh.extend(fresh);
+                // Persist this project's fresh rows from references before its
+                // batch is moved out and sent.
+                cache.save_fresh(loaded.iter());
+                let mut conversations: Vec<Conversation> = loaded
+                    .into_iter()
+                    .map(|entry| entry.into_conversation(include_full_text))
+                    .collect();
+                conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
                 if !conversations.is_empty() {
                     let _ = tx.send(LoaderMessage::Batch(conversations));
                 }
             }
 
-            // All batches are on the channel; persist newly parsed transcripts
-            // in one write transaction instead of one per project.
-            save_conversations(
-                ProviderKind::CursorAgent,
-                show_last,
-                all_fresh
-                    .iter()
-                    .map(|(conv, fingerprint)| (conv, *fingerprint)),
-            );
-
-            // Entries no project claimed belong to files that no longer exist.
-            let stale: Vec<PathBuf> = cache
-                .into_inner()
-                .map(|cache| cache.into_keys().collect())
-                .unwrap_or_default();
-            prune_conversations(ProviderKind::CursorAgent, &stale);
+            // Every project has consumed its cache entries; whatever remains is a
+            // deleted file. Prune once at the end.
+            cache.prune_unclaimed(&[]);
 
             let _ = tx.send(LoaderMessage::Done);
         });
@@ -501,7 +457,7 @@ fn process_transcript_file(
     workspace_path: Option<&Path>,
     project_dir_name: &str,
     debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
+) -> Result<Option<(Conversation, PreviewPair)>> {
     let path = &transcript.path;
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -572,24 +528,28 @@ fn process_transcript_file(
         return Ok(None);
     }
 
-    let preview = if show_last {
-        parts
-            .iter()
-            .rev()
-            .take(3)
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(" ... ")
-    } else {
-        parts
-            .iter()
-            .take(3)
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(" ... ")
+    // Compute both preview directions in one pass so a cached row can serve
+    // either listing mode without re-parsing; the active mode is selected below.
+    let previews = PreviewPair {
+        first: normalize_whitespace(
+            &parts
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ... "),
+        ),
+        last: normalize_whitespace(
+            &parts
+                .iter()
+                .rev()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ... "),
+        ),
     };
-
-    let preview = normalize_whitespace(&preview);
+    let preview = previews.select(show_last);
     let full_text = normalize_whitespace(&parts.join(" "));
     // Fall back to the mtime captured during the walk rather than re-stat'ing.
     let timestamp = last_timestamp
@@ -614,23 +574,26 @@ fn process_transcript_file(
 
     // Clone the owned copies the Conversation needs exactly once, at the end.
     let workspace_path = workspace_path.map(Path::to_path_buf);
-    Ok(Some(Conversation {
-        path: path.clone(),
-        provider: ProviderKind::CursorAgent,
-        id,
-        timestamp,
-        preview,
-        full_text,
-        project_name,
-        project_path: workspace_path.clone(),
-        cwd: workspace_path,
-        message_count,
-        parse_errors,
-        summary: None,
-        model: None,
-        total_tokens: 0,
-        duration_minutes,
-    }))
+    Ok(Some((
+        Conversation {
+            path: path.clone(),
+            provider: ProviderKind::CursorAgent,
+            id,
+            timestamp,
+            preview,
+            full_text,
+            project_name,
+            project_path: workspace_path.clone(),
+            cwd: workspace_path,
+            message_count,
+            parse_errors,
+            summary: None,
+            model: None,
+            total_tokens: 0,
+            duration_minutes,
+        },
+        previews,
+    )))
 }
 
 /// Controls how much per-line text work `parse_transcript_line` performs.
@@ -1235,7 +1198,7 @@ mod tests {
         )
         .unwrap();
 
-        let conversation = process_transcript_file(
+        let (conversation, _) = process_transcript_file(
             &transcript_file(transcript_path),
             false,
             Some(workspace_path.as_path()),
@@ -1395,7 +1358,7 @@ mod tests {
         )
         .unwrap();
 
-        let conversation = process_transcript_file(
+        let (conversation, _) = process_transcript_file(
             &transcript_file(transcript_path),
             false,
             None,
@@ -1496,7 +1459,7 @@ mod tests {
             .unwrap();
         }
 
-        let conversation =
+        let (conversation, previews) =
             process_transcript_file(&transcript_file(transcript_path), false, None, "proj", None)
                 .unwrap()
                 .unwrap();
@@ -1506,6 +1469,12 @@ mod tests {
         // Full text spans every part, not just the previewed ones.
         assert_eq!(conversation.full_text, "one two three four five");
         assert_eq!(conversation.message_count, 5);
+
+        // A single parse yields both preview directions so a cached row can
+        // serve either listing mode; the active mode matches the selection.
+        assert_eq!(previews.first, "one ... two ... three");
+        assert_eq!(previews.last, "five ... four ... three");
+        assert_eq!(previews.select(false), conversation.preview);
     }
 
     #[test]
@@ -1522,7 +1491,7 @@ mod tests {
             .unwrap();
         }
 
-        let conversation =
+        let (conversation, previews) =
             process_transcript_file(&transcript_file(transcript_path), true, None, "proj", None)
                 .unwrap()
                 .unwrap();
@@ -1530,6 +1499,7 @@ mod tests {
         // show_last keeps the last three parts, most-recent first.
         assert_eq!(conversation.preview, "five ... four ... three");
         assert_eq!(conversation.full_text, "one two three four five");
+        assert_eq!(previews.select(true), conversation.preview);
     }
 
     #[test]
