@@ -1,7 +1,7 @@
 mod app;
 mod export;
 pub(crate) mod search;
-mod ui;
+pub(crate) mod ui;
 pub mod viewer;
 
 pub(crate) use app::provider_theme;

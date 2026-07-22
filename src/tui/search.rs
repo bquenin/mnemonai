@@ -112,9 +112,31 @@ pub fn search(
     now: DateTime<Local>,
     narrow_from: Option<&[usize]>,
 ) -> Vec<usize> {
+    search_scored(conversations, searchable, query, now, narrow_from)
+        .into_iter()
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Like [`search`], but also returns each conversation's relevance score.
+///
+/// This is the single ranking implementation; [`search`] is a thin wrapper that
+/// drops the scores. The headless `search` command uses the scores directly, and
+/// a parity test locks the two in step so ranking is never forked.
+///
+/// Results are `(conversation index, score)` pairs ordered by score descending,
+/// then timestamp descending. When the query is empty every conversation is
+/// returned with a `0.0` score (mirroring [`search`]'s "return all" behavior).
+pub fn search_scored(
+    conversations: &[Conversation],
+    searchable: &[SearchableConversation],
+    query: &str,
+    now: DateTime<Local>,
+    narrow_from: Option<&[usize]>,
+) -> Vec<(usize, f64)> {
     if query.trim().is_empty() {
         // Return all indices sorted by timestamp (already sorted in history.rs)
-        return (0..conversations.len()).collect();
+        return (0..conversations.len()).map(|idx| (idx, 0.0)).collect();
     }
 
     let query_lower = normalize_for_search(query);
@@ -122,7 +144,7 @@ pub fn search(
     // Score conversations in parallel, optionally narrowing to a subset
     let query_terms = parse_query_terms(&query_lower);
     if query_terms.is_empty() {
-        return (0..conversations.len()).collect();
+        return (0..conversations.len()).map(|idx| (idx, 0.0)).collect();
     }
 
     let mut scored: Vec<(usize, f64, DateTime<Local>)> = if let Some(indices) = narrow_from {
@@ -172,7 +194,53 @@ pub fn search(
             .then_with(|| b.2.cmp(&a.2))
     });
 
-    scored.into_iter().map(|(idx, _, _)| idx).collect()
+    scored
+        .into_iter()
+        .map(|(idx, score, _)| (idx, score))
+        .collect()
+}
+
+/// Locate every query-term occurrence in `text_lower`, as `(byte_offset,
+/// char_len)` pairs sorted ascending by offset.
+///
+/// `text_lower` must already be lowercased (it is `SearchableConversation::
+/// text_lower`); `query` is normalized here. Term parsing and the whole-word
+/// rule match [`search`]/`score_text` exactly: interior terms and a final term
+/// without a trailing space match as substrings, while a final term with a
+/// trailing space matches only at a word boundary. Occurrences of a single term
+/// are non-overlapping (advancing past each match), so the returned length for
+/// one term equals `count_occurrences` over the whole text. The headless search
+/// command uses this for `match_count` and to anchor snippet windows.
+pub fn match_offsets(text_lower: &str, query: &str) -> Vec<(usize, usize)> {
+    let query_lower = normalize_for_search(query);
+    let query_terms = parse_query_terms(&query_lower);
+
+    let mut offsets = Vec::new();
+    for term in &query_terms {
+        if term.text.is_empty() {
+            continue;
+        }
+        let char_len = term.text.chars().count();
+        let mut start = 0;
+        while let Some(pos) = text_lower[start..].find(term.text) {
+            let abs = start + pos;
+            let abs_end = abs + term.text.len();
+            let at_boundary = !term.completed
+                || abs_end >= text_lower.len()
+                || text_lower[abs_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_word_boundary);
+            if at_boundary {
+                offsets.push((abs, char_len));
+            }
+            // Advance past the whole match (non-overlapping), matching
+            // `count_occurrences` so `match_count` stays consistent.
+            start = abs_end;
+        }
+    }
+    offsets.sort_unstable_by_key(|&(pos, _)| pos);
+    offsets
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
@@ -613,5 +681,54 @@ mod tests {
         let terms = parse_query_terms("single ");
         assert_eq!(terms.len(), 1);
         assert!(terms[0].completed);
+    }
+
+    #[test]
+    fn search_and_search_scored_agree_on_order() {
+        // The scored variant is the single ranking implementation; `search`
+        // must return exactly its indices in the same order.
+        let now = Local::now();
+        let mut convs = vec![
+            make_conv("deploy deploy deploy the deploy fix", now),
+            make_conv(&format!("deploy once {}", "filler ".repeat(120)), now),
+            make_conv("nothing relevant here", now),
+        ];
+        let searchable = precompute_search_text(&mut convs);
+
+        let order = search(&convs, &searchable, "deploy", now, None);
+        let scored = search_scored(&convs, &searchable, "deploy", now, None);
+        let scored_order: Vec<usize> = scored.iter().map(|&(idx, _)| idx).collect();
+
+        assert_eq!(order, scored_order);
+        // Scores are strictly descending in the returned order.
+        for pair in scored.windows(2) {
+            assert!(pair[0].1 >= pair[1].1);
+        }
+    }
+
+    #[test]
+    fn match_offsets_counts_and_locates_terms() {
+        // Two terms; occurrences of each are located and the total equals the
+        // per-term whole-text counts. Offsets are sorted ascending.
+        let text = normalize_for_search("workflow secrets and more workflow notes");
+        let offsets = match_offsets(&text, "workflow secret");
+
+        // "workflow" (prefix) appears twice, "secret" (prefix of "secrets") once.
+        assert_eq!(offsets.len(), 3);
+        assert!(offsets.windows(2).all(|w| w[0].0 <= w[1].0));
+        // Every reported offset actually starts one of the query terms.
+        for &(pos, char_len) in &offsets {
+            let slice: String = text[pos..].chars().take(char_len).collect();
+            assert!(slice == "workflow" || slice == "secret");
+        }
+    }
+
+    #[test]
+    fn match_offsets_respects_trailing_space_whole_word() {
+        let text = normalize_for_search("run diagnostics; the dia tool helps");
+        // Prefix term "dia" matches inside "diagnostics" and the standalone "dia".
+        assert_eq!(match_offsets(&text, "dia").len(), 2);
+        // Completed term "dia " (trailing space) only matches the whole word.
+        assert_eq!(match_offsets(&text, "dia ").len(), 1);
     }
 }

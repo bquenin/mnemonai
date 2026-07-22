@@ -1473,7 +1473,10 @@ fn find_hidden_match(
 
 /// Extract a context snippet around a match position in full_text.
 /// Returns a sanitized string with ellipsis prefix, suitable for display.
-fn extract_match_context(
+///
+/// Exposed to the crate so the headless `search` command can slice the same
+/// lowercased snippet windows the list UI shows, from one implementation.
+pub(crate) fn extract_match_context(
     full_text: &str,
     match_pos: usize,
     query_char_len: usize,

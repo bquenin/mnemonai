@@ -167,6 +167,8 @@ pub enum Command {
 
     /// Show one conversation without opening the TUI
     Show(ShowCommand),
+
+    Search(SearchCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -232,6 +234,79 @@ pub struct ListCommand {
     pub limit: Option<usize>,
 }
 
+/// Search conversation content and print ranked matches without the TUI
+///
+/// The positional WORDS are joined with single spaces into one query and matched
+/// with the same ranking as the interactive TUI type-ahead: every word must
+/// appear (AND), matching is case-insensitive, and each word matches as a
+/// substring anywhere in the text, never whole-word — so `search job flow` also
+/// matches "jobs" and "workflows". Results are ranked by a blend of match
+/// density, an early-conversation "topic window" boost, and recency.
+///
+/// Snippets are ~240-character windows centered on the earliest matches, sliced
+/// from the lowercased conversation text, so snippet text is lowercased.
+///
+/// Output defaults to a JSON array (like `list`); pass --jsonl for one object
+/// per line. Scope defaults to global; pass --local or --cwd PATH to restrict,
+/// or place the global --global flag before the subcommand.
+///
+/// Examples:
+///   mnemonai search reusable workflow secrets --since 90d --limit 5 --json
+///   mnemonai search job_workflow_ref --provider cursor-agent --json
+///   mnemonai search IBP-17360 --snippets 3
+///   mnemonai --global search deadlock --before 2026-06-01
+#[derive(Parser, Debug)]
+#[command(verbatim_doc_comment)]
+pub struct SearchCommand {
+    /// Words to search for (joined with single spaces into one query)
+    #[arg(value_name = "WORDS", num_args = 1.., required = true)]
+    pub words: Vec<String>,
+
+    /// Output a JSON array (default)
+    #[arg(long, group = "headless_search_output")]
+    pub json: bool,
+
+    /// Output one JSON object per line
+    #[arg(long, group = "headless_search_output")]
+    pub jsonl: bool,
+
+    /// Only include conversations from this provider
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderFilter>,
+
+    /// Only include conversations from the current directory tree
+    #[arg(long)]
+    pub local: bool,
+
+    /// Only include conversations whose cwd or project path is at or under this path
+    #[arg(long, value_name = "PATH", conflicts_with = "local")]
+    pub cwd: Option<PathBuf>,
+
+    /// Only include conversations from the last duration (for example: 7d, 24h, 2w)
+    #[arg(long, value_name = "DURATION", conflicts_with = "after")]
+    pub since: Option<String>,
+
+    /// Only include conversations at or after this timestamp (RFC 3339 or YYYY-MM-DD)
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub after: Option<String>,
+
+    /// Only include conversations before this timestamp (RFC 3339 or YYYY-MM-DD)
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub before: Option<String>,
+
+    /// Maximum number of results to return
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+
+    /// Number of match snippets to include per result (clamped to 0..=5)
+    #[arg(long, default_value_t = 2)]
+    pub snippets: usize,
+
+    /// Drop results whose conversation id equals this id (repeatable)
+    #[arg(long = "exclude-session", value_name = "ID")]
+    pub exclude_session: Vec<String>,
+}
+
 #[derive(Parser, Debug)]
 pub struct ShowCommand {
     /// Conversation ID or source path
@@ -252,6 +327,16 @@ pub struct ShowCommand {
     /// Include conversations from deleted project directories
     #[arg(long)]
     pub show_deleted_projects: bool,
+
+    /// Only include messages matching this pattern (case-insensitive substring;
+    /// repeatable, matched as OR). Matches message text, thinking, and stringified
+    /// tool input/result. Non-matching neighbors within --context are kept too.
+    #[arg(long, value_name = "PATTERN")]
+    pub grep: Vec<String>,
+
+    /// Number of neighboring messages to keep around each --grep match
+    #[arg(long, default_value_t = 1)]
+    pub context: usize,
 }
 
 #[cfg(test)]
@@ -293,6 +378,101 @@ mod tests {
 
         assert!(args.command.is_none());
         assert_eq!(args.input_file, Some(PathBuf::from("session.jsonl")));
+    }
+
+    #[test]
+    fn parses_search_subcommand_with_multiple_words() {
+        let args = Args::try_parse_from([
+            "mnemonai",
+            "search",
+            "reusable",
+            "workflow",
+            "secrets",
+            "--since",
+            "90d",
+            "--limit",
+            "5",
+            "--snippets",
+            "3",
+            "--provider",
+            "cursor-agent",
+            "--exclude-session",
+            "abc",
+            "--exclude-session",
+            "def",
+            "--json",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Search(command)) => {
+                assert_eq!(command.words, vec!["reusable", "workflow", "secrets"]);
+                assert!(command.json);
+                assert!(!command.jsonl);
+                assert_eq!(command.since.as_deref(), Some("90d"));
+                assert_eq!(command.limit, 5);
+                assert_eq!(command.snippets, 3);
+                assert_eq!(command.provider, Some(ProviderFilter::CursorAgent));
+                assert_eq!(command.exclude_session, vec!["abc", "def"]);
+            }
+            other => panic!("expected search command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn search_defaults_limit_and_snippets() {
+        let args = Args::try_parse_from(["mnemonai", "search", "job_workflow_ref"]).unwrap();
+        match args.command {
+            Some(Command::Search(command)) => {
+                assert_eq!(command.words, vec!["job_workflow_ref"]);
+                assert_eq!(command.limit, 10);
+                assert_eq!(command.snippets, 2);
+                assert!(command.exclude_session.is_empty());
+            }
+            other => panic!("expected search command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn search_requires_at_least_one_word() {
+        assert!(Args::try_parse_from(["mnemonai", "search"]).is_err());
+    }
+
+    #[test]
+    fn parses_show_grep_and_context() {
+        let args = Args::try_parse_from([
+            "mnemonai",
+            "show",
+            "sess-1",
+            "--grep",
+            "job_workflow_ref",
+            "--grep",
+            "IBP-17360",
+            "--context",
+            "2",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Command::Show(command)) => {
+                assert_eq!(command.target, "sess-1");
+                assert_eq!(command.grep, vec!["job_workflow_ref", "IBP-17360"]);
+                assert_eq!(command.context, 2);
+            }
+            other => panic!("expected show command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn show_context_defaults_to_one() {
+        let args = Args::try_parse_from(["mnemonai", "show", "sess-1"]).unwrap();
+        match args.command {
+            Some(Command::Show(command)) => {
+                assert!(command.grep.is_empty());
+                assert_eq!(command.context, 1);
+            }
+            other => panic!("expected show command, got {:?}", other),
+        }
     }
 
     #[test]

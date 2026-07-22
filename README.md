@@ -62,6 +62,12 @@ mnemonai list --json --cwd ~/code/my-repo --after 2026-06-01 --before 2026-06-20
 # Show one conversation by session ID or source path
 mnemonai show <session-id-or-path> --json
 
+# Search conversation content, ranked, with match snippets (JSON array)
+mnemonai search reusable workflow secrets --since 90d --limit 5 --json
+
+# Grep within one conversation's messages, keeping 1 neighbor per match
+mnemonai show <session-id-or-path> --grep job_workflow_ref --context 1 --json
+
 # Skill-style pipeline
 mnemonai list --jsonl --limit 500 | jq -r 'select(.message_count > 50) | .id'
 ```
@@ -75,6 +81,33 @@ is inclusive and the upper bound is exclusive. `--cwd` matches conversations
 whose recorded `cwd` or `project_path` is at or under the path. Output is JSON by
 default; on errors (no match, ambiguous target) the command prints a message to
 stderr and exits non-zero.
+
+`search <words>...` ranks conversations by content, finding sessions that a
+preview-only `list` scan misses. The positional words are joined with single
+spaces into one query and matched with the same ranking as the interactive TUI
+type-ahead: every word must appear (AND), matching is case-insensitive, and each
+word matches as a substring anywhere in the text, never whole-word — so
+`search job flow` also matches "jobs" and "workflows". It accepts `--provider`,
+`--local` / `--cwd`, and
+`--since` / `--after` / `--before` with the same meaning as `list`, plus
+`--limit <n>` (default 10), `--snippets <0..=5>` (default 2), and a repeatable
+`--exclude-session <id>` that drops specific conversations (handy for excluding
+the live session). Output is a JSON array by default; pass `--jsonl` for one
+object per line. Snippets are ~240-character windows centered on the earliest
+matches, sliced from the lowercased conversation text, so snippet text is
+lowercased.
+
+`show` additionally accepts a repeatable `--grep <pattern>` (case-insensitive
+substring, OR across patterns; matches a message's text, thinking, and
+stringified tool input/result) and `--context <n>` (default 1). With `--grep`,
+the output keeps only matching messages plus `n` neighbors on each side (merging
+overlapping ranges), flags each real match with `"matched": true`, and adds a
+`total_messages` field with the pre-filter count. Without `--grep`, `show`
+output is unchanged.
+
+Scope for `search` and `--grep` defaults to global; pass `--local` or `--cwd`, or
+place the global `--global` flag before the subcommand
+(`mnemonai --global search <words>`).
 
 Headless output depends only on these flags, never on the config file: unlike the
 interactive TUI, `list`/`show` ignore the config's `local`, `exclude`, and
@@ -103,10 +136,29 @@ when empty):
 | `duration_minutes` | number? | |
 | `parse_errors` | array | diagnostics; entries can include raw transcript lines, so this may be large for broken transcripts |
 
+### `search` output — ranked matches
+
+Each result is a slim object ordered by `score` descending (then `timestamp`
+descending). No `preview` or `parse_errors`; use `show` for full detail.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `provider` | string | `claude` \| `codex` \| `cursor` \| `cursor-agent` |
+| `id` | string | session ID (use with `show`) |
+| `path` | string | absolute source path |
+| `timestamp` | string | RFC 3339 |
+| `project_name` | string? | |
+| `cwd` | string? | |
+| `summary` | string? | title, when available |
+| `score` | number | relevance (match density + topic-window boost + recency) |
+| `match_count` | number | total query-term occurrences in the conversation |
+| `snippets` | array | up to `--snippets` lowercased ~240-char context windows |
+
 ### `show` output — conversation detail
 
-`{ "conversation": <summary>, "messages": [<message>, ...] }`, where each message
-carries `role` plus whichever of these apply (absent fields are omitted):
+`{ "conversation": <summary>, "messages": [<message>, ...] }` (with `--grep`, a
+`total_messages` count is inserted before `messages`), where each message carries
+`role` plus whichever of these apply (absent fields are omitted):
 
 | Field | Populated for |
 |-------|---------------|
@@ -114,6 +166,7 @@ carries `role` plus whichever of these apply (absent fields are omitted):
 | `entry_index` | always — zero-based source log entry index |
 | `block_index` | content-block messages, when applicable |
 | `role` | always — one of `summary`, `user`, `assistant`, `tool_call`, `tool_result`, `thinking`, `image`, `system`, or `agent_<type>` for sub-agent turns |
+| `matched` | `--grep` matches only — `true` on messages that matched a pattern (context neighbors omit it) |
 | `timestamp` | most messages (RFC 3339) |
 | `text` | text messages, tool results, summaries |
 | `tool_call_id` | `tool_call` and `tool_result`; use this to pair calls with results |
