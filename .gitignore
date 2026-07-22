@@ -3,3 +3,6 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+
+# Agent session scaffolding (worktrees, settings)
+.claude/
