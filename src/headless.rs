@@ -2,17 +2,28 @@ use crate::claude::{
     AgentContent, ContentBlock, LogEntry, UserContent, extract_tool_result_text,
     parse_agent_progress,
 };
-use crate::cli::{Command, DebugLevel, ListCommand, ProviderFilter, ShowCommand};
+use crate::cli::{Command, DebugLevel, ListCommand, ProviderFilter, SearchCommand, ShowCommand};
 use crate::error::{AppError, Result};
 use crate::history::{
     Conversation, LoaderMessage, ParseError, path_to_string, project_path_is_live,
 };
 use crate::providers::{LoadOptions, Provider};
+use crate::tui::search;
+use crate::tui::ui::extract_match_context;
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
+
+/// Width, in characters, of a search snippet window (roughly 240 chars centered
+/// on a match). Also used as the minimum byte gap between two matches before a
+/// second snippet is emitted, so windows do not overlap.
+const SNIPPET_WIDTH: usize = 240;
+
+/// Upper clamp on the number of snippets a single result may carry.
+const SNIPPET_MAX: usize = 5;
 
 pub struct HeadlessSettings {
     pub cli_local: bool,
@@ -43,7 +54,25 @@ struct ConversationSummary {
 #[derive(Serialize)]
 struct ConversationDetail {
     conversation: ConversationSummary,
+    /// Total message count before `--grep` filtering. Present only when
+    /// `--grep` is active, so plain `show` output is byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_messages: Option<usize>,
     messages: Vec<MessageDto>,
+}
+
+#[derive(Serialize)]
+struct SearchResult {
+    provider: &'static str,
+    id: String,
+    path: String,
+    timestamp: String,
+    project_name: Option<String>,
+    cwd: Option<String>,
+    summary: Option<String>,
+    score: f64,
+    match_count: usize,
+    snippets: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +82,10 @@ struct MessageDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_index: Option<usize>,
     role: String,
+    /// True on messages that matched a `--grep` pattern (neighbors kept for
+    /// context are omitted). Absent without `--grep`, keeping output unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +168,7 @@ impl MessageDto {
             entry_index: context.entry_index,
             block_index: context.block_index,
             role: role.into(),
+            matched: None,
             timestamp: context.timestamp.map(ToString::to_string),
             text: None,
             tool_call_id: None,
@@ -163,6 +197,7 @@ pub fn run_command(
     match command {
         Command::List(command) => run_list(command, providers, settings),
         Command::Show(command) => run_show(command, providers, settings),
+        Command::Search(command) => run_search(command, providers, settings),
     }
 }
 
@@ -178,6 +213,7 @@ fn run_list(
         command.local,
         command.show_deleted_projects,
         command.cwd.is_some(),
+        false,
     )?;
     apply_list_filters(&mut conversations, command)?;
     if let Some(limit) = command.limit {
@@ -208,6 +244,7 @@ fn run_show(
         command.local,
         command.show_deleted_projects,
         false,
+        false,
     )?;
     let conversation = resolve_conversation(&conversations, &command.target)?;
     let provider = providers
@@ -220,12 +257,239 @@ fn run_show(
             ))
         })?;
     let entries = provider.read_entries(conversation)?;
+    let messages = messages_from_entries(&entries);
+
+    // `--grep` keeps only messages matching a pattern (plus context neighbors)
+    // and records the pre-filter count; without it the output is unchanged.
+    let (messages, total_messages) = if command.grep.is_empty() {
+        (messages, None)
+    } else {
+        let total = messages.len();
+        (
+            apply_grep(messages, &command.grep, command.context),
+            Some(total),
+        )
+    };
+
     let detail = ConversationDetail {
         conversation: ConversationSummary::from_conversation(conversation),
-        messages: messages_from_entries(&entries),
+        total_messages,
+        messages,
     };
 
     write_json(&detail)
+}
+
+/// Keep only messages matching any `--grep` pattern (case-insensitive substring,
+/// OR across patterns), plus up to `context` neighbors on each side. Matched
+/// messages are flagged with `matched = Some(true)`; context-only neighbors are
+/// not. Overlapping/adjacent context ranges are merged.
+fn apply_grep(messages: Vec<MessageDto>, patterns: &[String], context: usize) -> Vec<MessageDto> {
+    let patterns_lower: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
+
+    let matched: Vec<bool> = messages
+        .iter()
+        .map(|message| message_matches_grep(message, &patterns_lower))
+        .collect();
+
+    // A boolean mask of which message indices survive: each match contributes
+    // the inclusive window [i - context, i + context], clamped to the ends.
+    let mut keep = vec![false; messages.len()];
+    for (i, is_match) in matched.iter().enumerate() {
+        if *is_match {
+            let lo = i.saturating_sub(context);
+            let hi = i
+                .saturating_add(context)
+                .min(messages.len().saturating_sub(1));
+            for slot in &mut keep[lo..=hi] {
+                *slot = true;
+            }
+        }
+    }
+
+    messages
+        .into_iter()
+        .zip(matched)
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, (mut message, is_match))| {
+            if is_match {
+                message.matched = Some(true);
+            }
+            message
+        })
+        .collect()
+}
+
+/// Whether a message's text, thinking, or stringified tool input/result contains
+/// any of the already-lowercased patterns. The JSON stringification happens only
+/// here (i.e. only when `--grep` is active).
+fn message_matches_grep(message: &MessageDto, patterns_lower: &[String]) -> bool {
+    let mut haystack = String::new();
+    if let Some(text) = &message.text {
+        haystack.push_str(text);
+        haystack.push('\n');
+    }
+    if let Some(thinking) = &message.thinking {
+        haystack.push_str(thinking);
+        haystack.push('\n');
+    }
+    if let Some(input) = &message.tool_input
+        && let Ok(rendered) = serde_json::to_string(input)
+    {
+        haystack.push_str(&rendered);
+        haystack.push('\n');
+    }
+    if let Some(result) = &message.tool_result
+        && let Ok(rendered) = serde_json::to_string(result)
+    {
+        haystack.push_str(&rendered);
+        haystack.push('\n');
+    }
+
+    let haystack_lower = haystack.to_lowercase();
+    patterns_lower
+        .iter()
+        .any(|pattern| haystack_lower.contains(pattern))
+}
+
+fn run_search(
+    command: &SearchCommand,
+    providers: &[Box<dyn Provider>],
+    settings: &HeadlessSettings,
+) -> Result<()> {
+    let mut conversations = load_conversations(
+        providers,
+        settings,
+        command.provider,
+        command.local,
+        false,
+        command.cwd.is_some(),
+        true,
+    )?;
+    apply_search_filters(&mut conversations, command)?;
+
+    let results = rank_and_build(conversations, command, Local::now());
+
+    if command.jsonl {
+        write_jsonl(&results)
+    } else {
+        write_json(&results)
+    }
+}
+
+/// Rank the (already time/provider/scope-filtered) conversations against the
+/// query, drop excluded sessions, and build the output rows (snippets and
+/// match counts) for the top `limit`.
+///
+/// Ranking, snippet extraction, and match counting all reuse the TUI search
+/// machinery so headless order matches the interactive list exactly.
+fn rank_and_build(
+    mut conversations: Vec<Conversation>,
+    command: &SearchCommand,
+    now: DateTime<Local>,
+) -> Vec<SearchResult> {
+    if !command.exclude_session.is_empty() {
+        let excluded: HashSet<&str> = command.exclude_session.iter().map(String::as_str).collect();
+        conversations.retain(|conversation| !excluded.contains(conversation.id.as_str()));
+    }
+
+    let query = command.words.join(" ");
+    let snippet_count = command.snippets.min(SNIPPET_MAX);
+
+    // `precompute_search_text` moves each conversation's body into `text_lower`,
+    // so keep the searchable rows alive for snippet slicing below.
+    let searchable = search::precompute_search_text(&mut conversations);
+    let mut text_lowers: Vec<&str> = vec![""; conversations.len()];
+    for row in &searchable {
+        if row.index < text_lowers.len() {
+            text_lowers[row.index] = &row.text_lower;
+        }
+    }
+
+    let ranked = search::search_scored(&conversations, &searchable, &query, now, None);
+
+    let mut results = Vec::new();
+    for (index, score) in ranked {
+        if results.len() >= command.limit {
+            break;
+        }
+        let conversation = &conversations[index];
+        let text_lower = text_lowers[index];
+        let offsets = search::match_offsets(text_lower, &query);
+        let snippets = build_snippets(text_lower, &offsets, snippet_count);
+        results.push(SearchResult {
+            provider: conversation.provider.key(),
+            id: conversation.id.clone(),
+            path: conversation.path.to_string_lossy().to_string(),
+            timestamp: conversation.timestamp.to_rfc3339(),
+            project_name: conversation.project_name.clone(),
+            cwd: path_to_string(conversation.cwd.as_deref()),
+            summary: conversation.summary.clone(),
+            score,
+            match_count: offsets.len(),
+            snippets,
+        });
+    }
+
+    results
+}
+
+/// Slice up to `count` ~240-char snippet windows from the lowercased corpus,
+/// centered on the earliest match offsets. Offsets closer than one window width
+/// to the previous snippet are skipped so windows don't overlap.
+fn build_snippets(text_lower: &str, offsets: &[(usize, usize)], count: usize) -> Vec<String> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let mut snippets = Vec::new();
+    let mut last_pos: Option<usize> = None;
+    for &(pos, char_len) in offsets {
+        if snippets.len() >= count {
+            break;
+        }
+        if let Some(previous) = last_pos
+            && pos < previous + SNIPPET_WIDTH
+        {
+            continue;
+        }
+        snippets.push(extract_match_context(
+            text_lower,
+            pos,
+            char_len,
+            SNIPPET_WIDTH,
+        ));
+        last_pos = Some(pos);
+    }
+    snippets
+}
+
+fn apply_search_filters(
+    conversations: &mut Vec<Conversation>,
+    command: &SearchCommand,
+) -> Result<()> {
+    let after = after_cutoff(command.since.as_deref(), command.after.as_deref())?;
+    let before = command
+        .before
+        .as_deref()
+        .map(|value| parse_timestamp_filter(value, "--before"))
+        .transpose()?;
+    let cwd_roots = command
+        .cwd
+        .as_deref()
+        .map(crate::loader::filter_path_roots)
+        .transpose()?;
+
+    conversations.retain(|conversation| {
+        after.is_none_or(|after| conversation.timestamp >= after)
+            && before.is_none_or(|before| conversation.timestamp < before)
+            && cwd_roots
+                .as_ref()
+                .is_none_or(|roots| crate::loader::conversation_matches_scope(conversation, roots))
+    });
+
+    Ok(())
 }
 
 fn load_conversations(
@@ -235,19 +499,21 @@ fn load_conversations(
     command_local: bool,
     command_show_deleted: bool,
     force_global: bool,
+    include_full_text: bool,
 ) -> Result<Vec<Conversation>> {
     let local = use_local_scope(settings, command_local, force_global);
     let show_deleted_projects = command_show_deleted || settings.show_deleted_projects;
-    // Headless `list`/`show` never emit the conversation body, so load under the
-    // metadata profile: the corpus is never decoded from the cache, Cursor skips
-    // deriving it, and the returned conversations carry an empty body. A file
-    // provider's fresh parse still computes the text as a scan byproduct and
-    // writes the cache row complete, so a later full-profile (TUI) run that hits
-    // those rows gets a real search corpus.
+    // Headless `list`/`show` never emit the conversation body, so they load under
+    // the metadata profile (`include_full_text = false`): the corpus is never
+    // decoded from the cache, Cursor skips deriving it, and the returned
+    // conversations carry an empty body. A file provider's fresh parse still
+    // computes the text as a scan byproduct and writes the cache row complete, so
+    // a later full-profile run that hits those rows gets a real search corpus.
+    // `search` needs the body to rank and snippet, so it passes `true`.
     let load_options = LoadOptions {
         show_last: settings.show_last,
         debug: settings.debug,
-        include_full_text: false,
+        include_full_text,
     };
     let mut conversations = if local {
         crate::loader::load_local(providers, load_options, provider_filter)?
@@ -305,16 +571,20 @@ fn apply_list_filters(conversations: &mut Vec<Conversation>, command: &ListComma
 }
 
 fn list_after_cutoff(command: &ListCommand) -> Result<Option<DateTime<Local>>> {
-    if let Some(since) = command.since.as_deref() {
+    after_cutoff(command.since.as_deref(), command.after.as_deref())
+}
+
+/// Resolve the inclusive lower time bound from `--since` (a relative duration) or
+/// `--after` (an absolute timestamp). Shared by `list` and `search`.
+fn after_cutoff(since: Option<&str>, after: Option<&str>) -> Result<Option<DateTime<Local>>> {
+    if let Some(since) = since {
         let duration = parse_since_duration(since)?;
         let cutoff = Local::now()
             .checked_sub_signed(duration)
             .ok_or_else(|| invalid_duration(since))?;
         Ok(Some(cutoff))
     } else {
-        command
-            .after
-            .as_deref()
+        after
             .map(|value| parse_timestamp_filter(value, "--after"))
             .transpose()
     }
@@ -1670,5 +1940,489 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text.as_deref(), Some("hi back"));
         assert_eq!(messages[1].model.as_deref(), Some("claude-test"));
+    }
+
+    // ---- search ----
+
+    fn conv_text(
+        id: &str,
+        provider: ProviderKind,
+        text: &str,
+        timestamp: DateTime<Local>,
+    ) -> Conversation {
+        Conversation {
+            path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            provider,
+            id: id.to_string(),
+            timestamp,
+            preview: text.chars().take(40).collect(),
+            full_text: text.to_string(),
+            project_name: Some("proj".to_string()),
+            project_path: None,
+            cwd: None,
+            message_count: 1,
+            parse_errors: Vec::new(),
+            summary: Some(format!("summary {id}")),
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+        }
+    }
+
+    fn search_command(words: &[&str]) -> SearchCommand {
+        SearchCommand {
+            words: words.iter().map(|w| w.to_string()).collect(),
+            json: false,
+            jsonl: false,
+            provider: None,
+            local: false,
+            cwd: None,
+            since: None,
+            after: None,
+            before: None,
+            limit: 10,
+            snippets: 2,
+            exclude_session: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn headless_search_order_matches_tui_search() {
+        // The headless ranking must reproduce the interactive list order exactly.
+        let now = Local.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let convs = vec![
+            conv_text(
+                "dense",
+                ProviderKind::Claude,
+                "deploy deploy deploy the deploy fix for deploy",
+                now,
+            ),
+            conv_text(
+                "sparse",
+                ProviderKind::Codex,
+                &format!("deploy once {}", "filler ".repeat(120)),
+                now - Duration::days(1),
+            ),
+            conv_text("none", ProviderKind::Cursor, "nothing to see here", now),
+        ];
+
+        let command = search_command(&["deploy"]);
+        let headless_ids: Vec<String> = rank_and_build(convs.clone(), &command, now)
+            .into_iter()
+            .map(|result| result.id)
+            .collect();
+
+        let mut tui_convs = convs.clone();
+        let searchable = search::precompute_search_text(&mut tui_convs);
+        let tui_ids: Vec<String> = search::search(&tui_convs, &searchable, "deploy", now, None)
+            .into_iter()
+            .map(|index| tui_convs[index].id.clone())
+            .collect();
+
+        assert_eq!(headless_ids, tui_ids);
+        assert_eq!(headless_ids, vec!["dense", "sparse"]);
+
+        // Multi-word: the CLI joins WORDS with single spaces, so ranking must
+        // match a TUI user typing the same words (no trailing space). "fi" is a
+        // substring of both "fix" (dense) and "filler" (sparse); AND drops "none".
+        let command = search_command(&["deploy", "fi"]);
+        let headless_multi: Vec<String> = rank_and_build(convs.clone(), &command, now)
+            .into_iter()
+            .map(|result| result.id)
+            .collect();
+        let tui_multi: Vec<String> =
+            search::search(&tui_convs, &searchable, "deploy fi", now, None)
+                .into_iter()
+                .map(|index| tui_convs[index].id.clone())
+                .collect();
+
+        assert_eq!(headless_multi, tui_multi);
+        assert_eq!(headless_multi.len(), 2);
+        assert!(!headless_multi.contains(&"none".to_string()));
+    }
+
+    #[test]
+    fn search_joins_words_as_substring_terms_like_typeahead() {
+        let now = Local::now();
+        let convs = vec![
+            conv_text(
+                "both",
+                ProviderKind::Claude,
+                "reviewing the workspace flowers today",
+                now,
+            ),
+            conv_text(
+                "one",
+                ProviderKind::Codex,
+                "only workspace here, no petals",
+                now,
+            ),
+        ];
+        // The join has no trailing space, so no term is "completed": interior
+        // "work" and final "flow" both match as substrings (workspace, flowers),
+        // and AND logic requires both to appear.
+        let mut command = search_command(&["work", "flow"]);
+        command.snippets = 0;
+        let ids: Vec<String> = rank_and_build(convs, &command, now)
+            .into_iter()
+            .map(|result| result.id)
+            .collect();
+        assert_eq!(ids, vec!["both"]);
+    }
+
+    #[test]
+    fn search_snippets_are_lowercased_bounded_and_clamped() {
+        let now = Local::now();
+        let filler = "x".repeat(300);
+        let text = format!(
+            "JOB_WORKFLOW_REF start {filler} middle JOB_WORKFLOW_REF here {filler} tail JOB_WORKFLOW_REF end"
+        );
+        let convs = vec![conv_text("s", ProviderKind::Claude, &text, now)];
+
+        let mut command = search_command(&["job_workflow_ref"]);
+        command.snippets = 2;
+        let results = rank_and_build(convs.clone(), &command, now);
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.match_count, 3, "case-insensitive occurrence count");
+        assert_eq!(result.snippets.len(), 2, "clamped to the requested count");
+        for snippet in &result.snippets {
+            assert_eq!(
+                snippet,
+                &snippet.to_lowercase(),
+                "snippets come from the lowercased corpus"
+            );
+            assert!(
+                snippet.contains("job_workflow_ref"),
+                "each snippet is centered on a match: {snippet}"
+            );
+            assert!(
+                snippet.chars().count() <= SNIPPET_WIDTH + 4,
+                "snippet stays near the window width: {} chars",
+                snippet.chars().count()
+            );
+        }
+
+        command.snippets = 0;
+        assert!(
+            rank_and_build(convs.clone(), &command, now)[0]
+                .snippets
+                .is_empty()
+        );
+
+        command.snippets = 9;
+        let clamped = rank_and_build(convs, &command, now);
+        assert!(clamped[0].snippets.len() <= SNIPPET_MAX);
+        assert_eq!(
+            clamped[0].snippets.len(),
+            3,
+            "only three distinct windows exist"
+        );
+    }
+
+    #[test]
+    fn search_snippets_slice_multibyte_text_without_panicking() {
+        // Snippet windows are centered on byte offsets inside CJK/emoji text;
+        // slicing must land on char boundaries instead of panicking mid-codepoint.
+        let now = Local::now();
+        let text = format!(
+            "{} deploy {} deploy {}",
+            "汉字🎉".repeat(80),
+            "émoji🚀".repeat(80),
+            "日本語".repeat(80)
+        );
+        let convs = vec![conv_text("mb", ProviderKind::Claude, &text, now)];
+
+        let mut command = search_command(&["deploy"]);
+        command.snippets = 5;
+        let results = rank_and_build(convs, &command, now);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].match_count, 2);
+        assert_eq!(results[0].snippets.len(), 2, "matches are >240 bytes apart");
+        for snippet in &results[0].snippets {
+            assert!(snippet.contains("deploy"), "snippet centers a match");
+        }
+    }
+
+    #[test]
+    fn search_composes_provider_since_query_and_exclude() {
+        let now = Local::now();
+        let providers: Vec<Box<dyn Provider>> = vec![
+            StubProvider::ok(
+                ProviderKind::Claude,
+                vec![conv_text(
+                    "claude-hit",
+                    ProviderKind::Claude,
+                    "workflow secrets rotation",
+                    now,
+                )],
+            ),
+            StubProvider::ok(
+                ProviderKind::Codex,
+                vec![
+                    conv_text(
+                        "codex-recent",
+                        ProviderKind::Codex,
+                        "reusable workflow secrets",
+                        now,
+                    ),
+                    conv_text(
+                        "codex-old",
+                        ProviderKind::Codex,
+                        "reusable workflow secrets",
+                        now - Duration::days(120),
+                    ),
+                    conv_text(
+                        "codex-excluded",
+                        ProviderKind::Codex,
+                        "reusable workflow secrets",
+                        now,
+                    ),
+                ],
+            ),
+        ];
+        let settings = HeadlessSettings {
+            cli_local: false,
+            cli_global: false,
+            show_last: false,
+            show_deleted_projects: false,
+            debug: None,
+        };
+
+        // Provider filter keeps only Codex; full text is requested for ranking.
+        let mut conversations = load_conversations(
+            &providers,
+            &settings,
+            Some(ProviderFilter::Codex),
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let loaded: Vec<&str> = conversations.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !loaded.contains(&"claude-hit"),
+            "provider filter drops Claude"
+        );
+        assert!(loaded.contains(&"codex-recent"));
+
+        let mut command = search_command(&["workflow", "secret"]);
+        command.provider = Some(ProviderFilter::Codex);
+        command.since = Some("30d".to_string());
+        command.exclude_session = vec!["codex-excluded".to_string()];
+        command.snippets = 0;
+
+        // --since drops the 120-day-old conversation before ranking.
+        apply_search_filters(&mut conversations, &command).unwrap();
+        let result_ids: Vec<String> = rank_and_build(conversations, &command, now)
+            .into_iter()
+            .map(|result| result.id)
+            .collect();
+        assert_eq!(result_ids, vec!["codex-recent"]);
+    }
+
+    #[test]
+    fn search_result_json_shape_is_pinned() {
+        let now = Local::now();
+        let convs = vec![conv_text(
+            "sess-1",
+            ProviderKind::CursorAgent,
+            "job_workflow_ref discussion here",
+            now,
+        )];
+        let mut command = search_command(&["job_workflow_ref"]);
+        command.snippets = 1;
+        let results = rank_and_build(convs, &command, now);
+        let json = serde_json::to_value(&results).unwrap();
+        let obj = &json[0];
+
+        assert_eq!(obj["provider"], "cursor-agent");
+        assert_eq!(obj["id"], "sess-1");
+        assert_eq!(obj["path"], "/tmp/sess-1.jsonl");
+        assert!(obj["timestamp"].is_string());
+        assert_eq!(obj["project_name"], "proj");
+        assert!(obj["cwd"].is_null());
+        assert_eq!(obj["match_count"], 1);
+        assert!(obj["score"].is_number());
+        assert_eq!(obj["snippets"].as_array().unwrap().len(), 1);
+
+        // Slim by design: no preview, no parse_errors.
+        assert!(obj.get("preview").is_none());
+        assert!(obj.get("parse_errors").is_none());
+        for key in [
+            "provider",
+            "id",
+            "path",
+            "timestamp",
+            "project_name",
+            "cwd",
+            "summary",
+            "score",
+            "match_count",
+            "snippets",
+        ] {
+            assert!(obj.get(key).is_some(), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn search_empty_results_serialize_as_empty_array() {
+        let results: Vec<SearchResult> = Vec::new();
+        let bytes = json_bytes(&results).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "[]\n");
+    }
+
+    // ---- show --grep ----
+
+    fn text_msg(index: usize, text: &str) -> MessageDto {
+        let mut message = MessageDto::new("user", MessageContext::new(index));
+        message.index = index;
+        message.text = Some(text.to_string());
+        message
+    }
+
+    fn tool_result_msg(index: usize, result: Value) -> MessageDto {
+        let mut message = MessageDto::new("tool_result", MessageContext::new(index));
+        message.index = index;
+        message.tool_result = Some(result);
+        message
+    }
+
+    #[test]
+    fn grep_or_matches_tool_fields_and_merges_overlapping_context() {
+        let messages = vec![
+            text_msg(0, "intro line"),
+            text_msg(1, "the ALPHA appears here"),
+            tool_result_msg(2, serde_json::json!({"stdout": "contains beta token"})),
+            text_msg(3, "trailing note"),
+            text_msg(4, "far away tail"),
+        ];
+        // OR of two patterns: "alpha" hits message 1 (text), "beta" hits message 2
+        // (inside the tool_result JSON). Context windows [0,2] and [1,3] overlap
+        // and merge; message 4 is excluded.
+        let filtered = apply_grep(messages, &["alpha".to_string(), "beta".to_string()], 1);
+
+        let indices: Vec<usize> = filtered.iter().map(|m| m.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+
+        let matched: Vec<usize> = filtered
+            .iter()
+            .filter(|m| m.matched == Some(true))
+            .map(|m| m.index)
+            .collect();
+        assert_eq!(
+            matched,
+            vec![1, 2],
+            "only real matches carry the matched flag"
+        );
+        assert_eq!(
+            filtered[0].matched, None,
+            "context-only neighbor has no flag"
+        );
+        assert_eq!(filtered[3].matched, None);
+    }
+
+    #[test]
+    fn grep_merges_adjacent_context_windows() {
+        let messages = vec![
+            text_msg(0, "a"),
+            text_msg(1, "alpha"),
+            text_msg(2, "b"),
+            text_msg(3, "c"),
+            text_msg(4, "alpha"),
+            text_msg(5, "d"),
+        ];
+        // Windows [0,2] and [3,5] are adjacent and merge into one contiguous run.
+        let filtered = apply_grep(messages, &["alpha".to_string()], 1);
+        let indices: Vec<usize> = filtered.iter().map(|m| m.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+        let matched: Vec<usize> = filtered
+            .iter()
+            .filter(|m| m.matched == Some(true))
+            .map(|m| m.index)
+            .collect();
+        assert_eq!(matched, vec![1, 4]);
+    }
+
+    #[test]
+    fn grep_with_no_hits_returns_empty() {
+        let messages = vec![text_msg(0, "nothing"), text_msg(1, "here")];
+        assert!(apply_grep(messages, &["zzz".to_string()], 2).is_empty());
+    }
+
+    #[test]
+    fn grep_detail_json_includes_total_messages_and_matched() {
+        let messages = vec![
+            text_msg(0, "intro"),
+            text_msg(1, "alpha match"),
+            text_msg(2, "beta"),
+        ];
+        let total = messages.len();
+        let filtered = apply_grep(messages, &["alpha".to_string()], 0);
+        let detail = ConversationDetail {
+            conversation: ConversationSummary::from_conversation(&conversation(
+                "c",
+                "/tmp/c.jsonl",
+                ProviderKind::Claude,
+            )),
+            total_messages: Some(total),
+            messages: filtered,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["total_messages"], 3);
+        assert_eq!(json["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(json["messages"][0]["matched"], true);
+    }
+
+    #[test]
+    fn plain_show_output_is_byte_identical_without_new_fields() {
+        // Without --grep, ConversationDetail carries total_messages = None and no
+        // message is flagged, so the serialization must match the historical
+        // {conversation, messages} shape byte for byte.
+        #[derive(Serialize)]
+        struct OldDetail {
+            conversation: ConversationSummary,
+            messages: Vec<MessageDto>,
+        }
+
+        let entries = vec![
+            LogEntry::User {
+                message: UserMessage {
+                    content: UserContent::String("run tests".to_string()),
+                },
+                timestamp: "2026-06-19T10:00:00-07:00".to_string(),
+                cwd: None,
+            },
+            LogEntry::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "on it".to_string(),
+                    }],
+                    model: Some("claude-test".to_string()),
+                    usage: None,
+                    id: None,
+                },
+                timestamp: "2026-06-19T10:00:01-07:00".to_string(),
+            },
+        ];
+        let conv = conversation("byte-id", "/tmp/byte-id.jsonl", ProviderKind::Claude);
+
+        let new_detail = ConversationDetail {
+            conversation: ConversationSummary::from_conversation(&conv),
+            total_messages: None,
+            messages: messages_from_entries(&entries),
+        };
+        let old_detail = OldDetail {
+            conversation: ConversationSummary::from_conversation(&conv),
+            messages: messages_from_entries(&entries),
+        };
+
+        let new_bytes = json_bytes(&new_detail).unwrap();
+        assert_eq!(new_bytes, json_bytes(&old_detail).unwrap());
+
+        let rendered = String::from_utf8(new_bytes).unwrap();
+        assert!(!rendered.contains("total_messages"));
+        assert!(!rendered.contains("\"matched\""));
     }
 }
