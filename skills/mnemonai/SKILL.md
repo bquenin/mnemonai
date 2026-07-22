@@ -1,9 +1,9 @@
 ---
-name: recall
+name: mnemonai
 description: Search past AI agent sessions (Claude Code, Codex, Cursor IDE, Cursor Agent) and Slack history for prior discussions, decisions, and solutions. Use when the user asks "have we seen/discussed/solved this before?", wants prior context or a past recommendation pulled into this session, or references earlier work they cannot locate.
 ---
 
-# Recall: retrieve prior context from agent sessions and Slack
+# mnemonai: retrieve prior context from agent sessions and Slack
 
 ## When to use
 - "Do you remember…", "have we already…", "we solved this before…", "find the thread/session where…"
