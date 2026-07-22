@@ -1,27 +1,25 @@
+use super::LoadOptions;
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, UserContent, UserMessage, extract_text_from_blocks,
 };
 use crate::cli::DebugLevel;
 use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, delete_conversation, fingerprint_from_metadata,
-    load_provider_cache, prune_conversations, save_conversations,
+    LoadedConversation, ProviderCache, delete_conversation, fingerprint_from_metadata,
 };
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::{
-    Conversation, LoaderMessage, ParseError, ProviderKind, format_short_name_from_path,
+    Conversation, LoaderMessage, ParseError, PreviewPair, ProviderKind, format_short_name_from_path,
 };
 use chrono::{DateTime, FixedOffset, Local};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::SystemTime;
 
@@ -122,6 +120,9 @@ impl RecordHead {
 
 struct ParsedCodexTranscript {
     conversation: Option<Conversation>,
+    /// Both previews for the conversation (scan mode only), so the cache can
+    /// store them and serve either preview mode without re-parsing.
+    previews: Option<PreviewPair>,
     entries: Vec<LogEntry>,
 }
 
@@ -150,28 +151,6 @@ struct CodexParseState {
     parse_errors: Vec<ParseError>,
 }
 
-enum ConversationLoad {
-    Cached(Conversation),
-    Fresh(Conversation, SourceFingerprint),
-}
-
-impl ConversationLoad {
-    fn into_conversation(self) -> Conversation {
-        match self {
-            Self::Cached(conversation) | Self::Fresh(conversation, _) => conversation,
-        }
-    }
-
-    /// Borrow a freshly parsed conversation and its fingerprint for saving,
-    /// letting the index be written from references without cloning.
-    fn as_fresh(&self) -> Option<(&Conversation, SourceFingerprint)> {
-        match self {
-            Self::Fresh(conversation, fingerprint) => Some((conversation, *fingerprint)),
-            Self::Cached(_) => None,
-        }
-    }
-}
-
 impl CodexProvider {
     pub fn new() -> Self {
         Self {
@@ -186,11 +165,7 @@ impl CodexProvider {
         Some(self.codex_home.join("sessions"))
     }
 
-    fn load_all_conversations(
-        &self,
-        show_last: bool,
-        debug_level: Option<DebugLevel>,
-    ) -> Result<Vec<Conversation>> {
+    fn load_all_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
         let Some(root) = self.sessions_root() else {
             return Ok(Vec::new());
         };
@@ -198,31 +173,28 @@ impl CodexProvider {
             return Ok(Vec::new());
         }
 
+        let debug_level = options.debug;
         let files = collect_session_files(&root);
-        let cache = Mutex::new(load_provider_cache(ProviderKind::Codex, show_last));
-        let loaded: Vec<ConversationLoad> = files
+        let cache = ProviderCache::load(
+            ProviderKind::Codex,
+            options.show_last,
+            options.include_full_text,
+        );
+        let loaded: Vec<LoadedConversation> = files
             .into_par_iter()
-            .filter_map(|path| load_one(path, show_last, &cache, debug_level))
+            .filter_map(|path| load_one(path, options.show_last, &cache, debug_level))
             .collect();
 
         // Save the freshly parsed conversations from references, before we move
         // them into the returned list — no per-conversation clone.
-        save_conversations(
-            ProviderKind::Codex,
-            show_last,
-            loaded.iter().filter_map(ConversationLoad::as_fresh),
-        );
+        cache.save_fresh(loaded.iter());
 
         // Entries no session file claimed belong to files that no longer exist.
-        let stale: Vec<PathBuf> = cache
-            .into_inner()
-            .map(|cache| cache.into_keys().collect())
-            .unwrap_or_default();
-        prune_conversations(ProviderKind::Codex, &stale);
+        cache.prune_unclaimed(&[]);
 
         let mut conversations: Vec<Conversation> = loaded
             .into_iter()
-            .map(ConversationLoad::into_conversation)
+            .map(|entry| entry.into_conversation(options.include_full_text))
             .collect();
         conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
         Ok(conversations)
@@ -235,12 +207,7 @@ impl CodexProvider {
     /// (from references) before the batch is sent — the same fingerprint the
     /// sync path would write — and pruning of vanished files happens once at
     /// the end, after every directory has consumed its cache entries.
-    fn stream_all_conversations(
-        &self,
-        tx: &Sender<LoaderMessage>,
-        show_last: bool,
-        debug_level: Option<DebugLevel>,
-    ) {
+    fn stream_all_conversations(&self, tx: &Sender<LoaderMessage>, options: LoadOptions) {
         let Some(root) = self.sessions_root() else {
             let _ = tx.send(LoaderMessage::Done);
             return;
@@ -250,25 +217,26 @@ impl CodexProvider {
             return;
         }
 
-        let cache = Mutex::new(load_provider_cache(ProviderKind::Codex, show_last));
+        let debug_level = options.debug;
+        let cache = ProviderCache::load(
+            ProviderKind::Codex,
+            options.show_last,
+            options.include_full_text,
+        );
 
         for (_dir, files) in collect_session_batch_dirs(&root) {
-            let loaded: Vec<ConversationLoad> = files
+            let loaded: Vec<LoadedConversation> = files
                 .into_par_iter()
-                .filter_map(|path| load_one(path, show_last, &cache, debug_level))
+                .filter_map(|path| load_one(path, options.show_last, &cache, debug_level))
                 .collect();
 
             // Persist this batch's fresh rows before sending it, from
             // references, so nothing here is cloned.
-            save_conversations(
-                ProviderKind::Codex,
-                show_last,
-                loaded.iter().filter_map(ConversationLoad::as_fresh),
-            );
+            cache.save_fresh(loaded.iter());
 
             let batch: Vec<Conversation> = loaded
                 .into_iter()
-                .map(ConversationLoad::into_conversation)
+                .map(|entry| entry.into_conversation(options.include_full_text))
                 .collect();
             if !batch.is_empty() {
                 let _ = tx.send(LoaderMessage::Batch(batch));
@@ -278,11 +246,7 @@ impl CodexProvider {
         // Every directory has consumed the cache entries for files it saw;
         // whatever remains points at files that no longer exist. Pruning once
         // at the end keeps the same semantics as the sync path.
-        let stale: Vec<PathBuf> = cache
-            .into_inner()
-            .map(|cache| cache.into_keys().collect())
-            .unwrap_or_default();
-        prune_conversations(ProviderKind::Codex, &stale);
+        cache.prune_unclaimed(&[]);
 
         let _ = tx.send(LoaderMessage::Done);
     }
@@ -294,9 +258,9 @@ impl CodexProvider {
 fn load_one(
     path: PathBuf,
     show_last: bool,
-    cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
+    cache: &ProviderCache,
     debug_level: Option<DebugLevel>,
-) -> Option<ConversationLoad> {
+) -> Option<LoadedConversation> {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -310,20 +274,23 @@ fn load_one(
 
     // Always consume the cache entry for a file we've seen: whatever remains in
     // the map afterwards is treated as deleted and pruned, and a file that
-    // merely failed to stat or parse isn't deleted.
-    let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
-    if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
-        && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
-    {
-        debug::debug(
-            debug_level,
-            &format!("Loaded Codex transcript {} from index", filename),
-        );
-        return Some(ConversationLoad::Cached(conversation));
+    // merely failed to stat or parse isn't deleted. `take_if_fresh` consumes on
+    // any attempt; when we have no fingerprint we still `claim` so the entry
+    // isn't mistaken for a vanished file.
+    if let Some(fingerprint) = fingerprint {
+        if let Some(conversation) = cache.take_if_fresh(&path, fingerprint) {
+            debug::debug(
+                debug_level,
+                &format!("Loaded Codex transcript {} from index", filename),
+            );
+            return Some(LoadedConversation::Cached(conversation));
+        }
+    } else {
+        cache.claim(&path);
     }
 
     match process_codex_transcript_file(path, show_last, modified, debug_level) {
-        Ok(Some(conversation)) => {
+        Ok(Some((conversation, previews))) => {
             debug::debug(
                 debug_level,
                 &format!(
@@ -332,8 +299,12 @@ fn load_one(
                 ),
             );
             match fingerprint {
-                Some(fingerprint) => Some(ConversationLoad::Fresh(conversation, fingerprint)),
-                None => Some(ConversationLoad::Cached(conversation)),
+                Some(fingerprint) => Some(LoadedConversation::Fresh {
+                    conversation,
+                    previews,
+                    fingerprint,
+                }),
+                None => Some(LoadedConversation::Cached(conversation)),
             }
         }
         Ok(None) => None,
@@ -356,25 +327,17 @@ impl super::Provider for CodexProvider {
         "Codex"
     }
 
-    fn load_conversations(
-        &self,
-        show_last: bool,
-        debug_level: Option<DebugLevel>,
-    ) -> Result<Vec<Conversation>> {
-        self.load_all_conversations(show_last, debug_level)
+    fn load_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
+        self.load_all_conversations(options)
     }
 
-    fn load_conversations_streaming(
-        &self,
-        show_last: bool,
-        debug_level: Option<DebugLevel>,
-    ) -> Receiver<LoaderMessage> {
+    fn load_conversations_streaming(&self, options: LoadOptions) -> Receiver<LoaderMessage> {
         let (tx, rx) = mpsc::channel();
         let codex_home = self.codex_home.clone();
 
         std::thread::spawn(move || {
             let provider = CodexProvider { codex_home };
-            provider.stream_all_conversations(&tx, show_last, debug_level);
+            provider.stream_all_conversations(&tx, options);
         });
 
         rx
@@ -451,13 +414,12 @@ fn process_codex_transcript_file(
     show_last: bool,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
+) -> Result<Option<(Conversation, PreviewPair)>> {
     // The startup listing only needs the conversation summary; scan mode skips
     // building the (discarded) LogEntry list entirely.
-    Ok(
-        parse_codex_transcript_file(&path, ParseMode::Scan, show_last, modified, debug_level)?
-            .conversation,
-    )
+    let parsed =
+        parse_codex_transcript_file(&path, ParseMode::Scan, show_last, modified, debug_level)?;
+    Ok(parsed.conversation.zip(parsed.previews))
 }
 
 fn parse_codex_transcript_file(
@@ -567,13 +529,17 @@ fn parse_codex_transcript_reader<R: BufRead>(
     finalize_timestamps(&mut state);
 
     let entries = std::mem::take(&mut state.entries);
-    let conversation = match mode {
-        ParseMode::Scan => build_codex_conversation(path, show_last, modified, state),
+    let (conversation, previews) = match mode {
+        ParseMode::Scan => match build_codex_conversation(path, show_last, modified, state) {
+            Some((conversation, previews)) => (Some(conversation), Some(previews)),
+            None => (None, None),
+        },
         // The viewer path builds no conversation; skip preview/full-text work.
-        ParseMode::Entries => None,
+        ParseMode::Entries => (None, None),
     };
     Ok(ParsedCodexTranscript {
         conversation,
+        previews,
         entries,
     })
 }
@@ -1010,29 +976,36 @@ fn build_codex_conversation(
     show_last: bool,
     modified: Option<SystemTime>,
     state: CodexParseState,
-) -> Option<Conversation> {
+) -> Option<(Conversation, PreviewPair)> {
     if state.all_parts.is_empty() {
         return None;
     }
 
-    let preview = if show_last {
-        state
-            .all_parts
-            .iter()
-            .rev()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ... ")
-    } else {
-        state
-            .all_parts
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ... ")
+    // Compute both preview directions in one pass so a cached row can serve
+    // either listing mode without re-parsing; the active mode's preview is
+    // selected below from the already-normalized pair.
+    let previews = PreviewPair {
+        first: normalize_whitespace(
+            &state
+                .all_parts
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ... "),
+        ),
+        last: normalize_whitespace(
+            &state
+                .all_parts
+                .iter()
+                .rev()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ... "),
+        ),
     };
+    let preview = previews.select(show_last);
 
     let timestamp = state
         .last_timestamp
@@ -1057,23 +1030,26 @@ fn build_codex_conversation(
         .id
         .unwrap_or_else(|| session_id_from_path(&path).unwrap_or_else(|| "unknown".to_string()));
 
-    Some(Conversation {
-        path,
-        provider: ProviderKind::Codex,
-        id,
-        timestamp,
-        preview: normalize_whitespace(&preview),
-        full_text: normalize_whitespace(&state.all_parts.join(" ")),
-        project_name,
-        project_path: project_path.clone(),
-        cwd: project_path,
-        message_count: state.message_count,
-        parse_errors: state.parse_errors,
-        summary: None,
-        model: state.model,
-        total_tokens: state.total_tokens,
-        duration_minutes,
-    })
+    Some((
+        Conversation {
+            path,
+            provider: ProviderKind::Codex,
+            id,
+            timestamp,
+            preview,
+            full_text: normalize_whitespace(&state.all_parts.join(" ")),
+            project_name,
+            project_path: project_path.clone(),
+            cwd: project_path,
+            message_count: state.message_count,
+            parse_errors: state.parse_errors,
+            summary: None,
+            model: state.model,
+            total_tokens: state.total_tokens,
+            duration_minutes,
+        },
+        previews,
+    ))
 }
 
 fn collect_session_files(root: &Path) -> Vec<PathBuf> {
@@ -1352,6 +1328,7 @@ mod tests {
         let scanned = scan(content, show_last);
         ParsedCodexTranscript {
             conversation: scanned.conversation,
+            previews: scanned.previews,
             entries: entries(content),
         }
     }
@@ -1462,6 +1439,13 @@ mod tests {
         let scanned_empty = scan(&with_empty, false).conversation.unwrap();
 
         assert_same_summary(&scanned_giant, &scanned_empty);
+
+        // A single scan computes both preview directions so a cached row can
+        // serve either listing mode; the giant tool output taints neither.
+        let previews = scan(&with_giant, false).previews.unwrap();
+        assert_eq!(previews.first, "Build Codex support ... Done");
+        assert_eq!(previews.last, "Done ... Build Codex support");
+        assert_eq!(previews.select(false), scanned_giant.preview);
 
         // Concrete expected values, so the golden compare can't pass by both
         // sides being wrong the same way.

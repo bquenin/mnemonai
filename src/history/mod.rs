@@ -143,6 +143,28 @@ pub struct Conversation {
     pub duration_minutes: Option<u64>,
 }
 
+/// Both preview strings for a conversation: the first-messages preview and the
+/// last-messages preview. Parsers compute both in a single pass so the cache can
+/// store them side by side and reconstruct either one — for `--first` or
+/// `--last` — without re-parsing the source file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreviewPair {
+    pub first: String,
+    pub last: String,
+}
+
+impl PreviewPair {
+    /// The preview for the requested mode: the last-messages preview when
+    /// `show_last`, otherwise the first-messages preview.
+    pub fn select(&self, show_last: bool) -> String {
+        if show_last {
+            self.last.clone()
+        } else {
+            self.first.clone()
+        }
+    }
+}
+
 pub struct Project {
     pub name: String,         // directory name (encoded)
     pub display_name: String, // heuristic decoded path

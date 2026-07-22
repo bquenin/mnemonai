@@ -303,7 +303,9 @@ impl App {
         let mut filtered = Vec::new();
         let mut selected = None;
 
-        if let Ok(Some(mut conv)) = process_conversation_file(path.clone(), false, modified, None) {
+        if let Ok(Some((mut conv, _))) =
+            process_conversation_file(path.clone(), false, modified, None)
+        {
             // Set project_name the same way as the loader does
             let project_path = conv.cwd.clone().unwrap_or_else(|| path.clone());
             conv.project_name = Some(format_short_name_from_path(&project_path));
@@ -2181,16 +2183,14 @@ mod tests {
 
         fn load_conversations(
             &self,
-            _show_last: bool,
-            _debug: Option<crate::cli::DebugLevel>,
+            _options: crate::providers::LoadOptions,
         ) -> Result<Vec<Conversation>> {
             Ok(Vec::new())
         }
 
         fn load_conversations_streaming(
             &self,
-            _show_last: bool,
-            _debug: Option<crate::cli::DebugLevel>,
+            _options: crate::providers::LoadOptions,
         ) -> Receiver<LoaderMessage> {
             let (_tx, rx) = std::sync::mpsc::channel();
             rx

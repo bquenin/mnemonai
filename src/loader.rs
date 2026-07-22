@@ -1,10 +1,10 @@
 //! Shared conversation-loading helpers used by both the interactive TUI and the
 //! headless commands so they apply identical local and provider filtering.
 
-use crate::cli::{DebugLevel, ProviderFilter};
+use crate::cli::ProviderFilter;
 use crate::error::{AppError, Result};
 use crate::history::{Conversation, LoaderMessage, ProviderKind};
-use crate::providers::Provider;
+use crate::providers::{LoadOptions, Provider};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -23,8 +23,7 @@ pub fn provider_filter_matches(filter: Option<ProviderFilter>, kind: &ProviderKi
 /// by timestamp and assign display indexes.
 pub fn load_local(
     providers: &[Box<dyn Provider>],
-    show_last: bool,
-    debug: Option<DebugLevel>,
+    options: LoadOptions,
     provider_filter: Option<ProviderFilter>,
 ) -> Result<Vec<Conversation>> {
     let current_dir = std::env::current_dir().map_err(|err| {
@@ -35,7 +34,7 @@ pub fn load_local(
     })?;
 
     let roots = filter_path_roots(&current_dir)?;
-    load_scoped(providers, show_last, debug, provider_filter, &roots)
+    load_scoped(providers, options, provider_filter, &roots)
 }
 
 /// Load conversations scoped to explicit root candidates.
@@ -46,8 +45,7 @@ pub fn load_local(
 /// the previous sequential implementation.
 fn load_scoped(
     providers: &[Box<dyn Provider>],
-    show_last: bool,
-    debug: Option<DebugLevel>,
+    options: LoadOptions,
     provider_filter: Option<ProviderFilter>,
     roots: &[PathBuf],
 ) -> Result<Vec<Conversation>> {
@@ -55,7 +53,7 @@ fn load_scoped(
         let handles: Vec<_> = providers
             .iter()
             .filter(|provider| provider_filter_matches(provider_filter, &provider.kind()))
-            .map(|provider| scope.spawn(move || provider.load_conversations(show_last, debug)))
+            .map(|provider| scope.spawn(move || provider.load_conversations(options)))
             .collect();
         handles
             .into_iter()
@@ -187,21 +185,13 @@ mod tests {
             "stub"
         }
 
-        fn load_conversations(
-            &self,
-            _show_last: bool,
-            _debug: Option<DebugLevel>,
-        ) -> Result<Vec<Conversation>> {
+        fn load_conversations(&self, _options: LoadOptions) -> Result<Vec<Conversation>> {
             self.conversations
                 .clone()
                 .ok_or_else(|| AppError::CommandError("stub failure".to_string()))
         }
 
-        fn load_conversations_streaming(
-            &self,
-            _show_last: bool,
-            _debug: Option<DebugLevel>,
-        ) -> Receiver<LoaderMessage> {
+        fn load_conversations_streaming(&self, _options: LoadOptions) -> Receiver<LoaderMessage> {
             let (_tx, rx) = mpsc::channel();
             rx
         }
@@ -305,15 +295,28 @@ mod tests {
 
         // Failing providers are skipped, in-scope results keep provider order,
         // and out-of-scope conversations are filtered.
-        let conversations = load_scoped(&providers, false, None, None, &roots).unwrap();
+        let conversations = load_scoped(
+            &providers,
+            LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: false,
+            },
+            None,
+            &roots,
+        )
+        .unwrap();
         let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["codex-1", "cursor-1"]);
 
         // The provider filter still restricts which providers load at all.
         let conversations = load_scoped(
             &providers,
-            false,
-            None,
+            LoadOptions {
+                show_last: false,
+                debug: None,
+                include_full_text: false,
+            },
             Some(ProviderFilter::Cursor),
             &roots,
         )

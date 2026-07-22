@@ -9,15 +9,12 @@ use super::path::{
 };
 use super::{Conversation, LoaderMessage, Project};
 use crate::cli::DebugLevel;
-use crate::conversation_index::{
-    CachedFileConversation, SourceFingerprint, fingerprint_from_metadata, load_provider_cache,
-    prune_conversations, save_conversations,
-};
+use crate::conversation_index::{LoadedConversation, ProviderCache, fingerprint_from_metadata};
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::ProviderKind;
+use crate::providers::LoadOptions;
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -25,25 +22,36 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::SystemTime;
 
-enum ConversationLoad {
-    Cached(Conversation),
-    Fresh(Conversation, SourceFingerprint),
-}
-
-impl ConversationLoad {
-    fn into_conversation(self) -> Conversation {
-        match self {
-            Self::Cached(conversation) | Self::Fresh(conversation, _) => conversation,
-        }
-    }
+/// Turn one project's loaded entries into finished conversations, injecting the
+/// project name/path exactly as before: prefer the cwd parsed from the JSONL,
+/// falling back to the decoded project directory name. Consumes `loaded`,
+/// dropping full text when the caller asked for the metadata profile.
+fn finish_project(
+    project_name: &str,
+    loaded: Vec<LoadedConversation>,
+    include_full_text: bool,
+) -> Vec<Conversation> {
+    let fallback_path = decode_project_dir_name_to_path(project_name);
+    let mut conversations: Vec<Conversation> = loaded
+        .into_iter()
+        .map(|entry| {
+            let mut conv = entry.into_conversation(include_full_text);
+            let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
+            conv.project_name = Some(format_short_name_from_path(&project_path));
+            conv.project_path = Some(project_path);
+            conv
+        })
+        .collect();
+    conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
+    conversations
 }
 
 /// Load conversations from ALL projects globally
 pub fn load_all_conversations(
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
+    options: LoadOptions,
     exclude_paths: &[String],
 ) -> Result<Vec<Conversation>> {
+    let debug_level = options.debug;
     let root = super::get_claude_projects_root()?;
     let projects = list_projects(&root, exclude_paths)?;
 
@@ -52,41 +60,29 @@ pub fn load_all_conversations(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
-    let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
-    let fresh_acc: Mutex<Vec<(Conversation, SourceFingerprint)>> = Mutex::new(Vec::new());
+    let cache = ProviderCache::load(
+        ProviderKind::Claude,
+        options.show_last,
+        options.include_full_text,
+    );
     let failed_projects: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-    // Load conversations from all projects in parallel
-    let mut all_conversations: Vec<Conversation> = projects
+    // Load conversations from all projects in parallel, keeping each project's
+    // entries alive (rather than cloning the fresh ones) so they can be saved
+    // from references in a single transaction below.
+    let per_project: Vec<(String, Vec<LoadedConversation>)> = projects
         .par_iter()
-        .flat_map(|project| {
+        .filter_map(|project| {
             let project_dir = root.join(&project.name);
-            match load_conversations_with_cache(&project_dir, show_last, debug_level, &cache) {
-                Ok((mut convs, fresh)) => {
-                    if !fresh.is_empty() {
-                        fresh_acc.lock().unwrap().extend(fresh);
-                    }
-
-                    // Fallback path for old JSONL files without cwd field
-                    let fallback_path = decode_project_dir_name_to_path(&project.name);
-
-                    // Inject project info into each conversation
-                    for conv in &mut convs {
-                        // Prefer the cwd extracted from the JSONL file (accurate), fall back to decoded path
-                        let project_path =
-                            conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                        conv.project_name = Some(format_short_name_from_path(&project_path));
-                        conv.project_path = Some(project_path);
-                    }
-                    convs
-                }
+            match load_project_loaded(&project_dir, &cache, options.show_last, debug_level) {
+                Ok(loaded) => Some((project.name.clone(), loaded)),
                 Err(e) => {
                     debug::warn(
                         debug_level,
                         &format!("Failed to load project {}: {}", project.display_name, e),
                     );
                     failed_projects.lock().unwrap().push(project_dir);
-                    Vec::new()
+                    None
                 }
             }
         })
@@ -94,26 +90,18 @@ pub fn load_all_conversations(
 
     // One write transaction for the whole run, instead of one per project
     // racing each other for the SQLite write lock.
-    let fresh = fresh_acc.into_inner().unwrap_or_default();
-    save_conversations(
-        ProviderKind::Claude,
-        show_last,
-        fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
-    );
+    cache.save_fresh(per_project.iter().flat_map(|(_, loaded)| loaded.iter()));
 
     // Entries no project claimed belong to files that no longer exist — except
     // under a project that failed to load, where we simply don't know.
     let failed = failed_projects.into_inner().unwrap_or_default();
-    let stale: Vec<PathBuf> = cache
-        .into_inner()
-        .map(|cache| {
-            cache
-                .into_keys()
-                .filter(|path| !failed.iter().any(|dir| path.starts_with(dir)))
-                .collect()
-        })
-        .unwrap_or_default();
-    prune_conversations(ProviderKind::Claude, &stale);
+    cache.prune_unclaimed(&failed);
+
+    // Consume into finished conversations with per-project name/path injection.
+    let mut all_conversations: Vec<Conversation> = per_project
+        .into_iter()
+        .flat_map(|(name, loaded)| finish_project(&name, loaded, options.include_full_text))
+        .collect();
 
     // Global sort by timestamp (newest first)
     all_conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
@@ -132,14 +120,13 @@ pub fn load_all_conversations(
 /// Start loading all conversations in the background
 /// Returns a receiver that will receive LoaderMessage updates
 pub fn load_all_conversations_streaming(
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
+    options: LoadOptions,
     exclude_paths: Vec<String>,
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        load_all_streaming_inner(tx, show_last, debug_level, &exclude_paths);
+        load_all_streaming_inner(tx, options, &exclude_paths);
     });
 
     rx
@@ -147,10 +134,10 @@ pub fn load_all_conversations_streaming(
 
 fn load_all_streaming_inner(
     tx: Sender<LoaderMessage>,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
+    options: LoadOptions,
     exclude_paths: &[String],
 ) {
+    let debug_level = options.debug;
     // First, validate that the projects root exists (fatal if not)
     let root = match super::get_claude_projects_root() {
         Ok(r) => r,
@@ -181,31 +168,30 @@ fn load_all_streaming_inner(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
-    let cache = Mutex::new(load_provider_cache(ProviderKind::Claude, show_last));
-    let fresh_acc: Mutex<Vec<(Conversation, SourceFingerprint)>> = Mutex::new(Vec::new());
+    let cache = ProviderCache::load(
+        ProviderKind::Claude,
+        options.show_last,
+        options.include_full_text,
+    );
     let failed_projects: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-    // Process projects in parallel and send batches as they complete
+    // Process projects in parallel and send batches as they complete. Each
+    // project persists its own fresh rows from references before its entries are
+    // consumed into the batch; on warm starts there are none, so this opens no
+    // transaction. Pruning still happens exactly once, after enumeration.
     projects.par_iter().for_each(|project| {
         let project_dir = root.join(&project.name);
 
-        match load_conversations_with_cache(&project_dir, show_last, debug_level, &cache) {
-            Ok((mut convs, fresh)) => {
-                if !fresh.is_empty() {
-                    fresh_acc.lock().unwrap().extend(fresh);
+        match load_project_loaded(&project_dir, &cache, options.show_last, debug_level) {
+            Ok(loaded) => {
+                cache.save_fresh(loaded.iter());
+                if loaded.is_empty() {
+                    return;
                 }
+                let convs = finish_project(&project.name, loaded, options.include_full_text);
                 if convs.is_empty() {
                     return;
                 }
-
-                let fallback_path = decode_project_dir_name_to_path(&project.name);
-
-                for conv in &mut convs {
-                    let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                    conv.project_name = Some(format_short_name_from_path(&project_path));
-                    conv.project_path = Some(project_path);
-                }
-
                 // Send batch, ignore error if receiver dropped
                 let _ = tx.send(LoaderMessage::Batch(convs));
             }
@@ -220,28 +206,10 @@ fn load_all_streaming_inner(
         }
     });
 
-    // All batches are on the channel; persist newly parsed conversations in a
-    // single write transaction so the next start can skip re-parsing them.
-    let fresh = fresh_acc.into_inner().unwrap_or_default();
-    save_conversations(
-        ProviderKind::Claude,
-        show_last,
-        fresh.iter().map(|(conv, fingerprint)| (conv, *fingerprint)),
-    );
-
     // Entries no project claimed belong to files that no longer exist — except
     // under a project that failed to load, where we simply don't know.
     let failed = failed_projects.into_inner().unwrap_or_default();
-    let stale: Vec<PathBuf> = cache
-        .into_inner()
-        .map(|cache| {
-            cache
-                .into_keys()
-                .filter(|path| !failed.iter().any(|dir| path.starts_with(dir)))
-                .collect()
-        })
-        .unwrap_or_default();
-    prune_conversations(ProviderKind::Claude, &stale);
+    cache.prune_unclaimed(&failed);
 
     let _ = tx.send(LoaderMessage::Done);
 }
@@ -303,19 +271,18 @@ fn list_projects(root: &Path, exclude_names: &[String]) -> Result<Vec<Project>> 
     Ok(projects)
 }
 
-/// Conversations loaded from one project, paired with the freshly parsed
-/// (cache-miss) ones the caller should persist in a single batch.
-type ProjectLoad = (Vec<Conversation>, Vec<(Conversation, SourceFingerprint)>);
-
-/// Load one project directory. Returns the conversations plus clones of the
-/// freshly parsed ones (cache misses) so the caller can persist them in a
-/// single batch — per-project writes would race for the SQLite write lock.
-fn load_conversations_with_cache(
+/// Load one project directory into cache-resolved entries, without injecting
+/// project info or persisting. The shared [`ProviderCache`] consumes each file's
+/// entry on the attempt (cache hit or miss) and claims files it cannot
+/// fingerprint, so leftover map entries are exactly the deleted files. The
+/// caller persists the fresh entries from references and finishes the
+/// conversations.
+fn load_project_loaded(
     projects_dir: &Path,
+    cache: &ProviderCache,
     show_last: bool,
     debug_level: Option<DebugLevel>,
-    cache: &Mutex<HashMap<PathBuf, CachedFileConversation>>,
-) -> Result<ProjectLoad> {
+) -> Result<Vec<LoadedConversation>> {
     // Find all JSONL files and capture metadata in one pass
     let mut files_with_meta = Vec::new();
     let mut skipped_agent_files = 0;
@@ -357,7 +324,7 @@ fn load_conversations_with_cache(
     files_with_meta.reverse();
 
     // Process each file (potentially in parallel)
-    let loaded: Vec<ConversationLoad> = files_with_meta
+    let loaded: Vec<LoadedConversation> = files_with_meta
         .into_par_iter()
         .filter_map(|(path, modified, fingerprint)| {
             let filename = path
@@ -366,22 +333,26 @@ fn load_conversations_with_cache(
                 .unwrap_or("unknown")
                 .to_owned();
 
-            // Always consume the cache entry for a file we've seen: whatever
-            // remains in the map afterwards is treated as deleted and pruned,
-            // and a file that merely failed to stat or parse isn't deleted.
-            let cached_entry = cache.lock().ok().and_then(|mut cache| cache.remove(&path));
-            if let (Some(fingerprint), Some(cached)) = (fingerprint, cached_entry)
-                && let Some(conversation) = cached.into_conversation_if_fresh(fingerprint)
-            {
+            // Consume the cache entry on every attempt so leftovers are exactly
+            // the deleted files; a file that failed to stat is claimed too, so
+            // it is never mistaken for a deletion.
+            let cached = match fingerprint {
+                Some(fingerprint) => cache.take_if_fresh(&path, fingerprint),
+                None => {
+                    cache.claim(&path);
+                    None
+                }
+            };
+            if let Some(conversation) = cached {
                 debug::debug(
                     debug_level,
                     &format!("Loaded {} from conversation index", filename),
                 );
-                return Some(ConversationLoad::Cached(conversation));
+                return Some(LoadedConversation::Cached(conversation));
             }
 
             match process_conversation_file(path, show_last, modified, debug_level) {
-                Ok(Some(conversation)) => {
+                Ok(Some((conversation, previews))) => {
                     // Only build this message (it embeds the whole preview) when
                     // debug logging is actually enabled.
                     if debug_level.is_some() {
@@ -391,10 +362,12 @@ fn load_conversations_with_cache(
                         );
                     }
                     match fingerprint {
-                        Some(fingerprint) => {
-                            Some(ConversationLoad::Fresh(conversation, fingerprint))
-                        }
-                        None => Some(ConversationLoad::Cached(conversation)),
+                        Some(fingerprint) => Some(LoadedConversation::Fresh {
+                            conversation,
+                            previews,
+                            fingerprint,
+                        }),
+                        None => Some(LoadedConversation::Cached(conversation)),
                     }
                 }
                 Ok(None) => None,
@@ -409,44 +382,10 @@ fn load_conversations_with_cache(
         })
         .collect();
 
-    // Clone the freshly parsed conversations for the caller to persist later.
-    // On warm starts nearly everything is cached, so this clones little or
-    // nothing; only a cold start pays for the copies.
-    let fresh: Vec<(Conversation, SourceFingerprint)> = loaded
-        .iter()
-        .filter_map(|loaded| match loaded {
-            ConversationLoad::Fresh(conversation, fingerprint) => {
-                Some((conversation.clone(), *fingerprint))
-            }
-            ConversationLoad::Cached(_) => None,
-        })
-        .collect();
-
-    let mut conversations: Vec<Conversation> = loaded
-        .into_iter()
-        .map(ConversationLoad::into_conversation)
-        .collect();
-
-    // Ensure deterministic ordering after parallel processing
-    conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
-
-    // Inject project info into each conversation
-    let fallback_path = projects_dir
-        .file_name()
-        .map(|n| decode_project_dir_name_to_path(&n.to_string_lossy()))
-        .unwrap_or_default();
-
-    for conv in conversations.iter_mut() {
-        // Prefer the cwd extracted from the JSONL file, fall back to decoded path
-        let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-        conv.project_name = Some(format_short_name_from_path(&project_path));
-        conv.project_path = Some(project_path);
-    }
-
     debug::info(
         debug_level,
-        &format!("Total conversations loaded: {}", conversations.len()),
+        &format!("Total conversations loaded: {}", loaded.len()),
     );
 
-    Ok((conversations, fresh))
+    Ok(loaded)
 }
