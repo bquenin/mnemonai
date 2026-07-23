@@ -9,7 +9,7 @@ use crate::history::{
 };
 use crate::providers::{LoadOptions, Provider};
 use crate::tui::search;
-use crate::tui::ui::extract_match_context;
+use crate::tui::ui::{extract_match_context, extract_span_context};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
@@ -395,6 +395,8 @@ fn rank_and_build(
     }
 
     let query = command.words.join(" ");
+    let query_lower = search::normalize_for_search(&query);
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
     let snippet_count = command.snippets.min(SNIPPET_MAX);
 
     // `precompute_search_text` moves each conversation's body into `text_lower`,
@@ -417,7 +419,7 @@ fn rank_and_build(
         let conversation = &conversations[index];
         let text_lower = text_lowers[index];
         let offsets = search::match_offsets(text_lower, &query);
-        let snippets = build_snippets(text_lower, &offsets, snippet_count);
+        let snippets = build_snippets(text_lower, &offsets, &query_words, snippet_count);
         results.push(SearchResult {
             provider: conversation.provider.key(),
             id: conversation.id.clone(),
@@ -435,23 +437,38 @@ fn rank_and_build(
     results
 }
 
-/// Slice up to `count` ~240-char snippet windows from the lowercased corpus,
-/// centered on the earliest match offsets. Offsets closer than one window width
-/// to the previous snippet are skipped so windows don't overlap.
-fn build_snippets(text_lower: &str, offsets: &[(usize, usize)], count: usize) -> Vec<String> {
+/// Slice up to `count` ~240-char snippet windows from the lowercased corpus.
+/// Multi-term searches lead with the tightest coherent all-term span; remaining
+/// windows use the earliest non-overlapping match offsets.
+fn build_snippets(
+    text_lower: &str,
+    offsets: &[(usize, usize)],
+    query_words: &[&str],
+    count: usize,
+) -> Vec<String> {
     if count == 0 {
         return Vec::new();
     }
 
     let mut snippets = Vec::new();
-    let mut last_pos: Option<usize> = None;
+    let mut covered_spans = Vec::new();
+    if let Some((span_start, span_end)) = search::best_query_span(text_lower, query_words) {
+        snippets.push(extract_span_context(
+            text_lower,
+            span_start,
+            span_end,
+            SNIPPET_WIDTH,
+        ));
+        covered_spans.push((span_start, span_end));
+    }
+
     for &(pos, char_len) in offsets {
         if snippets.len() >= count {
             break;
         }
-        if let Some(previous) = last_pos
-            && pos < previous + SNIPPET_WIDTH
-        {
+        if covered_spans.iter().any(|&(start, end)| {
+            pos.saturating_add(SNIPPET_WIDTH) >= start && pos <= end.saturating_add(SNIPPET_WIDTH)
+        }) {
             continue;
         }
         snippets.push(extract_match_context(
@@ -460,7 +477,7 @@ fn build_snippets(text_lower: &str, offsets: &[(usize, usize)], count: usize) ->
             char_len,
             SNIPPET_WIDTH,
         ));
-        last_pos = Some(pos);
+        covered_spans.push((pos, pos));
     }
     snippets
 }
@@ -2118,6 +2135,25 @@ mod tests {
             3,
             "only three distinct windows exist"
         );
+    }
+
+    #[test]
+    fn multi_term_search_leads_with_representative_span() {
+        let now = Local::now();
+        let text = format!(
+            "ticket introduction why three ns entries? {} investigating legacy cleanup",
+            "cluster details ".repeat(20)
+        );
+        let convs = vec![conv_text("multi", ProviderKind::CursorAgent, &text, now)];
+        let mut command = search_command(&["legacy", "ns"]);
+        command.snippets = 1;
+
+        let results = rank_and_build(convs, &command, now);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].snippets.len(), 1);
+        assert!(results[0].snippets[0].contains("legacy"));
+        assert!(results[0].snippets[0].contains("ns"));
     }
 
     #[test]

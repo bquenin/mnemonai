@@ -3,7 +3,7 @@ use crate::tui::app::{
     App, AppMode, DialogMode, LineStyle, LoadingState, RenderedLine, ViewHeader, ViewSearchMode,
     ViewState,
 };
-use crate::tui::search::is_word_separator;
+use crate::tui::search::{best_query_span, is_word_separator};
 use chrono::{DateTime, Local};
 use chrono_humanize::{Accuracy, HumanTime, Tense};
 use ratatui::layout::Position;
@@ -1372,10 +1372,17 @@ pub(super) fn compute_context_snippet(
     // Lowercase the preview once (not per word) so its word-prefix matches are
     // counted on the same footing as the already-lowercased corpus.
     let preview_lower = truncated_preview.to_lowercase();
-    let (match_pos, match_char_len) = find_hidden_match(text_lower, &preview_lower, query_words)?;
-
     let context_width = width.saturating_sub(4); // Account for indicator
-    let context_text = extract_match_context(text_lower, match_pos, match_char_len, context_width);
+    let context_text = if query_words.len() > 1
+        && !preview_contains_all_terms(&preview_lower, query_words)
+        && let Some((span_start, span_end)) = best_query_span(text_lower, query_words)
+    {
+        extract_span_context(text_lower, span_start, span_end, context_width)
+    } else {
+        let (match_pos, match_char_len) =
+            find_hidden_match(text_lower, &preview_lower, query_words)?;
+        extract_match_context(text_lower, match_pos, match_char_len, context_width)
+    };
 
     // Truncate context if still too long.
     let truncated = if context_text.chars().count() > context_width {
@@ -1388,6 +1395,81 @@ pub(super) fn compute_context_snippet(
         context_text
     };
     Some(truncated)
+}
+
+fn preview_contains_all_terms(preview_lower: &str, query_words: &[&str]) -> bool {
+    query_words.iter().all(|query| {
+        preview_lower
+            .split_whitespace()
+            .any(|word| word.starts_with(query))
+    })
+}
+
+fn retreat_chars(text: &str, offset: usize, count: usize) -> usize {
+    if count == 0 {
+        return offset.min(text.len());
+    }
+    text[..offset.min(text.len())]
+        .char_indices()
+        .rev()
+        .nth(count - 1)
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn advance_chars(text: &str, offset: usize, count: usize) -> usize {
+    text[offset.min(text.len())..]
+        .char_indices()
+        .nth(count)
+        .map(|(index, _)| offset + index)
+        .unwrap_or(text.len())
+}
+
+/// Extract one representative line for a multi-term match. When the tightest
+/// all-term span fits, show it with surrounding context. When it is wider than
+/// the available line, show compact context around both ends separated by an
+/// inner ellipsis so the user can see that every term contributed.
+pub(crate) fn extract_span_context(
+    full_text: &str,
+    span_start: usize,
+    span_end: usize,
+    max_width: usize,
+) -> String {
+    let span_start = span_start.min(full_text.len());
+    let span_end = span_end.min(full_text.len()).max(span_start);
+    let span_char_len = full_text[span_start..span_end].chars().count();
+    if span_char_len <= max_width.saturating_sub(4) {
+        return extract_match_context(full_text, span_start, span_char_len, max_width);
+    }
+
+    let inner_ellipsis = " … ";
+    let content_budget = max_width
+        .saturating_sub(inner_ellipsis.chars().count())
+        .saturating_sub(2);
+    let left_budget = content_budget / 2;
+    let right_budget = content_budget.saturating_sub(left_budget);
+
+    let left_start = retreat_chars(full_text, span_start, left_budget / 3);
+    let left_end = advance_chars(full_text, left_start, left_budget);
+    let right_end = advance_chars(full_text, span_end, right_budget / 3);
+    let right_start = retreat_chars(full_text, right_end, right_budget);
+
+    let left = sanitize_preview(&full_text[left_start..left_end.min(full_text.len())]);
+    let right = sanitize_preview(&full_text[right_start..right_end.min(full_text.len())]);
+    let prefix = if left_start > 0 { "…" } else { "" };
+    let suffix = if right_end < full_text.len() {
+        "…"
+    } else {
+        ""
+    };
+    let combined = format!("{prefix}{left}{inner_ellipsis}{right}{suffix}");
+
+    if combined.chars().count() > max_width {
+        let head: String = combined.chars().take(max_width.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        combined
+    }
 }
 
 /// Count words in an already-lowercased `text` whose start matches any of the
@@ -1752,12 +1834,16 @@ mod tests {
         }
     }
 
-    /// The rendered context line must equal the previous implementation's,
-    /// case-insensitively (the corpus is now lowercased before slicing).
+    /// Single-term context remains byte-for-byte compatible with the previous
+    /// implementation. Multi-term queries intentionally use a representative
+    /// all-term span now and are covered separately below.
     #[test]
-    fn context_snippet_matches_old_implementation_case_insensitively() {
+    fn single_term_context_matches_old_implementation_case_insensitively() {
         let width = 60usize;
         for (full, preview, query_words) in matcher_fixtures() {
+            if query_words.len() != 1 {
+                continue;
+            }
             // Old path: find on original text, extract from original text.
             let old = old_find_hidden_match(full, preview, &query_words).map(|(pos, len)| {
                 let context_width = width.saturating_sub(4);
@@ -1776,5 +1862,28 @@ mod tests {
                 "context diverged for full={full:?} preview={preview:?} query={query_words:?}"
             );
         }
+    }
+
+    #[test]
+    fn multi_term_context_shows_both_ends_of_best_span() {
+        let full = format!(
+            "ticket introduction why three ns entries? {} investigating legacy cleanup",
+            "cluster details ".repeat(12)
+        )
+        .to_lowercase();
+
+        let snippet =
+            compute_context_snippet(&full, "ticket introduction", &["legacy", "ns"], 80).unwrap();
+
+        assert!(
+            snippet.contains("ns"),
+            "short term should be visible: {snippet}"
+        );
+        assert!(
+            snippet.contains("legacy"),
+            "long term should be visible: {snippet}"
+        );
+        assert!(snippet.contains(" … "), "wide spans use an inner ellipsis");
+        assert!(snippet.chars().count() <= 76);
     }
 }
