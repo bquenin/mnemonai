@@ -240,11 +240,14 @@ pub struct ListCommand {
 /// with the same ranking as the interactive TUI type-ahead: every word must
 /// appear (AND), matching is case-insensitive, and each word matches as a
 /// substring anywhere in the text, never whole-word — so `search job flow` also
-/// matches "jobs" and "workflows". Results are ranked by a blend of match
-/// density, an early-conversation "topic window" boost, and recency.
+/// matches "jobs" and "workflows". Results use saturated, balanced per-term
+/// scoring so one noisy keyword cannot dominate, with additional boosts for
+/// nearby terms, early-conversation matches, density, and recency. Standalone
+/// occurrences of one- and two-character terms rank above embedded substrings.
 ///
-/// Snippets are ~240-character windows centered on the earliest matches, sliced
-/// from the lowercased conversation text, so snippet text is lowercased.
+/// Snippets are ~240-character windows sliced from the lowercased conversation
+/// text. Multi-term searches lead with a nearby span containing every term when
+/// available; single-term searches retain earliest-match ordering.
 ///
 /// Output defaults to a JSON array (like `list`); pass --jsonl for one object
 /// per line. Scope defaults to global; pass --local or --cwd PATH to restrict,

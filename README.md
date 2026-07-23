@@ -87,15 +87,18 @@ preview-only `list` scan misses. The positional words are joined with single
 spaces into one query and matched with the same ranking as the interactive TUI
 type-ahead: every word must appear (AND), matching is case-insensitive, and each
 word matches as a substring anywhere in the text, never whole-word — so
-`search job flow` also matches "jobs" and "workflows". It accepts `--provider`,
-`--local` / `--cwd`, and
+`search job flow` also matches "jobs" and "workflows". Ranking saturates and
+balances each term's frequency, favors standalone occurrences of one- and
+two-character terms, and boosts conversations where all terms occur nearby;
+this prevents one noisy substring from dominating a multi-term query. It
+accepts `--provider`, `--local` / `--cwd`, and
 `--since` / `--after` / `--before` with the same meaning as `list`, plus
 `--limit <n>` (default 10), `--snippets <0..=5>` (default 2), and a repeatable
 `--exclude-session <id>` that drops specific conversations (handy for excluding
 the live session). Output is a JSON array by default; pass `--jsonl` for one
-object per line. Snippets are ~240-character windows centered on the earliest
-matches, sliced from the lowercased conversation text, so snippet text is
-lowercased.
+object per line. Snippets are ~240-character windows sliced from the lowercased
+conversation text. Multi-term searches lead with a nearby span containing every
+term when available; single-term searches retain earliest-match ordering.
 
 `show` additionally accepts a repeatable `--grep <pattern>` (case-insensitive
 substring, OR across patterns; matches a message's text, thinking, and

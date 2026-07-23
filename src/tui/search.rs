@@ -9,6 +9,20 @@ const TOPIC_WINDOW_SIZE: usize = 2000;
 /// How much extra weight topic-window matches get over body matches.
 const TOPIC_WEIGHT: f64 = 3.0;
 
+/// Very short substring terms are especially prone to accidental matches
+/// inside unrelated words (`ns` in `instructions`, for example). Keep those
+/// matches eligible for incremental type-ahead, but cap their ranking weight
+/// unless the term also occurs as a standalone token.
+const SHORT_TERM_MAX_CHARS: usize = 2;
+const SHORT_TERM_EMBEDDED_HIT_CAP: f64 = 1.0;
+
+/// Conversations whose distinct query terms occur near one another receive a
+/// bounded ranking boost. The span is byte-based because the search corpus and
+/// match offsets are byte-indexed; all slicing still snaps to UTF-8 boundaries.
+const PROXIMITY_MAX_SPAN: usize = 512;
+const PROXIMITY_MAX_BOOST: f64 = 0.5;
+const PROXIMITY_MAX_ANCHORS: usize = 256;
+
 /// Precomputed search data for a conversation
 pub struct SearchableConversation {
     /// Lowercased full text for searching. This is the only in-memory copy of
@@ -48,6 +62,32 @@ struct QueryTerm<'a> {
     /// True if this term was followed by whitespace in the query,
     /// meaning the user finished typing it and it should match as a whole word.
     completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TermStats {
+    topic_hits: usize,
+    body_hits: usize,
+    exact_topic_hits: usize,
+    exact_body_hits: usize,
+}
+
+impl TermStats {
+    fn total_hits(self) -> usize {
+        self.topic_hits + self.body_hits
+    }
+
+    fn exact_hits(self) -> usize {
+        self.exact_topic_hits + self.exact_body_hits
+    }
+
+    fn weighted_hits(self) -> f64 {
+        (self.topic_hits as f64) * TOPIC_WEIGHT + self.body_hits as f64
+    }
+
+    fn exact_weighted_hits(self) -> f64 {
+        (self.exact_topic_hits as f64) * TOPIC_WEIGHT + self.exact_body_hits as f64
+    }
 }
 
 /// Find a char-boundary at or after TOPIC_WINDOW_SIZE bytes.
@@ -103,6 +143,256 @@ fn parse_query_terms(query_lower: &str) -> Vec<QueryTerm<'_>> {
             completed: i == terms.len() - 1 && has_trailing_space,
         })
         .collect()
+}
+
+fn has_boundary_before(text: &str, offset: usize) -> bool {
+    offset == 0
+        || text[..offset]
+            .chars()
+            .next_back()
+            .is_some_and(is_word_boundary)
+}
+
+fn has_boundary_after(text: &str, offset: usize) -> bool {
+    offset >= text.len() || text[offset..].chars().next().is_some_and(is_word_boundary)
+}
+
+fn is_exact_term_match(text: &str, start: usize, end: usize) -> bool {
+    has_boundary_before(text, start) && has_boundary_after(text, end)
+}
+
+fn occurrence_is_allowed(text: &str, term: &QueryTerm<'_>, end: usize) -> bool {
+    !term.completed || has_boundary_after(text, end)
+}
+
+fn collect_term_stats(text: &str, topic_end: usize, term: &QueryTerm<'_>) -> TermStats {
+    let mut stats = TermStats::default();
+    let mut cursor = 0;
+
+    while let Some(relative) = text[cursor..].find(term.text) {
+        let start = cursor + relative;
+        let end = start + term.text.len();
+        if occurrence_is_allowed(text, term, end) {
+            let in_topic = start < topic_end;
+            let exact = is_exact_term_match(text, start, end);
+            match (in_topic, exact) {
+                (true, true) => {
+                    stats.topic_hits += 1;
+                    stats.exact_topic_hits += 1;
+                }
+                (true, false) => stats.topic_hits += 1,
+                (false, true) => {
+                    stats.body_hits += 1;
+                    stats.exact_body_hits += 1;
+                }
+                (false, false) => stats.body_hits += 1,
+            }
+        }
+        cursor = end;
+    }
+
+    stats
+}
+
+fn term_is_short(term: &QueryTerm<'_>) -> bool {
+    term.text.chars().count() <= SHORT_TERM_MAX_CHARS
+}
+
+/// Preserve substring eligibility for short type-ahead terms, but prevent
+/// thousands of embedded matches from overwhelming stronger evidence for the
+/// other terms. Standalone-token hits retain their full topic/body weight.
+fn effective_weighted_hits(term: &QueryTerm<'_>, stats: TermStats) -> f64 {
+    let weighted = stats.weighted_hits();
+    if !term_is_short(term) {
+        return weighted;
+    }
+
+    let exact = stats.exact_weighted_hits();
+    let embedded = (weighted - exact).max(0.0);
+    exact + embedded.min(SHORT_TERM_EMBEDDED_HIT_CAP)
+}
+
+fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
+    offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn ceil_char_boundary(text: &str, mut offset: usize) -> usize {
+    offset = offset.min(text.len());
+    while offset < text.len() && !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
+}
+
+fn next_term_occurrence(
+    text: &str,
+    term: &QueryTerm<'_>,
+    exact_only: bool,
+    mut cursor: usize,
+    end_limit: usize,
+) -> Option<(usize, usize)> {
+    cursor = ceil_char_boundary(text, cursor);
+    let end_limit = floor_char_boundary(text, end_limit);
+
+    while cursor < end_limit {
+        let relative = text[cursor..end_limit].find(term.text)?;
+        let start = cursor + relative;
+        let end = start + term.text.len();
+        cursor = end;
+        if occurrence_is_allowed(text, term, end)
+            && (!exact_only || is_exact_term_match(text, start, end))
+        {
+            return Some((start, end));
+        }
+    }
+
+    None
+}
+
+fn closest_term_occurrence(
+    text: &str,
+    term: &QueryTerm<'_>,
+    exact_only: bool,
+    range_start: usize,
+    range_end: usize,
+    anchor_start: usize,
+    anchor_end: usize,
+) -> Option<(usize, usize)> {
+    let mut cursor = range_start;
+    let mut closest: Option<(usize, usize, usize)> = None;
+
+    while let Some((start, end)) = next_term_occurrence(text, term, exact_only, cursor, range_end) {
+        let distance = if end < anchor_start {
+            anchor_start - end
+        } else {
+            start.saturating_sub(anchor_end)
+        };
+        if closest.is_none_or(|(_, _, best_distance)| distance < best_distance) {
+            closest = Some((start, end, distance));
+        }
+        cursor = end;
+    }
+
+    closest.map(|(start, end, _)| (start, end))
+}
+
+/// Find the tightest bounded span containing one high-quality occurrence of
+/// every term. Short terms require standalone-token occurrences for proximity;
+/// their embedded substring hits still satisfy the hard-AND eligibility check,
+/// but do not manufacture a semantic-nearness boost.
+fn best_proximity_span(
+    text: &str,
+    terms: &[QueryTerm<'_>],
+    stats: &[TermStats],
+) -> Option<(usize, usize)> {
+    if terms.len() < 2 || terms.len() != stats.len() {
+        return None;
+    }
+
+    let preferred_counts: Vec<usize> = terms
+        .iter()
+        .zip(stats)
+        .map(|(term, stats)| {
+            if term_is_short(term) {
+                stats.exact_hits()
+            } else {
+                stats.total_hits()
+            }
+        })
+        .collect();
+    if preferred_counts.contains(&0) {
+        return None;
+    }
+
+    let anchor_index = preferred_counts
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, count)| **count)
+        .map(|(index, _)| index)?;
+    let anchor_count = preferred_counts[anchor_index];
+    let anchor_stride = anchor_count.div_ceil(PROXIMITY_MAX_ANCHORS).max(1);
+    let anchor_term = &terms[anchor_index];
+    let anchor_exact = term_is_short(anchor_term);
+
+    let mut best: Option<(usize, usize)> = None;
+    let mut cursor = 0;
+    let mut ordinal = 0usize;
+    while let Some((anchor_start, anchor_end)) =
+        next_term_occurrence(text, anchor_term, anchor_exact, cursor, text.len())
+    {
+        let inspect = ordinal.is_multiple_of(anchor_stride) || ordinal + 1 == anchor_count;
+        ordinal += 1;
+        cursor = anchor_end;
+        if !inspect {
+            continue;
+        }
+
+        let range_start =
+            floor_char_boundary(text, anchor_start.saturating_sub(PROXIMITY_MAX_SPAN));
+        let range_end = ceil_char_boundary(
+            text,
+            anchor_end
+                .saturating_add(PROXIMITY_MAX_SPAN)
+                .min(text.len()),
+        );
+        let mut span_start = anchor_start;
+        let mut span_end = anchor_end;
+        let mut complete = true;
+
+        for (index, term) in terms.iter().enumerate() {
+            if index == anchor_index {
+                continue;
+            }
+            let exact_only = term_is_short(term);
+            let Some((start, end)) = closest_term_occurrence(
+                text,
+                term,
+                exact_only,
+                range_start,
+                range_end,
+                anchor_start,
+                anchor_end,
+            ) else {
+                complete = false;
+                break;
+            };
+            span_start = span_start.min(start);
+            span_end = span_end.max(end);
+        }
+
+        if complete
+            && span_end - span_start <= PROXIMITY_MAX_SPAN
+            && best
+                .is_none_or(|(best_start, best_end)| span_end - span_start < best_end - best_start)
+        {
+            best = Some((span_start, span_end));
+        }
+    }
+
+    best
+}
+
+/// Return the best bounded all-term span for representative snippets. Search
+/// ranking and snippet selection share this definition of a coherent match.
+pub(crate) fn best_query_span(text_lower: &str, query_words: &[&str]) -> Option<(usize, usize)> {
+    let terms: Vec<QueryTerm<'_>> = query_words
+        .iter()
+        .copied()
+        .filter(|term| !term.is_empty())
+        .map(|text| QueryTerm {
+            text,
+            completed: false,
+        })
+        .collect();
+    let stats: Vec<TermStats> = terms
+        .iter()
+        .map(|term| collect_term_stats(text_lower, topic_end_for_text(text_lower), term))
+        .collect();
+    best_proximity_span(text_lower, &terms, &stats)
 }
 
 pub fn search(
@@ -246,6 +536,7 @@ pub fn match_offsets(text_lower: &str, query: &str) -> Vec<(usize, usize)> {
 /// Count non-overlapping occurrences of `needle` in `haystack`.
 /// If `whole_word` is true, only counts matches where the character after the match
 /// is a word boundary (or end of string).
+#[cfg(test)]
 fn count_occurrences(haystack: &str, needle: &str, whole_word: bool) -> usize {
     if needle.is_empty() {
         return 0;
@@ -271,16 +562,22 @@ fn count_occurrences(haystack: &str, needle: &str, whole_word: bool) -> usize {
     count
 }
 
-/// Score a conversation based on substring matching, term frequency density, and recency.
-/// Each query term (split on whitespace) must appear as a substring in the text (AND logic).
-/// This preserves URLs, paths, and other structured strings as single terms.
+/// Score a conversation based on balanced term evidence, proximity, density,
+/// and recency. Each query term (split on whitespace) must appear as a
+/// substring in the text (AND logic). This preserves URLs, paths, and other
+/// structured strings as single terms.
 ///
 /// Scoring formula:
 ///   For each term:
 ///     weighted_count = topic_hits * TOPIC_WEIGHT + body_hits
-///     per-term score = sqrt(weighted_count)
+///     per-term score = ln(1 + effective_weighted_count)
+///   relevance = geometric_mean(per-term scores)
 ///   density = relevance / ln(text_length)
-///   final = density * recency_multiplier
+///   final = density * proximity_multiplier * recency_multiplier
+///
+/// Logarithmic saturation prevents one noisy term from dominating a
+/// multi-term query, while the geometric mean rewards conversations with
+/// balanced evidence for every required term.
 fn score_text(
     text_lower: &str,
     topic_end: usize,
@@ -292,23 +589,25 @@ fn score_text(
         return 0.0;
     }
 
-    let topic_window = &text_lower[..topic_end];
-    let body = &text_lower[topic_end..];
-
-    let mut relevance = 0.0;
+    let mut stats = Vec::with_capacity(query_terms.len());
+    let mut term_score_log_sum = 0.0;
     for term in query_terms {
-        let topic_hits = count_occurrences(topic_window, term.text, term.completed);
-        let body_hits = count_occurrences(body, term.text, term.completed);
-        let total_hits = topic_hits + body_hits;
-        if total_hits == 0 {
+        let term_stats = collect_term_stats(text_lower, topic_end, term);
+        if term_stats.total_hits() == 0 {
             return 0.0; // AND logic: all terms must be present
         }
-        // Weight topic-window hits higher: early exchanges signal what the convo is about
-        let weighted = (topic_hits as f64) * TOPIC_WEIGHT + (body_hits as f64);
-        // sqrt dampens tool-output spam while preserving meaningful differences:
-        // 1 hit = 1.0, 5 hits ≈ 2.2, 20 hits ≈ 4.5, 100 hits = 10.0
-        relevance += weighted.sqrt();
+        let term_score = effective_weighted_hits(term, term_stats).ln_1p();
+        term_score_log_sum += term_score.ln();
+        stats.push(term_stats);
     }
+
+    let relevance = (term_score_log_sum / query_terms.len() as f64).exp();
+    let proximity_multiplier = best_proximity_span(text_lower, query_terms, &stats)
+        .map(|(start, end)| {
+            let closeness = 1.0 - ((end - start) as f64 / PROXIMITY_MAX_SPAN as f64);
+            1.0 + PROXIMITY_MAX_BOOST * closeness.max(0.0)
+        })
+        .unwrap_or(1.0);
 
     // Normalize by text length so dense matches in short conversations rank higher.
     // Use ln(len) to soften the penalty — a conversation twice as long isn't half as relevant.
@@ -316,7 +615,7 @@ fn score_text(
     let len_norm = (text_lower.len().max(500) as f64).ln();
     let density = relevance / len_norm;
 
-    density * recency_multiplier(timestamp, now)
+    density * proximity_multiplier * recency_multiplier(timestamp, now)
 }
 
 /// Recency boost half-life: a conversation this old gets half the boost.
@@ -324,9 +623,7 @@ const RECENCY_HALF_LIFE_DAYS: f64 = 14.0;
 
 /// Maximum recency boost, applied at age zero and decaying smoothly toward 0.
 /// Capped at 1.0 (a 2x multiplier) so recency breaks ties between similarly
-/// relevant conversations instead of overriding topical relevance: per-term
-/// relevance is sqrt-dampened, so a larger boost lets today's passing mention
-/// outrank an older conversation that is actually about the topic.
+/// relevant conversations instead of overriding topical relevance.
 const RECENCY_MAX_BOOST: f64 = 1.0;
 
 /// Calculate recency multiplier based on age.
@@ -393,6 +690,56 @@ mod tests {
         let searchable = precompute_search_text(&mut convs);
         let results = search(&convs, &searchable, "harden runtime", now, None);
         assert_eq!(results.len(), 0); // "runtime" not present
+    }
+
+    #[test]
+    fn balanced_multi_term_match_beats_noisy_short_substrings() {
+        let now = Local::now();
+        let noisy = format!(
+            "legacy note {}",
+            "instructions and considerations ".repeat(2_000)
+        );
+        let focused = format!(
+            "why do we have three ns entries? {} investigating legacy namespace removal",
+            "focused cluster context ".repeat(20)
+        );
+        let mut convs = vec![make_conv(&noisy, now), make_conv(&focused, now)];
+        let searchable = precompute_search_text(&mut convs);
+
+        let results = search(&convs, &searchable, "legacy ns", now, None);
+
+        assert_eq!(results.len(), 2, "substring eligibility remains unchanged");
+        assert_eq!(
+            results[0], 1,
+            "balanced evidence must beat thousands of accidental `ns` substrings"
+        );
+    }
+
+    #[test]
+    fn proximity_breaks_a_balanced_frequency_tie() {
+        let now = Local::now();
+        let far = format!("alpha {} beta", "x".repeat(400));
+        let near = format!("alpha beta {}", "x".repeat(400));
+        let mut convs = vec![make_conv(&far, now), make_conv(&near, now)];
+        let searchable = precompute_search_text(&mut convs);
+
+        let results = search(&convs, &searchable, "alpha beta", now, None);
+
+        assert_eq!(results, vec![1, 0]);
+    }
+
+    #[test]
+    fn best_query_span_uses_standalone_short_terms() {
+        let text = normalize_for_search(
+            "legacy instructions are unrelated; why three ns entries? investigate legacy cleanup",
+        );
+
+        let (start, end) = best_query_span(&text, &["legacy", "ns"]).unwrap();
+        let span = &text[start..end];
+
+        assert!(span.contains("ns"));
+        assert!(span.contains("legacy"));
+        assert!(!span.contains("instructions"));
     }
 
     #[test]
