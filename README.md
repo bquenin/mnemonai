@@ -276,10 +276,8 @@ one does. This integration makes fresh-session resumes cheap enough to prefer:
   prefixes.
 - **`hooks/context-warn.sh`** (UserPromptSubmit) — one-line warning when the
   session crosses 200K context tokens (then each further 100K), with the
-  estimated $/turn for the current model.
-- **`hooks/session-end.sh`** (SessionEnd) — when a session ends carrying
-  >200K, prints the cheap-resume phrase (`resume session <id>`) next to the
-  full-cost alternative (`claude -r <id>`).
+  estimated $/turn for the current model and the cheap-resume phrase
+  (`resume session <id>`) for later.
 
 Install (symlinks into `~/.claude`, so `git pull` updates them):
 
