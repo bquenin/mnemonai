@@ -258,6 +258,36 @@ show_deleted_projects = false # Include conversations from deleted directories
 default_args = []             # Default args passed to 'claude --resume' for Claude Code sessions
 ```
 
+## Claude Code Integration
+
+Optional session-continuity tooling for Claude Code, built on `mnemonai show`.
+Long sessions get monotonically more expensive: every turn re-reads the whole
+accumulated context, so a 400K-token session costs ~5x per turn what a fresh
+one does. This integration makes fresh-session resumes cheap enough to prefer:
+
+- **`handoff` skill** (`skills/handoff/`) — say `resume session <id>` in a
+  fresh session and it distills the old transcript into a compact handoff file
+  (`~/.claude/handoffs/<workstream>.md`), then continues from there. Works
+  post-hoc: the old session never has to prepare anything. Also supports
+  explicit end-of-day checkpoints (`handoff`).
+- **`scripts/session-digest.sh`** — the distiller: user prompts + assistant
+  prose only (no tool output/thinking), recent messages kept fuller, capped at
+  ~30K tokens. Provider-agnostic via `mnemonai show --json`; accepts id
+  prefixes.
+- **`hooks/context-warn.sh`** (UserPromptSubmit) — one-line warning when the
+  session crosses 200K context tokens (then each further 100K), with the
+  estimated $/turn for the current model and the cheap-resume phrase
+  (`resume session <id>`) for later.
+
+Install (symlinks into `~/.claude`, so `git pull` updates them):
+
+```bash
+./scripts/install-claude-integration.sh
+```
+
+Then merge the printed hook block into `~/.claude/settings.json`. Warning
+threshold is tunable via `MNEMONAI_CTX_WARN_TOKENS` (default 200000).
+
 ## Releasing
 
 1. Bump the version in `Cargo.toml`
