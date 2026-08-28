@@ -10,7 +10,7 @@
 //! Export respects the current display settings for thinking blocks and tool calls.
 
 use crate::claude::{ContentBlock, LogEntry, UserContent, UserMessage, extract_tool_result_text};
-use crate::text_processing::process_command_message;
+use crate::text_processing::{UserText, classify_user_text};
 use crate::tool_format;
 use crate::tui::viewer::read_log_entries;
 use arboard::Clipboard;
@@ -213,7 +213,8 @@ fn generate_plain_from_entries(entries: &[LogEntry], options: ExportOptions) -> 
             } => {
                 // Harness-injected text is not user speech: label it System and
                 // only include it when tool output is being exported.
-                if let Some(text) = extract_user_text(message) {
+                let texts = extract_user_text(message);
+                if let Some(text) = texts.speech {
                     if *is_meta {
                         if options.show_tools {
                             output.push_str(&format!("System: {}\n\n", text));
@@ -221,6 +222,12 @@ fn generate_plain_from_entries(entries: &[LogEntry], options: ExportOptions) -> 
                     } else {
                         output.push_str(&format!("You: {}\n\n", text));
                     }
+                }
+                // Command output shares the System label and the tool gate.
+                if let Some(text) = texts.output
+                    && options.show_tools
+                {
+                    output.push_str(&format!("System: {}\n\n", text));
                 }
                 if options.show_tools
                     && let UserContent::Blocks(blocks) = &message.content
@@ -266,7 +273,8 @@ fn generate_markdown_from_entries(entries: &[LogEntry], options: ExportOptions) 
             LogEntry::User {
                 message, is_meta, ..
             } => {
-                if let Some(text) = extract_user_text(message) {
+                let texts = extract_user_text(message);
+                if let Some(text) = texts.speech {
                     if *is_meta {
                         if options.show_tools {
                             output.push_str(&format!("## System\n\n{}\n\n", text));
@@ -274,6 +282,11 @@ fn generate_markdown_from_entries(entries: &[LogEntry], options: ExportOptions) 
                     } else {
                         output.push_str(&format!("## You\n\n{}\n\n", text));
                     }
+                }
+                if let Some(text) = texts.output
+                    && options.show_tools
+                {
+                    output.push_str(&format!("## System\n\n{}\n\n", text));
                 }
                 if options.show_tools
                     && let UserContent::Blocks(blocks) = &message.content
@@ -325,7 +338,8 @@ fn generate_ledger_from_entries(entries: &[LogEntry], options: ExportOptions) ->
             LogEntry::User {
                 message, is_meta, ..
             } => {
-                if let Some(text) = extract_user_text(message) {
+                let texts = extract_user_text(message);
+                if let Some(text) = texts.speech {
                     if *is_meta {
                         if options.show_tools {
                             append_ledger_block(&mut output, "System", &text, NAME_WIDTH);
@@ -335,6 +349,12 @@ fn generate_ledger_from_entries(entries: &[LogEntry], options: ExportOptions) ->
                         append_ledger_block(&mut output, "You", &text, NAME_WIDTH);
                         output.push('\n');
                     }
+                }
+                if let Some(text) = texts.output
+                    && options.show_tools
+                {
+                    append_ledger_block(&mut output, "System", &text, NAME_WIDTH);
+                    output.push('\n');
                 }
                 if options.show_tools
                     && let UserContent::Blocks(blocks) = &message.content
@@ -396,21 +416,40 @@ fn append_ledger_block(output: &mut String, speaker: &str, text: &str, name_widt
     }
 }
 
+/// Text extracted from a user message, split by attribution.
+///
+/// A user-role entry can carry genuine speech, command output (`! cmd`
+/// stdout/stderr, slash-command stdout), or both; the two are labeled
+/// differently on export.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct UserTexts {
+    speech: Option<String>,
+    output: Option<String>,
+}
+
 /// Extract text from a user message, handling command messages
-fn extract_user_text(message: &UserMessage) -> Option<String> {
+fn extract_user_text(message: &UserMessage) -> UserTexts {
+    let mut texts = UserTexts::default();
+    let mut classify = |text: &str| match classify_user_text(text) {
+        UserText::Speech(t) => {
+            texts.speech.get_or_insert(t);
+        }
+        UserText::Output(t) => {
+            texts.output.get_or_insert(t);
+        }
+        UserText::Skip => {}
+    };
     match &message.content {
-        UserContent::String(s) => process_command_message(s),
+        UserContent::String(s) => classify(s),
         UserContent::Blocks(blocks) => {
             for block in blocks {
-                if let ContentBlock::Text { text } = block
-                    && let Some(processed) = process_command_message(text)
-                {
-                    return Some(processed);
+                if let ContentBlock::Text { text } = block {
+                    classify(text);
                 }
             }
-            None
         }
     }
+    texts
 }
 
 /// Wrap content in markdown code fence, handling nested backticks
@@ -508,11 +547,7 @@ mod tests {
     fn extract_user_text_skips_clear_command() {
         assert_eq!(
             extract_user_text(&user_string("<command-name>/clear</command-name>")),
-            None
-        );
-        assert_eq!(
-            extract_user_text(&user_string("<command-name>/clear</command-name>")),
-            process_command_message("<command-name>/clear</command-name>")
+            UserTexts::default()
         );
     }
 
@@ -521,10 +556,9 @@ mod tests {
     #[test]
     fn extract_user_text_skips_local_command_caveat() {
         let caveat = "<local-command-caveat>Caveat: system generated.</local-command-caveat>";
-        assert_eq!(extract_user_text(&user_string(caveat)), None);
         assert_eq!(
             extract_user_text(&user_string(caveat)),
-            process_command_message(caveat)
+            UserTexts::default()
         );
     }
 
@@ -534,12 +568,8 @@ mod tests {
     fn extract_user_text_unwraps_cursor_tags() {
         let text = "<timestamp>Thursday, May 7, 2026, 10:12 PM (UTC-7)</timestamp>\n<user_query>\nperfect thanks\n</user_query>";
         assert_eq!(
-            extract_user_text(&user_string(text)),
+            extract_user_text(&user_string(text)).speech,
             Some("perfect thanks".to_string())
-        );
-        assert_eq!(
-            extract_user_text(&user_string(text)),
-            process_command_message(text)
         );
     }
 
@@ -548,8 +578,65 @@ mod tests {
     fn extract_user_text_preserves_normal_text() {
         assert_eq!(
             extract_user_text(&user_string("Hello world")),
-            Some("Hello world".to_string())
+            UserTexts {
+                speech: Some("Hello world".to_string()),
+                output: None,
+            }
         );
+    }
+
+    /// Shell output recorded under the user role is command output, not speech.
+    #[test]
+    fn extract_user_text_separates_command_output() {
+        assert_eq!(
+            extract_user_text(&user_string(
+                "<bash-stdout>one-time code</bash-stdout><bash-stderr></bash-stderr>"
+            )),
+            UserTexts {
+                speech: None,
+                output: Some("one-time code".to_string()),
+            }
+        );
+        assert_eq!(
+            extract_user_text(&user_string("<bash-input>gh auth status</bash-input>")),
+            UserTexts {
+                speech: Some("! gh auth status".to_string()),
+                output: None,
+            }
+        );
+    }
+
+    /// `! cmd` output follows the tool toggle and is labeled System, never You.
+    #[test]
+    fn ledger_export_labels_bash_output_as_system() {
+        let entries = vec![LogEntry::User {
+            message: user_string(
+                "<bash-stdout>one-time code</bash-stdout><bash-stderr></bash-stderr>",
+            ),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            cwd: None,
+            is_meta: false,
+        }];
+
+        let hidden = generate_ledger_from_entries(
+            &entries,
+            ExportOptions {
+                show_tools: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(hidden, "");
+
+        let shown = generate_ledger_from_entries(
+            &entries,
+            ExportOptions {
+                show_tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(shown.contains("System │"), "got: {:?}", shown);
+        assert!(!shown.contains("You │"), "got: {:?}", shown);
+        assert!(shown.contains("one-time code"), "got: {:?}", shown);
     }
 
     /// Harness-injected entries are not user speech: they follow the tool
