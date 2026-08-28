@@ -25,6 +25,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -85,6 +88,7 @@ jobs:
           SHA_ARM=$(awk '{print $1}' mnemonai-darwin-arm64.sha256)
           SHA_INTEL=$(awk '{print $1}' mnemonai-darwin-amd64.sha256)
           SHA_LINUX=$(awk '{print $1}' mnemonai-linux-amd64.sha256)
+          SHA_LINUX_ARM=$(awk '{print $1}' mnemonai-linux-arm64.sha256)
 
           mkdir -p tap/Formula
           cat > tap/Formula/mnemonai.rb << EOF
@@ -105,8 +109,13 @@ jobs:
             end
 
             on_linux do
-              url "https://github.com/bquenin/mnemonai/releases/download/v${VERSION}/mnemonai-linux-amd64.tar.gz"
-              sha256 "${SHA_LINUX}"
+              if Hardware::CPU.arm?
+                url "https://github.com/bquenin/mnemonai/releases/download/v${VERSION}/mnemonai-linux-arm64.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              else
+                url "https://github.com/bquenin/mnemonai/releases/download/v${VERSION}/mnemonai-linux-amd64.tar.gz"
+                sha256 "${SHA_LINUX}"
+              end
             end
 
             def install
