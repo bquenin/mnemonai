@@ -2417,6 +2417,7 @@ mod tests {
                 },
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
                 cwd: None,
+                is_meta: false,
             }];
             // Narrow width: the message wraps into many lines, so the match
             // lands at a high line index.

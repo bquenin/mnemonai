@@ -165,14 +165,17 @@ fn render_entry(lines: &mut Vec<RenderedLine>, entry: &LogEntry, options: &Rende
             }
         }
         LogEntry::User {
-            message, timestamp, ..
+            message,
+            timestamp,
+            is_meta,
+            ..
         } => {
             let ts = if options.show_timing {
                 format_timestamp(timestamp)
             } else {
                 None
             };
-            render_user_message(lines, message, options, ts.as_deref());
+            render_user_message(lines, message, options, ts.as_deref(), *is_meta);
         }
         LogEntry::Assistant {
             message, timestamp, ..
@@ -192,6 +195,7 @@ fn render_user_message(
     message: &crate::claude::UserMessage,
     options: &RenderOptions,
     timestamp: Option<&str>,
+    is_meta: bool,
 ) {
     let mut printed = false;
     let mut ts_remaining = timestamp;
@@ -219,15 +223,49 @@ fn render_user_message(
     };
 
     if let Some(text) = text {
-        let mut md_lines = render_markdown_to_lines(&text, options.content_width);
-        for line in &mut md_lines {
-            for (_, style) in &mut line.spans {
-                style.fg = Some(USER_TEXT);
+        if is_meta {
+            // Harness-injected text (skill bodies, hook output, reminders) is not
+            // user speech, so it follows the tool-visibility toggle and renders
+            // dimmed under a "System" label instead of the "You" block.
+            if options.tool_display.is_visible() {
+                let mut md_lines = render_markdown_to_lines(&text, options.content_width);
+                for line in &mut md_lines {
+                    for (_, style) in &mut line.spans {
+                        style.dimmed = true;
+                    }
+                }
+                let total = md_lines.len();
+                if options.tool_display == ToolDisplayMode::Truncated
+                    && total > TRUNCATED_RESULT_LINES
+                {
+                    md_lines.truncate(TRUNCATED_RESULT_LINES);
+                }
+                let remaining = total - md_lines.len();
+                render_ledger_block_styled(
+                    lines,
+                    "System",
+                    TOOL_TEXT,
+                    false,
+                    md_lines,
+                    ts_remaining,
+                );
+                if remaining > 0 {
+                    render_truncation_indicator(lines, remaining, true, timestamp.is_some());
+                }
+                printed = true;
+                ts_remaining = None;
             }
+        } else {
+            let mut md_lines = render_markdown_to_lines(&text, options.content_width);
+            for line in &mut md_lines {
+                for (_, style) in &mut line.spans {
+                    style.fg = Some(USER_TEXT);
+                }
+            }
+            render_ledger_block_styled(lines, "You", WHITE, true, md_lines, ts_remaining);
+            printed = true;
+            ts_remaining = None;
         }
-        render_ledger_block_styled(lines, "You", WHITE, true, md_lines, ts_remaining);
-        printed = true;
-        ts_remaining = None;
     }
 
     // Tool results (if enabled)
@@ -1899,7 +1937,27 @@ mod tests {
             },
             timestamp: "2026-02-04T19:46:38.440Z".to_string(),
             cwd: None,
+            is_meta: false,
         }
+    }
+
+    fn meta_user_entry(text: &str) -> LogEntry {
+        LogEntry::User {
+            message: crate::claude::UserMessage {
+                content: UserContent::String(text.to_string()),
+            },
+            timestamp: "2026-02-04T19:46:38.440Z".to_string(),
+            cwd: None,
+            is_meta: true,
+        }
+    }
+
+    /// Label rendered in the name column of a ledger line ("" for blank lines).
+    fn line_label(line: &RenderedLine) -> String {
+        line.spans
+            .first()
+            .map(|(text, _)| text.trim().to_string())
+            .unwrap_or_default()
     }
 
     fn test_render_options(content_width: usize, show_timing: bool) -> RenderOptions {
@@ -1964,6 +2022,69 @@ mod tests {
                 "content line display width {w} exceeds content_width {content_width}"
             );
         }
+    }
+
+    /// Harness-injected entries are labeled "System", never "You".
+    #[test]
+    fn test_meta_user_entry_renders_as_system() {
+        let entry = meta_user_entry("Base directory for this skill: /x");
+        let options = test_render_options(60, false);
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert_eq!(line_label(&lines[0]), "System");
+        assert!(
+            !lines.iter().any(|l| line_label(l) == "You"),
+            "meta entry must not render a You block"
+        );
+    }
+
+    /// Hiding tools hides harness-injected content too.
+    #[test]
+    fn test_meta_user_entry_hidden_when_tools_hidden() {
+        let entry = meta_user_entry("Base directory for this skill: /x");
+        let mut options = test_render_options(60, false);
+        options.tool_display = ToolDisplayMode::Hidden;
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert!(lines.is_empty(), "expected no lines, got {:?}", lines.len());
+    }
+
+    #[test]
+    fn test_meta_user_entry_truncates() {
+        let text = (0..20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = meta_user_entry(&text);
+        let options = test_render_options(60, false);
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|(t, _)| t.as_str()).collect())
+            .collect();
+        assert!(
+            rendered.iter().any(|l| l.contains("more lines...")),
+            "expected truncation indicator, got:\n{}",
+            rendered.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_non_meta_user_entry_renders_as_you() {
+        let entry = user_entry("hello there");
+        let options = test_render_options(60, false);
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert_eq!(line_label(&lines[0]), "You");
+    }
+
+    /// `isMeta` marks harness-injected entries; its absence means real user text.
+    #[test]
+    fn test_is_meta_deserialization() {
+        let with_meta = r#"{"type":"user","isMeta":true,"timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x"}]}}"#;
+        let entry: LogEntry = serde_json::from_str(with_meta).unwrap();
+        assert!(matches!(entry, LogEntry::User { is_meta: true, .. }));
+
+        let without_meta = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x"}]}}"#;
+        let entry: LogEntry = serde_json::from_str(without_meta).unwrap();
+        assert!(matches!(entry, LogEntry::User { is_meta: false, .. }));
     }
 
     #[test]

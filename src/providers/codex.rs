@@ -800,6 +800,7 @@ fn process_message_item(
                         .cwd
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
+                    is_meta: false,
                 }),
                 "assistant" => state.entries.push(LogEntry::Assistant {
                     message: AssistantMessage {
@@ -934,6 +935,7 @@ fn process_tool_output_item(
             .cwd
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
+        is_meta: false,
     });
 }
 
