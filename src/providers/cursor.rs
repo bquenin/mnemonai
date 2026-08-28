@@ -1556,6 +1556,7 @@ fn bubble_to_log_entry(bubble: &Bubble) -> Option<LogEntry> {
                 },
                 timestamp,
                 cwd: None,
+                is_meta: false,
             })
         }
         BUBBLE_TYPE_ASSISTANT => {

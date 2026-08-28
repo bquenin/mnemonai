@@ -685,6 +685,7 @@ fn parse_transcript_line_with_mode(
             },
             timestamp: timestamp_str,
             cwd: workspace_path.map(|path| path.to_string_lossy().to_string()),
+            is_meta: false,
         },
         "assistant" => LogEntry::Assistant {
             message: AssistantMessage {

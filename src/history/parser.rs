@@ -320,6 +320,7 @@ fn classify_via_full_parse(line: &str) -> ScanLine {
             message,
             cwd,
             timestamp,
+            ..
         }) => ScanLine::User(LineData {
             text: extract_text_from_user(&message),
             timestamp,
@@ -1424,6 +1425,7 @@ mod tests {
                     message,
                     cwd,
                     timestamp,
+                    ..
                 }) => {
                     if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&timestamp) {
                         if first_timestamp.is_none() {

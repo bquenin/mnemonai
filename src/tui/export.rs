@@ -208,9 +208,19 @@ fn generate_plain_from_entries(entries: &[LogEntry], options: ExportOptions) -> 
 
     for entry in entries {
         match entry {
-            LogEntry::User { message, .. } => {
+            LogEntry::User {
+                message, is_meta, ..
+            } => {
+                // Harness-injected text is not user speech: label it System and
+                // only include it when tool output is being exported.
                 if let Some(text) = extract_user_text(message) {
-                    output.push_str(&format!("You: {}\n\n", text));
+                    if *is_meta {
+                        if options.show_tools {
+                            output.push_str(&format!("System: {}\n\n", text));
+                        }
+                    } else {
+                        output.push_str(&format!("You: {}\n\n", text));
+                    }
                 }
                 if options.show_tools
                     && let UserContent::Blocks(blocks) = &message.content
@@ -253,9 +263,17 @@ fn generate_markdown_from_entries(entries: &[LogEntry], options: ExportOptions) 
 
     for entry in entries {
         match entry {
-            LogEntry::User { message, .. } => {
+            LogEntry::User {
+                message, is_meta, ..
+            } => {
                 if let Some(text) = extract_user_text(message) {
-                    output.push_str(&format!("## You\n\n{}\n\n", text));
+                    if *is_meta {
+                        if options.show_tools {
+                            output.push_str(&format!("## System\n\n{}\n\n", text));
+                        }
+                    } else {
+                        output.push_str(&format!("## You\n\n{}\n\n", text));
+                    }
                 }
                 if options.show_tools
                     && let UserContent::Blocks(blocks) = &message.content
@@ -304,10 +322,19 @@ fn generate_ledger_from_entries(entries: &[LogEntry], options: ExportOptions) ->
 
     for entry in entries {
         match entry {
-            LogEntry::User { message, .. } => {
+            LogEntry::User {
+                message, is_meta, ..
+            } => {
                 if let Some(text) = extract_user_text(message) {
-                    append_ledger_block(&mut output, "You", &text, NAME_WIDTH);
-                    output.push('\n');
+                    if *is_meta {
+                        if options.show_tools {
+                            append_ledger_block(&mut output, "System", &text, NAME_WIDTH);
+                            output.push('\n');
+                        }
+                    } else {
+                        append_ledger_block(&mut output, "You", &text, NAME_WIDTH);
+                        output.push('\n');
+                    }
                 }
                 if options.show_tools
                     && let UserContent::Blocks(blocks) = &message.content
@@ -523,6 +550,37 @@ mod tests {
             extract_user_text(&user_string("Hello world")),
             Some("Hello world".to_string())
         );
+    }
+
+    /// Harness-injected entries are not user speech: they follow the tool
+    /// toggle and are labeled System.
+    #[test]
+    fn ledger_export_labels_meta_entries_as_system() {
+        let entries = vec![LogEntry::User {
+            message: user_string("Base directory for this skill: /x"),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            cwd: None,
+            is_meta: true,
+        }];
+
+        let hidden = generate_ledger_from_entries(
+            &entries,
+            ExportOptions {
+                show_tools: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(hidden, "");
+
+        let shown = generate_ledger_from_entries(
+            &entries,
+            ExportOptions {
+                show_tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(shown.contains("System │"), "got: {:?}", shown);
+        assert!(!shown.contains("You │"), "got: {:?}", shown);
     }
 
     /// Text and text-block-array tool results must match `extract_tool_result_text`

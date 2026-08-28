@@ -13,6 +13,10 @@ pub enum LogEntry {
         timestamp: String,
         /// The working directory when this message was sent
         cwd: Option<String>,
+        /// Harness-injected user-role entries (skill content, hook output,
+        /// system reminders) the user did not type.
+        #[serde(rename = "isMeta", default)]
+        is_meta: bool,
     },
     Assistant {
         message: AssistantMessage,

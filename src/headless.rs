@@ -814,8 +814,11 @@ fn messages_from_entries(entries: &[LogEntry]) -> Vec<MessageDto> {
                 push_message(&mut messages, message);
             }
             LogEntry::User {
-                message, timestamp, ..
-            } => push_user_message(&mut messages, message, timestamp, entry_index),
+                message,
+                timestamp,
+                is_meta,
+                ..
+            } => push_user_message(&mut messages, message, timestamp, entry_index, *is_meta),
             LogEntry::Assistant {
                 message, timestamp, ..
             } => push_assistant_message(&mut messages, message, timestamp, entry_index),
@@ -861,18 +864,22 @@ fn push_user_message(
     message: &crate::claude::UserMessage,
     timestamp: &str,
     entry_index: usize,
+    is_meta: bool,
 ) {
+    // Harness-injected entries carry the user role in the transcript but were
+    // never typed by the user, so consumers see them as system messages.
+    let role = if is_meta { "system" } else { "user" };
     match &message.content {
         UserContent::String(text) => {
             let context = MessageContext::new(entry_index).timestamp(timestamp);
-            push_text_message(messages, "user", text, context);
+            push_text_message(messages, role, text, context);
         }
         UserContent::Blocks(blocks) => {
             for (block_index, block) in blocks.iter().enumerate() {
                 let context = MessageContext::new(entry_index)
                     .timestamp(timestamp)
                     .block_index(Some(block_index));
-                push_content_block(messages, "user", block, context);
+                push_content_block(messages, role, block, context);
             }
         }
     }
@@ -1159,6 +1166,7 @@ mod tests {
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
                 cwd: None,
+                is_meta: false,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
@@ -1479,6 +1487,7 @@ mod tests {
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
                 cwd: None,
+                is_meta: false,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
@@ -1693,6 +1702,7 @@ mod tests {
             },
             timestamp: "2026-06-19T10:00:00-07:00".to_string(),
             cwd: None,
+            is_meta: false,
         }];
 
         let messages = messages_from_entries(&entries);
@@ -2429,6 +2439,7 @@ mod tests {
                 },
                 timestamp: "2026-06-19T10:00:00-07:00".to_string(),
                 cwd: None,
+                is_meta: false,
             },
             LogEntry::Assistant {
                 message: AssistantMessage {
