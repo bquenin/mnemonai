@@ -7,7 +7,7 @@
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, UserContent, extract_tool_result_text,
 };
-use crate::text_processing::{process_command_message, short_agent_id};
+use crate::text_processing::{UserText, classify_user_text, short_agent_id};
 use crate::tool_format;
 use crate::tui::app::{LineStyle, RenderedLine};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -200,58 +200,35 @@ fn render_user_message(
     let mut printed = false;
     let mut ts_remaining = timestamp;
 
-    // Extract text from user message, collecting all text blocks
-    let text = match &message.content {
-        UserContent::String(s) => process_command_message(s),
+    // Extract text from the user message, keeping genuine speech separate from
+    // command output (`! cmd` stdout/stderr, slash-command stdout) that the
+    // transcript also records under the user role.
+    let mut speech_parts: Vec<String> = Vec::new();
+    let mut output_parts: Vec<String> = Vec::new();
+    let mut classify = |text: &str| match classify_user_text(text) {
+        UserText::Speech(t) => speech_parts.push(t),
+        UserText::Output(t) => output_parts.push(t),
+        UserText::Skip => {}
+    };
+    match &message.content {
+        UserContent::String(s) => classify(s),
         UserContent::Blocks(blocks) => {
-            let texts: Vec<String> = blocks
-                .iter()
-                .filter_map(|block| {
-                    if let ContentBlock::Text { text } = block {
-                        process_command_message(text)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(texts.join("\n\n"))
+            for block in blocks {
+                if let ContentBlock::Text { text } = block {
+                    classify(text);
+                }
             }
         }
-    };
+    }
 
-    if let Some(text) = text {
+    if !speech_parts.is_empty() {
+        let text = speech_parts.join("\n\n");
         if is_meta {
             // Harness-injected text (skill bodies, hook output, reminders) is not
             // user speech, so it follows the tool-visibility toggle and renders
             // dimmed under a "System" label instead of the "You" block.
             if options.tool_display.is_visible() {
-                let mut md_lines = render_markdown_to_lines(&text, options.content_width);
-                for line in &mut md_lines {
-                    for (_, style) in &mut line.spans {
-                        style.dimmed = true;
-                    }
-                }
-                let total = md_lines.len();
-                if options.tool_display == ToolDisplayMode::Truncated
-                    && total > TRUNCATED_RESULT_LINES
-                {
-                    md_lines.truncate(TRUNCATED_RESULT_LINES);
-                }
-                let remaining = total - md_lines.len();
-                render_ledger_block_styled(
-                    lines,
-                    "System",
-                    TOOL_TEXT,
-                    false,
-                    md_lines,
-                    ts_remaining,
-                );
-                if remaining > 0 {
-                    render_truncation_indicator(lines, remaining, true, timestamp.is_some());
-                }
+                render_system_text_block(lines, &text, options, ts_remaining, timestamp.is_some());
                 printed = true;
                 ts_remaining = None;
             }
@@ -266,6 +243,23 @@ fn render_user_message(
             printed = true;
             ts_remaining = None;
         }
+    }
+
+    // Command output is not user speech: render it like harness-injected text,
+    // dimmed under "System" and gated on the tool-visibility toggle.
+    if !output_parts.is_empty() && options.tool_display.is_visible() {
+        let text = output_parts.join("\n\n");
+        let ts = if ts_remaining.is_some() {
+            let t = ts_remaining;
+            ts_remaining = None;
+            t
+        } else if options.show_timing {
+            Some("     ")
+        } else {
+            None
+        };
+        render_system_text_block(lines, &text, options, ts, timestamp.is_some());
+        printed = true;
     }
 
     // Tool results (if enabled)
@@ -302,6 +296,34 @@ fn render_user_message(
 
     if printed {
         lines.push(RenderedLine::new(vec![])); // Empty line after message
+    }
+}
+
+/// Render non-speech text carried by a user entry (harness-injected content or
+/// command output) as a dimmed "System" ledger block, truncated in Truncated mode.
+///
+/// Callers are responsible for the tool-visibility gate.
+fn render_system_text_block(
+    lines: &mut Vec<RenderedLine>,
+    text: &str,
+    options: &RenderOptions,
+    timestamp: Option<&str>,
+    show_timing: bool,
+) {
+    let mut md_lines = render_markdown_to_lines(text, options.content_width);
+    for line in &mut md_lines {
+        for (_, style) in &mut line.spans {
+            style.dimmed = true;
+        }
+    }
+    let total = md_lines.len();
+    if options.tool_display == ToolDisplayMode::Truncated && total > TRUNCATED_RESULT_LINES {
+        md_lines.truncate(TRUNCATED_RESULT_LINES);
+    }
+    let remaining = total - md_lines.len();
+    render_ledger_block_styled(lines, "System", TOOL_TEXT, false, md_lines, timestamp);
+    if remaining > 0 {
+        render_truncation_indicator(lines, remaining, true, show_timing);
     }
 }
 
@@ -2064,6 +2086,62 @@ mod tests {
             rendered.iter().any(|l| l.contains("more lines...")),
             "expected truncation indicator, got:\n{}",
             rendered.join("\n")
+        );
+    }
+
+    /// `! cmd` is something the user typed, so it keeps the "You" label and is
+    /// displayed with the `! ` prefix Claude Code shows.
+    #[test]
+    fn test_bash_input_renders_as_user_command() {
+        let entry = user_entry("<bash-input>gh auth status</bash-input>");
+        let options = test_render_options(60, false);
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert_eq!(line_label(&lines[0]), "You");
+        let rendered: String = lines[0].spans.iter().map(|(t, _)| t.as_str()).collect();
+        let content = rendered.split(" │ ").nth(1).unwrap_or_default();
+        assert!(
+            content.starts_with("! "),
+            "expected `! ` prefix, got: {:?}",
+            content
+        );
+        assert!(content.contains("gh auth status"), "got: {:?}", rendered);
+    }
+
+    /// Shell output recorded under the user role is not user speech.
+    #[test]
+    fn test_bash_stdout_renders_as_system() {
+        let entry =
+            user_entry("<bash-stdout>one-time code</bash-stdout><bash-stderr></bash-stderr>");
+        let options = test_render_options(60, false);
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert_eq!(line_label(&lines[0]), "System");
+        assert!(
+            !lines.iter().any(|l| line_label(l) == "You"),
+            "command output must not render a You block"
+        );
+    }
+
+    /// Hiding tools hides command output too.
+    #[test]
+    fn test_bash_stdout_hidden_when_tools_hidden() {
+        let entry =
+            user_entry("<bash-stdout>one-time code</bash-stdout><bash-stderr></bash-stderr>");
+        let mut options = test_render_options(60, false);
+        options.tool_display = ToolDisplayMode::Hidden;
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert!(lines.is_empty(), "expected no lines, got {:?}", lines.len());
+    }
+
+    /// Slash-command stdout is output, not speech.
+    #[test]
+    fn test_local_command_stdout_renders_as_system() {
+        let entry = user_entry("<local-command-stdout>output here</local-command-stdout>");
+        let options = test_render_options(60, false);
+        let lines = render_entries(std::slice::from_ref(&entry), &options);
+        assert_eq!(line_label(&lines[0]), "System");
+        assert!(
+            !lines.iter().any(|l| line_label(l) == "You"),
+            "command output must not render a You block"
         );
     }
 
