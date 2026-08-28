@@ -43,16 +43,15 @@ pub fn classify_user_text(text: &str) -> UserText {
         return UserText::Speech(format!("! {}", command.trim()));
     }
 
-    // ...and the paired stdout/stderr entry is the command's output, not speech
-    if trimmed.contains("<bash-stdout>") || trimmed.contains("<bash-stderr>") {
-        let stdout = extract_xml_tag_content(trimmed, "bash-stdout")
-            .unwrap_or("")
-            .trim();
-        let stderr = extract_xml_tag_content(trimmed, "bash-stderr")
-            .unwrap_or("")
-            .trim();
+    // ...and the paired stdout/stderr entry is the command's output, not speech.
+    // Require a complete tag pair to extract: a message merely mentioning an
+    // unmatched tag is ordinary speech and must not be swallowed.
+    let stdout = extract_xml_tag_content(trimmed, "bash-stdout");
+    let stderr = extract_xml_tag_content(trimmed, "bash-stderr");
+    if stdout.is_some() || stderr.is_some() {
         let parts: Vec<&str> = [stdout, stderr]
             .into_iter()
+            .map(|s| s.unwrap_or("").trim())
             .filter(|s| !s.is_empty())
             .collect();
         if parts.is_empty() {
@@ -229,6 +228,14 @@ mod tests {
             classify_user_text("<bash-stdout>out</bash-stdout><bash-stderr>err</bash-stderr>"),
             output("out\nerr")
         );
+    }
+
+    /// A message that merely mentions an unmatched tag is ordinary speech and
+    /// must not be swallowed by the command-output path.
+    #[test]
+    fn unmatched_bash_tag_stays_speech() {
+        let text = "the <bash-stdout> block is mislabeled in the TUI";
+        assert_eq!(classify_user_text(text), speech(text));
     }
 
     #[test]
