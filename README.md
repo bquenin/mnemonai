@@ -8,7 +8,7 @@ Universal AI coding conversation history browser. Search, browse, and resume con
 |------|---------------|----------------|
 | **Claude Code** | JSONL files in `~/.claude/projects/` | `claude --resume <session-id>` |
 | **Codex** | JSONL transcripts in `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`) | `codex resume <session-id>` |
-| **Cursor Agent CLI** | JSONL transcripts in `~/.cursor/projects/*/agent-transcripts/` | `agent --resume <chat-id>` |
+| **Cursor Agent CLI** | JSONL transcripts in `~/.cursor/projects/*/agent-transcripts/`, plus SQLite session stores in `~/.cursor/acp-sessions/` for sessions driven over ACP (e.g. T3 Code) | `agent --resume <chat-id>` (ACP sessions resume from their client) |
 | **Cursor (IDE)** | SQLite in workspace storage | Bridge extension + `cursor://` URI |
 
 ## Supported Platforms

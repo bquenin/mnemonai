@@ -898,6 +898,14 @@ impl App {
             crate::tui::export::ExportResult {
                 message: "JSONL export is not available for Cursor conversations".to_string(),
             }
+        } else if matches!(format, crate::tui::export::ExportFormat::Jsonl)
+            && conv.is_some_and(|c| crate::providers::cursor_agent::is_acp_session_store(&c.path))
+        {
+            // Cursor ACP sessions are a SQLite store, not a transcript, and the
+            // store holds the session's blob encryption key: never copy it out.
+            crate::tui::export::ExportResult {
+                message: "JSONL export is not available for Cursor ACP sessions".to_string(),
+            }
         } else {
             // File-based export: raw JSONL always copies the transcript file
             // verbatim; other formats land here when no provider is available.
