@@ -40,24 +40,29 @@ const STORE_DB: &str = "store.db";
 const STORE_WAL: &str = "store.db-wal";
 const SESSIONS_DIR: &str = "acp-sessions";
 
+const META_JSON: &str = "meta.json";
+
 /// A session directory that holds a `store.db`, with the metadata captured
 /// during the directory walk.
 pub(super) struct AcpSession {
     pub(super) id: String,
     pub(super) db_path: PathBuf,
+    /// Last write to `store.db` or its WAL: the session's last activity.
     pub(super) modified: SystemTime,
-    size: u64,
+    /// Covers `store.db`, its WAL (a live session appends to the WAL long
+    /// before a checkpoint touches the main file) and `meta.json` (title and
+    /// workspace).
+    pub(super) fingerprint: SourceFingerprint,
 }
 
-impl AcpSession {
-    /// Covers both `store.db` and its WAL: a live session appends to the WAL
-    /// long before a checkpoint touches the main database file.
-    pub(super) fn fingerprint(&self) -> SourceFingerprint {
-        SourceFingerprint {
-            modified_millis: system_time_to_millis(self.modified),
-            size: self.size.min(i64::MAX as u64) as i64,
-        }
-    }
+/// The result of listing the ACP root.
+#[derive(Default)]
+pub(super) struct AcpScan {
+    pub(super) sessions: Vec<AcpSession>,
+    /// Paths whose cache rows must survive pruning because they could not be
+    /// read this time: a session directory whose `store.db` failed to stat, or
+    /// the whole root when it (or one of its entries) could not be listed.
+    pub(super) keep_under: Vec<PathBuf>,
 }
 
 /// Whether `path` is an ACP session's `store.db` rather than a JSONL transcript.
@@ -79,49 +84,71 @@ pub(super) fn session_dir(db_path: &Path) -> Option<&Path> {
 
 /// List the sessions under `root`, newest first. Directories without a
 /// `store.db` (just a `meta.json`) are sessions the client opened and never
-/// used, so they are skipped. A missing root is an empty listing; any other
-/// read error is returned so the caller keeps these sessions' cache rows
-/// instead of pruning them.
-pub(super) fn collect_sessions(root: &Path) -> std::io::Result<Vec<AcpSession>> {
+/// used, so they are skipped. A missing root is an empty listing. Anything
+/// that could not be read is reported in [`AcpScan::keep_under`] so the caller
+/// keeps those cache rows instead of pruning them.
+pub(super) fn collect_sessions(root: &Path) -> AcpScan {
+    let mut scan = AcpScan::default();
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
+        Err(err) if err.kind() == ErrorKind::NotFound => return scan,
+        Err(_) => {
+            scan.keep_under.push(root.to_path_buf());
+            return scan;
+        }
     };
 
-    let mut sessions: Vec<AcpSession> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let dir = entry.path();
-            let db_path = dir.join(STORE_DB);
-            let db = fs::metadata(&db_path).ok().filter(Metadata::is_file)?;
-            let wal = fs::metadata(dir.join(STORE_WAL)).ok();
-            let id = entry.file_name().to_str()?.to_string();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // An unreadable entry has no name to protect; protect them all.
+            scan.keep_under.push(root.to_path_buf());
+            continue;
+        };
+        let dir = entry.path();
+        let db_path = dir.join(STORE_DB);
+        let db = match fs::metadata(&db_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                scan.keep_under.push(dir);
+                continue;
+            }
+        };
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let wal = fs::metadata(dir.join(STORE_WAL)).ok();
+        let meta_json = fs::metadata(dir.join(META_JSON)).ok();
 
-            let mtime = |metadata: &Metadata| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let modified = wal
-                .as_ref()
-                .map(mtime)
-                .into_iter()
-                .fold(mtime(&db), SystemTime::max);
-            let size = db.len() + wal.as_ref().map_or(0, Metadata::len);
-            Some(AcpSession {
-                id,
-                db_path,
-                modified,
-                size,
-            })
-        })
-        .collect();
+        let mtime = |metadata: &Metadata| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified = wal.iter().map(mtime).fold(mtime(&db), SystemTime::max);
+        let fingerprint_modified = meta_json.iter().map(mtime).fold(modified, SystemTime::max);
+        let size = [Some(&db), wal.as_ref(), meta_json.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(Metadata::len)
+            .sum::<u64>();
+        scan.sessions.push(AcpSession {
+            id,
+            db_path,
+            modified,
+            fingerprint: SourceFingerprint {
+                modified_millis: system_time_to_millis(fingerprint_modified),
+                size: size.min(i64::MAX as u64) as i64,
+            },
+        });
+    }
 
-    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
-    Ok(sessions)
+    scan.sessions
+        .sort_by_key(|session| std::cmp::Reverse(session.modified));
+    scan
 }
 
 /// Build the listing entry for one session. Returns `None` only for a session
-/// that decoded cleanly but holds no conversation. A session whose store cannot
-/// be decoded (for example after a `cursor-agent` format change) is still
-/// listed with its title, workspace and time.
+/// that decoded cleanly but holds no conversation. A session whose store or
+/// messages cannot be decoded (for example after a `cursor-agent` format
+/// change) is still listed with its title, workspace, time and parse errors.
 pub(super) fn process_session(
     session: &AcpSession,
     show_last: bool,
@@ -143,7 +170,10 @@ pub(super) fn process_session(
         .as_deref()
         .map(|path| path.to_string_lossy().into_owned());
     let converted = convert(&loaded, cwd_string.as_deref());
-    if loaded.store_error.is_none() && converted.message_count == 0 {
+    if loaded.store_error.is_none()
+        && loaded.parse_errors.is_empty()
+        && converted.message_count == 0
+    {
         return None;
     }
 
@@ -1049,13 +1079,10 @@ mod tests {
         }
 
         fn session(&self) -> AcpSession {
-            let metadata = fs::metadata(&self.db_path).unwrap();
-            AcpSession {
-                id: "session-1".to_string(),
-                db_path: self.db_path.clone(),
-                modified: metadata.modified().unwrap(),
-                size: metadata.len(),
-            }
+            let root = self.db_path.parent().unwrap().parent().unwrap();
+            let mut scan = collect_sessions(root);
+            assert!(scan.keep_under.is_empty());
+            scan.sessions.pop().expect("fixture session")
         }
     }
 
@@ -1328,6 +1355,32 @@ mod tests {
     }
 
     #[test]
+    fn session_with_only_damaged_messages_is_still_listed() {
+        let fx = Fixture::new("all-damaged", r#"{"cwd":"/w","title":"Damaged"}"#);
+        let bad = blob_id(1);
+        fx.blob(&bad, b"{not json");
+        let root = blob_id(2);
+        fx.blob(&root, &tree(&[bad, blob_id(3)], &[]));
+        fx.store_meta(&root, None);
+
+        let (conversation, _) = process_session(&fx.session(), false, None).unwrap();
+        assert_eq!(conversation.summary.as_deref(), Some("Damaged"));
+        assert_eq!(conversation.message_count, 0);
+        assert_eq!(conversation.parse_errors.len(), 2);
+    }
+
+    #[test]
+    fn meta_json_changes_the_fingerprint() {
+        let fx = standard_fixture("meta-fingerprint", r#"{"cwd":"/w","title":"Old"}"#, None);
+        let before = fx.session().fingerprint;
+
+        let meta_path = fx.db_path.parent().unwrap().join(META_JSON);
+        fs::write(&meta_path, r#"{"cwd":"/w","title":"Renamed session"}"#).unwrap();
+
+        assert_ne!(fx.session().fingerprint, before);
+    }
+
+    #[test]
     fn provider_reads_refuses_resume_and_deletes_acp_sessions() {
         use crate::providers::Provider;
 
@@ -1355,17 +1408,38 @@ mod tests {
         fs::create_dir_all(&real).unwrap();
         fs::write(real.join(STORE_DB), b"db").unwrap();
         fs::write(real.join(STORE_WAL), b"wal!").unwrap();
+        fs::write(real.join(META_JSON), b"{}").unwrap();
 
-        let sessions = collect_sessions(&root.path).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "real");
-        assert_eq!(sessions[0].fingerprint().size, 6);
+        let scan = collect_sessions(&root.path);
+        assert!(scan.keep_under.is_empty());
+        assert_eq!(scan.sessions.len(), 1);
+        assert_eq!(scan.sessions[0].id, "real");
+        assert_eq!(scan.sessions[0].fingerprint.size, 8);
 
-        assert!(
-            collect_sessions(&root.path.join("missing"))
-                .unwrap()
-                .is_empty()
-        );
+        let missing = collect_sessions(&root.path.join("missing"));
+        assert!(missing.sessions.is_empty());
+        assert!(missing.keep_under.is_empty());
+    }
+
+    #[test]
+    fn collect_sessions_protects_what_it_cannot_read() {
+        let root = TestTempDir::new("unreadable");
+        let not_a_dir = root.path.join("file");
+        fs::write(&not_a_dir, b"").unwrap();
+        let scan = collect_sessions(&not_a_dir);
+        assert!(scan.sessions.is_empty());
+        assert_eq!(scan.keep_under, vec![not_a_dir]);
+
+        #[cfg(unix)]
+        {
+            // A self-referencing symlink fails to stat with ELOOP, not NotFound.
+            let looped = root.path.join("acp").join("looped");
+            fs::create_dir_all(&looped).unwrap();
+            std::os::unix::fs::symlink(looped.join(STORE_DB), looped.join(STORE_DB)).unwrap();
+            let scan = collect_sessions(&root.path.join("acp"));
+            assert!(scan.sessions.is_empty());
+            assert_eq!(scan.keep_under, vec![looped]);
+        }
     }
 
     #[test]

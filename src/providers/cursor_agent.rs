@@ -140,6 +140,20 @@ impl CursorAgentProvider {
         }
     }
 
+    /// List both sources independently, so a failed transcript walk does not
+    /// hide readable ACP sessions.
+    fn discover(&self) -> Sources {
+        let (projects, projects_error) = match self.list_projects() {
+            Ok(projects) => (projects, None),
+            Err(err) => (Vec::new(), Some(err)),
+        };
+        Sources {
+            projects,
+            projects_error,
+            acp: acp::collect_sessions(&self.acp_root),
+        }
+    }
+
     /// Load ACP sessions into [`LoadedConversation`] values, claiming each
     /// session's cache entry. Sessions whose id already has a JSONL transcript
     /// are skipped: the transcript is the canonical record.
@@ -154,7 +168,7 @@ impl CursorAgentProvider {
             .par_iter()
             .filter(|session| !transcript_ids.contains(&session.id))
             .filter_map(|session| {
-                let fingerprint = session.fingerprint();
+                let fingerprint = session.fingerprint;
                 if let Some(conversation) = cache.take_if_fresh(&session.db_path, fingerprint) {
                     debug::debug(
                         debug_level,
@@ -332,11 +346,15 @@ impl super::Provider for CursorAgentProvider {
     }
 
     fn load_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
-        let projects = self.list_projects()?;
-        let acp_sessions = acp::collect_sessions(&self.acp_root);
-        if projects.is_empty() && acp_sessions.as_ref().is_ok_and(Vec::is_empty) {
-            return Ok(Vec::new());
+        let mut sources = self.discover();
+        if sources.projects.is_empty() && sources.acp.sessions.is_empty() {
+            // Nothing to load: surface a failed transcript walk as before.
+            return match sources.projects_error.take() {
+                Some(err) => Err(err),
+                None => Ok(Vec::new()),
+            };
         }
+        let keep_under = sources.keep_under(&self.projects_root);
 
         let debug_level = options.debug;
         let cache = ProviderCache::load(
@@ -345,7 +363,7 @@ impl super::Provider for CursorAgentProvider {
             options.include_full_text,
         );
         let mut loaded: Vec<LoadedConversation> = Vec::new();
-        for project in &projects {
+        for project in &sources.projects {
             loaded.extend(self.load_project_conversations(
                 project,
                 options.show_last,
@@ -355,7 +373,7 @@ impl super::Provider for CursorAgentProvider {
         }
         let transcript_ids = conversation_ids(&loaded);
         loaded.extend(Self::load_acp_conversations(
-            acp_sessions.as_deref().unwrap_or_default(),
+            &sources.acp.sessions,
             &transcript_ids,
             options.show_last,
             debug_level,
@@ -363,10 +381,10 @@ impl super::Provider for CursorAgentProvider {
         ));
 
         // Persist fresh rows from references before converting, then prune the
-        // entries nothing claimed (deleted files). An unreadable ACP directory
-        // keeps its sessions' rows.
+        // entries nothing claimed (deleted files), sparing sources that could
+        // not be read.
         cache.save_fresh(loaded.iter());
-        cache.prune_unclaimed(&acp_keep_under(&self.acp_root, &acp_sessions));
+        cache.prune_unclaimed(&keep_under);
 
         let mut conversations: Vec<Conversation> = loaded
             .into_iter()
@@ -396,14 +414,10 @@ impl super::Provider for CursorAgentProvider {
                 projects_root,
                 acp_root,
             };
-            let projects = match provider.list_projects() {
-                Ok(projects) => projects,
-                Err(_) => {
-                    let _ = tx.send(LoaderMessage::Done);
-                    return;
-                }
-            };
-            let acp_sessions = acp::collect_sessions(&provider.acp_root);
+            // A failed transcript walk no longer ends the load: readable ACP
+            // sessions still stream, and the transcript rows are spared.
+            let sources = provider.discover();
+            let keep_under = sources.keep_under(&provider.projects_root);
 
             let cache = cache_handle
                 .join()
@@ -423,14 +437,14 @@ impl super::Provider for CursorAgentProvider {
             };
 
             let mut transcript_ids = HashSet::new();
-            for project in &projects {
+            for project in &sources.projects {
                 let loaded =
                     provider.load_project_conversations(project, show_last, debug_level, &cache);
                 transcript_ids.extend(conversation_ids(&loaded));
                 send_batch(loaded);
             }
             send_batch(Self::load_acp_conversations(
-                acp_sessions.as_deref().unwrap_or_default(),
+                &sources.acp.sessions,
                 &transcript_ids,
                 show_last,
                 debug_level,
@@ -439,7 +453,7 @@ impl super::Provider for CursorAgentProvider {
 
             // Every source has consumed its cache entries; whatever remains is a
             // deleted file. Prune once at the end.
-            cache.prune_unclaimed(&acp_keep_under(&provider.acp_root, &acp_sessions));
+            cache.prune_unclaimed(&keep_under);
 
             let _ = tx.send(LoaderMessage::Done);
         });
@@ -694,15 +708,22 @@ fn conversation_ids(loaded: &[LoadedConversation]) -> HashSet<String> {
         .collect()
 }
 
-/// Cache rows to spare from pruning: everything under the ACP root when it
-/// could not be listed, so a transient read error does not drop them.
-fn acp_keep_under(
-    acp_root: &Path,
-    sessions: &std::io::Result<Vec<acp::AcpSession>>,
-) -> Vec<PathBuf> {
-    match sessions {
-        Ok(_) => Vec::new(),
-        Err(_) => vec![acp_root.to_path_buf()],
+/// What [`CursorAgentProvider::discover`] found in each source.
+struct Sources {
+    projects: Vec<AgentProject>,
+    projects_error: Option<AppError>,
+    acp: acp::AcpScan,
+}
+
+impl Sources {
+    /// Cache rows to spare from pruning because their source could not be read
+    /// this time, so a transient error does not drop them.
+    fn keep_under(&self, projects_root: &Path) -> Vec<PathBuf> {
+        let mut keep_under = self.acp.keep_under.clone();
+        if self.projects_error.is_some() {
+            keep_under.push(projects_root.to_path_buf());
+        }
+        keep_under
     }
 }
 
