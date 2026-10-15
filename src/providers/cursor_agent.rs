@@ -15,6 +15,7 @@ use chrono::{DateTime, FixedOffset, Local};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -23,8 +24,16 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
+mod acp;
+
+pub use acp::is_session_store as is_acp_session_store;
+
+/// Reads both places `cursor-agent` records conversations: JSONL transcripts
+/// under `~/.cursor/projects/*/agent-transcripts/`, and the SQLite session
+/// stores it writes instead when driven over ACP (`~/.cursor/acp-sessions/`).
 pub struct CursorAgentProvider {
     projects_root: PathBuf,
+    acp_root: PathBuf,
 }
 
 struct AgentProject {
@@ -124,10 +133,52 @@ struct ParsedTranscriptLine {
 
 impl CursorAgentProvider {
     pub fn new() -> Self {
-        let home = home::home_dir().unwrap_or_default();
+        let cursor_dir = home::home_dir().unwrap_or_default().join(".cursor");
         Self {
-            projects_root: home.join(".cursor").join("projects"),
+            projects_root: cursor_dir.join("projects"),
+            acp_root: cursor_dir.join("acp-sessions"),
         }
+    }
+
+    /// Load ACP sessions into [`LoadedConversation`] values, claiming each
+    /// session's cache entry. Sessions whose id already has a JSONL transcript
+    /// are skipped: the transcript is the canonical record.
+    fn load_acp_conversations(
+        sessions: &[acp::AcpSession],
+        transcript_ids: &HashSet<String>,
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+        cache: &ProviderCache,
+    ) -> Vec<LoadedConversation> {
+        sessions
+            .par_iter()
+            .filter(|session| !transcript_ids.contains(&session.id))
+            .filter_map(|session| {
+                let fingerprint = session.fingerprint();
+                if let Some(conversation) = cache.take_if_fresh(&session.db_path, fingerprint) {
+                    debug::debug(
+                        debug_level,
+                        &format!("Loaded Cursor ACP session {} from index", session.id),
+                    );
+                    return Some(LoadedConversation::Cached(conversation));
+                }
+
+                let (conversation, previews) =
+                    acp::process_session(session, show_last, debug_level)?;
+                debug::debug(
+                    debug_level,
+                    &format!(
+                        "Loaded Cursor ACP session {}: {}",
+                        session.id, conversation.preview
+                    ),
+                );
+                Some(LoadedConversation::Fresh {
+                    conversation,
+                    previews,
+                    fingerprint,
+                })
+            })
+            .collect()
     }
 
     fn list_projects(&self) -> Result<Vec<AgentProject>> {
@@ -282,7 +333,8 @@ impl super::Provider for CursorAgentProvider {
 
     fn load_conversations(&self, options: LoadOptions) -> Result<Vec<Conversation>> {
         let projects = self.list_projects()?;
-        if projects.is_empty() {
+        let acp_sessions = acp::collect_sessions(&self.acp_root);
+        if projects.is_empty() && acp_sessions.as_ref().is_ok_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
 
@@ -301,11 +353,20 @@ impl super::Provider for CursorAgentProvider {
                 &cache,
             ));
         }
+        let transcript_ids = conversation_ids(&loaded);
+        loaded.extend(Self::load_acp_conversations(
+            acp_sessions.as_deref().unwrap_or_default(),
+            &transcript_ids,
+            options.show_last,
+            debug_level,
+            &cache,
+        ));
 
         // Persist fresh rows from references before converting, then prune the
-        // entries no project claimed (deleted files).
+        // entries nothing claimed (deleted files). An unreadable ACP directory
+        // keeps its sessions' rows.
         cache.save_fresh(loaded.iter());
-        cache.prune_unclaimed(&[]);
+        cache.prune_unclaimed(&acp_keep_under(&self.acp_root, &acp_sessions));
 
         let mut conversations: Vec<Conversation> = loaded
             .into_iter()
@@ -319,6 +380,7 @@ impl super::Provider for CursorAgentProvider {
     fn load_conversations_streaming(&self, options: LoadOptions) -> Receiver<LoaderMessage> {
         let (tx, rx) = mpsc::channel();
         let projects_root = self.projects_root.clone();
+        let acp_root = self.acp_root.clone();
         let show_last = options.show_last;
         let include_full_text = options.include_full_text;
         let debug_level = options.debug;
@@ -330,7 +392,10 @@ impl super::Provider for CursorAgentProvider {
                 ProviderCache::load(ProviderKind::CursorAgent, show_last, include_full_text)
             });
 
-            let provider = CursorAgentProvider { projects_root };
+            let provider = CursorAgentProvider {
+                projects_root,
+                acp_root,
+            };
             let projects = match provider.list_projects() {
                 Ok(projects) => projects,
                 Err(_) => {
@@ -338,15 +403,14 @@ impl super::Provider for CursorAgentProvider {
                     return;
                 }
             };
+            let acp_sessions = acp::collect_sessions(&provider.acp_root);
 
             let cache = cache_handle
                 .join()
                 .unwrap_or_else(|_| ProviderCache::empty(ProviderKind::CursorAgent));
-            for project in &projects {
-                let loaded =
-                    provider.load_project_conversations(project, show_last, debug_level, &cache);
-                // Persist this project's fresh rows from references before its
-                // batch is moved out and sent.
+            let send_batch = |loaded: Vec<LoadedConversation>| {
+                // Persist this batch's fresh rows from references before it is
+                // moved out and sent.
                 cache.save_fresh(loaded.iter());
                 let mut conversations: Vec<Conversation> = loaded
                     .into_iter()
@@ -356,11 +420,26 @@ impl super::Provider for CursorAgentProvider {
                 if !conversations.is_empty() {
                     let _ = tx.send(LoaderMessage::Batch(conversations));
                 }
-            }
+            };
 
-            // Every project has consumed its cache entries; whatever remains is a
+            let mut transcript_ids = HashSet::new();
+            for project in &projects {
+                let loaded =
+                    provider.load_project_conversations(project, show_last, debug_level, &cache);
+                transcript_ids.extend(conversation_ids(&loaded));
+                send_batch(loaded);
+            }
+            send_batch(Self::load_acp_conversations(
+                acp_sessions.as_deref().unwrap_or_default(),
+                &transcript_ids,
+                show_last,
+                debug_level,
+                &cache,
+            ));
+
+            // Every source has consumed its cache entries; whatever remains is a
             // deleted file. Prune once at the end.
-            cache.prune_unclaimed(&[]);
+            cache.prune_unclaimed(&acp_keep_under(&provider.acp_root, &acp_sessions));
 
             let _ = tx.send(LoaderMessage::Done);
         });
@@ -369,6 +448,10 @@ impl super::Provider for CursorAgentProvider {
     }
 
     fn read_entries(&self, conversation: &Conversation) -> Result<Vec<LogEntry>> {
+        if acp::is_session_store(&conversation.path) {
+            return acp::read_entries(&conversation.path);
+        }
+
         let file = File::open(&conversation.path)?;
         let reader = BufReader::new(file);
         let workspace_path = conversation.project_path.as_deref();
@@ -405,6 +488,15 @@ impl super::Provider for CursorAgentProvider {
     }
 
     fn resume(&self, conversation: &Conversation, _default_args: &[String]) -> Result<()> {
+        if acp::is_session_store(&conversation.path) {
+            // `cursor-agent --resume` only looks in its own chat store; an ACP
+            // session belongs to the client that drives it (e.g. T3 Code).
+            return Err(AppError::ClaudeExecutionError(
+                "Cursor ACP sessions can only be resumed from the ACP client that created them"
+                    .to_string(),
+            ));
+        }
+
         let workspace_path = if let Some(path) = conversation
             .project_path
             .as_ref()
@@ -437,6 +529,12 @@ impl super::Provider for CursorAgentProvider {
     }
 
     fn delete(&self, conversation: &Conversation) -> Result<()> {
+        if let Some(session_dir) = acp::session_dir(&conversation.path) {
+            fs::remove_dir_all(session_dir)?;
+            delete_conversation(ProviderKind::CursorAgent, &conversation.path);
+            return Ok(());
+        }
+
         if let Some(transcript_dir) = transcript_parent_dir(&conversation.path, &conversation.id)
             && transcript_dir.exists()
         {
@@ -528,27 +626,7 @@ fn process_transcript_file(
         return Ok(None);
     }
 
-    // Compute both preview directions in one pass so a cached row can serve
-    // either listing mode without re-parsing; the active mode is selected below.
-    let previews = PreviewPair {
-        first: normalize_whitespace(
-            &parts
-                .iter()
-                .take(3)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ... "),
-        ),
-        last: normalize_whitespace(
-            &parts
-                .iter()
-                .rev()
-                .take(3)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ... "),
-        ),
-    };
+    let previews = previews_from_parts(&parts);
     let preview = previews.select(show_last);
     let full_text = normalize_whitespace(&parts.join(" "));
     // Fall back to the mtime captured during the walk rather than re-stat'ing.
@@ -594,6 +672,38 @@ fn process_transcript_file(
         },
         previews,
     )))
+}
+
+/// Compute both preview directions in one pass so a cached row can serve either
+/// listing mode without re-parsing; callers select the active mode.
+fn previews_from_parts(parts: &[String]) -> PreviewPair {
+    let join = |parts: Vec<&str>| normalize_whitespace(&parts.join(" ... "));
+    PreviewPair {
+        first: join(parts.iter().take(3).map(String::as_str).collect()),
+        last: join(parts.iter().rev().take(3).map(String::as_str).collect()),
+    }
+}
+
+fn conversation_ids(loaded: &[LoadedConversation]) -> HashSet<String> {
+    loaded
+        .iter()
+        .map(|entry| match entry {
+            LoadedConversation::Cached(conversation)
+            | LoadedConversation::Fresh { conversation, .. } => conversation.id.clone(),
+        })
+        .collect()
+}
+
+/// Cache rows to spare from pruning: everything under the ACP root when it
+/// could not be listed, so a transient read error does not drop them.
+fn acp_keep_under(
+    acp_root: &Path,
+    sessions: &std::io::Result<Vec<acp::AcpSession>>,
+) -> Vec<PathBuf> {
+    match sessions {
+        Ok(_) => Vec::new(),
+        Err(_) => vec![acp_root.to_path_buf()],
+    }
 }
 
 /// Controls how much per-line text work `parse_transcript_line` performs.
@@ -1231,6 +1341,7 @@ mod tests {
 
         let provider = CursorAgentProvider {
             projects_root: temp.path.clone(),
+            acp_root: temp.path.join("acp-sessions"),
         };
         let conversation = Conversation {
             path: transcript_dir.join("chat-123.jsonl"),
@@ -1523,6 +1634,7 @@ mod tests {
 
         let provider = CursorAgentProvider {
             projects_root: temp.path.clone(),
+            acp_root: temp.path.join("acp-sessions"),
         };
         let conversation = Conversation {
             path: transcript_path,
